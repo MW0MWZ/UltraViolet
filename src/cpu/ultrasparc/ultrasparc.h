@@ -97,7 +97,7 @@ struct MmuRegs {
 class UltraSparc {
 public:
     struct Options {
-        u64 version = 0x0017001293000407ull;  // VER: manufacturer 0x17, impl 0x12 (IIi), mask, maxtl 4, maxwin 7
+        u64 version = 0x0017001291000407ull;  // VER: manufacturer 0x17, impl 0x12 (IIi), mask, maxtl 4, maxwin 7
         double clock_hz = 440e6;
         u32 ecache_bytes = 2u << 20;  // external (E-) cache: 256 KiB to 2 MiB, a power of two
     };

@@ -58,4 +58,19 @@ UV_FORCEINLINE void store_be(void* p, T v) {
     std::memcpy(p, &v, sizeof(T));
 }
 
+// Little-endian (PCI) structures in guest memory, such as DMA descriptors.
+template <typename T>
+UV_FORCEINLINE T load_le(const void* p) {
+    T v;
+    std::memcpy(&v, p, sizeof(T));
+    if constexpr (std::endian::native == std::endian::big) v = byteswap(v);
+    return v;
+}
+
+template <typename T>
+UV_FORCEINLINE void store_le(void* p, T v) {
+    if constexpr (std::endian::native == std::endian::big) v = byteswap(v);
+    std::memcpy(p, &v, sizeof(T));
+}
+
 }  // namespace uv

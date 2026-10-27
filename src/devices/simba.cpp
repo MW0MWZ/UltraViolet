@@ -5,9 +5,10 @@
 namespace uv {
 
 Simba::Simba(bool bus_a, std::function<u64()> ticks)
-    : pci::Bridge(0x108E, 0x5000, 0x11), bus_a_(bus_a), ticks_(std::move(ticks)) {
+    : pci::Bridge(0x108E, 0x5000, 0x13), bus_a_(bus_a), ticks_(std::move(ticks)) {
     set_cfg16(pci::kCommand, pci::kCmdMemory);       // memory decode is on at power-on
     set_cfg16(pci::kStatus, 0x02A0);                 // 66 MHz capable, fast back-to-back, medium DEVSEL
+    set_cfg8(pci::kHeaderType, 0x81);                // a bridge, and one of two functions
     // Implementation registers 0xB8-0xFF: interrupt acknowledge, retry
     // limits, latency timers, secondary control, the address maps, PCI
     // control and diagnostics are writable; the DMA and PIO error status
