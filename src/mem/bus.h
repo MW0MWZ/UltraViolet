@@ -116,6 +116,8 @@ public:
 
     // Debugger hook: every device (MMIO) read, after it completes.
     std::function<void(u64 paddr, unsigned size, u64 value)> device_read_hook;
+    // Debugger hook: every device (MMIO) write, before the device sees it.
+    std::function<void(u64 paddr, unsigned size, u64 value)> device_write_hook;
 
     template <typename T>
     UV_FORCEINLINE bool read(u64 paddr, T& out) {

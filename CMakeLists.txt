@@ -56,6 +56,10 @@ add_library(uv_emu STATIC
   src/devices/m48t59.cpp
   src/devices/ebus_misc.cpp
   src/devices/fdc82077.cpp
+  src/devices/ata.cpp
+  src/devices/atapi_cdrom.cpp
+  src/devices/cmd646.cpp
+  src/storage/disk_image.cpp
   src/machine/ultra5_10/ultra5_10.cpp
   src/net/net_backend.cpp
   src/net/slirp_backend.cpp
@@ -103,6 +107,7 @@ if(UV_BUILD_TESTS)
     tests/cpu_tests.cpp
     tests/fpu_tests.cpp
     tests/machine_tests.cpp
+    tests/ide_tests.cpp
   )
   target_link_libraries(uv_tests PRIVATE uv_emu uv_warnings)
   add_test(NAME uv_tests COMMAND uv_tests)

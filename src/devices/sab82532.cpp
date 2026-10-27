@@ -198,8 +198,9 @@ bool Sab82532::Channel::read(unsigned reg, u8& v) {
 
 void Sab82532::Channel::write(unsigned reg, u8 v) {
     if (reg < 0x20) {
-        xfifo[reg] = v;
-        xcount = std::max(xcount, reg + 1);
+        // The XFIFO fills in order at any address of its window (Solaris
+        // writes a whole block to offset 0); bytes beyond 32 are lost.
+        if (xcount < xfifo.size()) xfifo[xcount++] = v;
         return;
     }
     switch (reg) {

@@ -149,6 +149,8 @@ bool Bus::write_slow(u64 paddr, unsigned size, u64 value) {
     if (paddr <= kAddressMask) {
         const Page& p = page(paddr);
         if (p.device) {
+            if (device_write_hook) [[unlikely]]
+                device_write_hook(paddr, size, value);
             if (p.device->write(paddr - p.device_base, size, value)) return true;
             UV_LOG(Debug, "bus", "bus error: write%u @ %011llx", size * 8, static_cast<unsigned long long>(paddr));
             if (error_handler_) error_handler_(paddr, size, true);

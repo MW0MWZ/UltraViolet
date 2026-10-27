@@ -26,7 +26,7 @@ constexpr u32 kEbusNvram = 0x000000, kEbusAudio = 0x200000, kEbusSuperIo = 0x300
 
 constexpr double kPciHz = 66.0e6;      // the APB's primary bus clock, which its tick register counts
 constexpr double kSuperIoUartHz = 1843200.0;
-constexpr u8 kSuperIoSid = 0xD0;       // SuperIO identification register value
+constexpr u8 kSuperIoSid = 0x90;       // SuperIO identification register value, as a real Ultra 5/10 reads
 constexpr u8 kMachineType = 0x80;      // IDPROM machine type: sun4u
 
 }  // namespace
@@ -39,11 +39,15 @@ Ultra5_10::Ultra5_10(const Options& options)
       simba_b_(false, [this] { return static_cast<u64>(static_cast<double>(cpu_.cycles()) * kPciHz / opt_.cpu_hz); }),
       simba_a_(true, [this] { return static_cast<u64>(static_cast<double>(cpu_.cycles()) * kPciHz / opt_.cpu_hz); }),
       flash_(options.prom, 0x01, 0xD5, 0x10000),
+      start_time_(options.start_time ? options.start_time : std::time(nullptr)),
+      nvram_([this] { return start_time_ + static_cast<std::time_t>(static_cast<double>(cpu_.cycles()) / opt_.cpu_hz); }),
       superio_(kSuperIoSid),
       su_kbd_(sched_, kbd_line_, kSuperIoUartHz, options.cpu_hz),
       su_mouse_(sched_, mouse_line_, kSuperIoUartHz, options.cpu_hz),
       se_(sched_, ttya_, ttyb_, options.cpu_hz),
-      fdc_(sched_) {
+      fdc_(sched_),
+      ide_(sched_, options.cpu_hz),
+      cdrom_(sched_, options.cpu_hz) {
     sched_.set_clock([this] { return cpu_.cycles(); });
 
     bus_.add_host_region(ram_.get(), ram_.size());
@@ -69,11 +73,12 @@ Ultra5_10::Ultra5_10(const Options& options)
     sabre_.root().attach(1, 0, &simba_b_);
     sabre_.root().attach(1, 1, &simba_a_);
     simba_a_.secondary().attach(1, 0, &ebus_);
+    simba_a_.secondary().attach(3, 0, &ide_);
 
     // EBus devices
     ebus_.set_prom(&flash_, static_cast<u32>(std::max<std::size_t>(opt_.prom.size(), 1)));
     ebus_.add(kEbusNvram, M48t59::kSize, &nvram_);
-    ebus_.add(kEbusSuperIo + 0x398, 2, &superio_);
+    ebus_.add(kEbusSuperIo + 0x15C, 2, &superio_);  // configuration ports at ISA 0x15C/0x15D
     ebus_.add(kEbusKeyboard, 8, &su_kbd_);
     ebus_.add(kEbusMouse, 8, &su_mouse_);
     ebus_.add(kEbusSerial, 0x80, &se_);
@@ -95,6 +100,25 @@ Ultra5_10::Ultra5_10(const Options& options)
     su_mouse_.set_irq_sink([this](bool a) { sabre_.set_interrupt(kInoMouse, a); });
     se_.set_irq_sink([this](bool a) { sabre_.set_interrupt(kInoSerial, a); });
     fdc_.set_irq_sink([this](bool a) { sabre_.set_interrupt(kInoFloppy, a); });
+
+    // IDE: the disk (if any) on the primary channel, the CD-ROM drive as
+    // master of the secondary.
+    ide_.set_interrupt_sink([this](bool a) { sabre_.set_interrupt(kInoIde, a); });
+    ide_.set_dma_port([this](u32 a, u8* d, std::size_t n) { return sabre_.dma_read(a, d, n); },
+                      [this](u32 a, const u8* d, std::size_t n) { return sabre_.dma_write(a, d, n); });
+    if (!opt_.disk_path.empty()) {
+        const bool ok = opt_.disk_create_bytes ? disk_image_.create(opt_.disk_path, opt_.disk_create_bytes)
+                                               : disk_image_.open(opt_.disk_path, false);
+        if (ok) {
+            disk_ = std::make_unique<AtaDisk>(sched_, opt_.cpu_hz, disk_image_);
+            ide_.channel(0).attach(0, disk_.get());
+        } else {
+            UV_LOG(Error, "ultra5_10", "cannot open disk image %s", opt_.disk_path.c_str());
+        }
+    }
+    ide_.channel(1).attach(0, &cdrom_);
+    if (!opt_.cdrom_path.empty() && !insert_cdrom(opt_.cdrom_path))
+        UV_LOG(Error, "ultra5_10", "cannot open CD image %s", opt_.cdrom_path.c_str());
 
     // NVRAM: the saved contents, or a fresh one with a valid IDPROM.
     if (opt_.nvram_path.empty() || !nvram_.load(opt_.nvram_path)) nvram_.write_idprom(kMachineType, opt_.mac, 0x000001);
@@ -128,6 +152,15 @@ void Ultra5_10::reset() {
     se_.reset();
     fdc_.reset();
     cpu_.reset();
+}
+
+bool Ultra5_10::insert_cdrom(const std::string& path) {
+    cdrom_.insert(nullptr);
+    cd_image_.close();
+    if (path.empty()) return true;
+    if (!cd_image_.open(path, true)) return false;
+    cdrom_.insert(&cd_image_);
+    return true;
 }
 
 void Ultra5_10::update_prom_mapping() {

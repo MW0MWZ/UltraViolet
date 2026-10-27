@@ -9,10 +9,13 @@
 
 namespace uv {
 
-RioEbus::RioEbus() : pci::Function(0x108E, 0x1000, 0x01, 0x068000) {
-    define_bar(0, kBarSize, false, kResetBar0);
-    define_bar(1, kBarSize, false, kResetBar1);
+RioEbus::RioEbus() : pci::Function(0x108E, 0x1000, 0x01, 0x068000, 0x80) {
+    define_bar(0, kBar0Size, false, kResetBar0);
+    define_bar(1, kBar1Size, false, kResetBar1);
     set_cfg16(pci::kCommand, pci::kCmdMemory);
+    set_cfg16(pci::kStatus, 0x0280);  // medium DEVSEL, fast back-to-back
+    set_cfg8(pci::kMinGrant, 0x0A);
+    set_cfg8(pci::kMaxLatency, 0x19);
     save_reset_state();
 }
 

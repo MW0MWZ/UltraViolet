@@ -18,7 +18,7 @@ namespace uv {
 
 class RioEbus final : public pci::Function {
 public:
-    static constexpr u32 kBarSize = 16u << 20;
+    static constexpr u32 kBar0Size = 16u << 20, kBar1Size = 8u << 20;
     static constexpr u32 kResetBar0 = 0xF0000000u, kResetBar1 = 0xF1000000u;
 
     RioEbus();

@@ -19,7 +19,8 @@ namespace uv::pci {
 // Configuration header offsets
 constexpr u8 kVendorId = 0x00, kDeviceId = 0x02, kCommand = 0x04, kStatus = 0x06, kRevision = 0x08,
              kClassProg = 0x09, kCacheLine = 0x0C, kLatency = 0x0D, kHeaderType = 0x0E, kBar0 = 0x10,
-             kSubsystemVendor = 0x2C, kRomBase = 0x30, kInterruptLine = 0x3C, kInterruptPin = 0x3D;
+             kSubsystemVendor = 0x2C, kSubsystemId = 0x2E, kRomBase = 0x30, kInterruptLine = 0x3C,
+             kInterruptPin = 0x3D, kMinGrant = 0x3E, kMaxLatency = 0x3F;
 // Type 1 (bridge) header
 constexpr u8 kPrimaryBus = 0x18, kSecondaryBus = 0x19, kSubordinateBus = 0x1A, kSecLatency = 0x1B,
              kIoBase = 0x1C, kIoLimit = 0x1D, kSecStatus = 0x1E, kMemBase = 0x20, kMemLimit = 0x22,
@@ -59,6 +60,15 @@ public:
         if (irq_) irq_(asserted);
     }
 
+    // Bus-master access to memory, wired by the platform (through the host
+    // bridge's DVMA path).
+    using DmaRead = std::function<bool(u32 addr, u8* data, std::size_t length)>;
+    using DmaWrite = std::function<bool(u32 addr, const u8* data, std::size_t length)>;
+    void set_dma_port(DmaRead read, DmaWrite write) {
+        dma_read_ = std::move(read);
+        dma_write_ = std::move(write);
+    }
+
     u16 command() const { return static_cast<u16>(cfg_[kCommand] | (cfg_[kCommand + 1] << 8)); }
     // Called after every configuration write (for platforms that keep fast
     // paths through this function's decode).
@@ -72,6 +82,13 @@ protected:
     // Accesses that fall in an enabled BAR, at `offset` into it.
     virtual bool bar_read(unsigned bar, u32 offset, unsigned size, u64& value);
     virtual bool bar_write(unsigned bar, u32 offset, unsigned size, u64 value);
+    // Bus-master cycles: refused (false) unless bus master enable is set.
+    bool master_read(u32 addr, u8* data, std::size_t length) const {
+        return (command() & kCmdMaster) && dma_read_ && dma_read_(addr, data, length);
+    }
+    bool master_write(u32 addr, const u8* data, std::size_t length) const {
+        return (command() & kCmdMaster) && dma_write_ && dma_write_(addr, data, length);
+    }
 
     // Raw configuration bytes, the bits software may write, and the
     // write-one-to-clear bits.
@@ -99,6 +116,8 @@ private:
     std::array<Bar, 6> bars_{};
     std::array<u8, 256> reset_cfg_{};
     std::function<void(bool)> irq_;
+    DmaRead dma_read_;
+    DmaWrite dma_write_;
 };
 
 // A PCI bus segment: up to 32 devices of 8 functions.

@@ -18,8 +18,11 @@ UltraViolet is at the very beginning. In place so far:
   banner and answers commands. Modelled so far: the UltraSPARC IIi's PCI bus
   module (Sabre) with its IOMMU and interrupt mapping, the Advanced PCI
   Bridge (Simba), the PCIO EBus with the flash PROM, the M48T59 NVRAM and
-  clock, the SuperIO's keyboard and mouse UARTs and floppy controller, and
-  the SAB82532 serial ports.
+  clock, the SuperIO's keyboard and mouse UARTs and floppy controller, the
+  SAB82532 serial ports, and the CMD646 IDE controller with an ATA disk and
+  an ATAPI CD-ROM drive (bus-master DMA included). OpenBoot finds them as
+  its `disk` and `cdrom`, and `boot cdrom` loads the Solaris 8 kernel from
+  its install media.
 - **UltraSPARC IIi interpreter:** the SPARC V9 integer unit with register
   windows, trap levels and the global register sets, the I- and D-MMU with
   their TLBs and TSB pointers, the internal ASIs, TICK and interrupts, the
@@ -28,8 +31,8 @@ UltraViolet is at the very beginning. In place so far:
   host pacing, logging, guest memory, the x86-64 and AArch64 code emitters for
   the JIT, and user-mode (libslirp) and TAP networking.
 
-Next come the on-board IDE (CMD646), Ethernet (HME) and graphics (ATI Rage
-Pro); see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Next come carrying the Solaris boot through to the installer, then the on-board Ethernet (HME) and
+graphics (ATI Rage Pro); see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Building
 
@@ -51,11 +54,14 @@ sudo apt install build-essential cmake ninja-build pkg-config libslirp-dev
 ## Running
 
 ```sh
-./build/ultraviolet --prom-dir roms --nvram disks/ultra10.nvram
+./build/ultraviolet --prom-dir roms --nvram disks/ultra10.nvram \
+    --disk disks/ultra10.img --disk-size 8192 --cdrom iso/solaris.iso
 ```
 
 The newest `ultra5_10-obp-*.bin` image in the PROM folder is used. The first
-serial port (ttya) is the terminal; Ctrl-] then q quits.
+serial port (ttya) is the terminal; Ctrl-] then q quits. `--disk` is a raw
+image on the primary IDE channel (created at `--disk-size` megabytes if it
+does not exist); `--cdrom` is an ISO image in the CD-ROM drive.
 
 ## Firmware and media
 
