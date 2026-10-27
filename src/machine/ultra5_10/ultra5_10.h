@@ -5,9 +5,12 @@
 // A carries the on-board devices: the PCIO (RIO) EBus at device 1, with
 // the flash PROM, the M48T59 NVRAM and clock, the SuperIO (keyboard and
 // mouse UARTs, floppy, parallel), the SAB82532 serial ports, audio and the
-// auxio, power and clock-control registers. Bus B carries the slots.
+// auxio, power and clock-control registers; and the CMD646 IDE controller
+// at device 3, with the disk on the primary channel and the CD-ROM drive
+// as master of the secondary. Bus B carries the slots.
 #pragma once
 
+#include <ctime>
 #include <memory>
 #include <string>
 #include <vector>
@@ -15,6 +18,8 @@
 #include "core/host_memory.h"
 #include "core/scheduler.h"
 #include "cpu/ultrasparc/ultrasparc.h"
+#include "devices/atapi_cdrom.h"
+#include "devices/cmd646.h"
 #include "devices/ebus_misc.h"
 #include "devices/fdc82077.h"
 #include "devices/m48t59.h"
@@ -25,6 +30,7 @@
 #include "devices/serial.h"
 #include "devices/simba.h"
 #include "mem/bus.h"
+#include "storage/disk_image.h"
 
 namespace uv {
 
@@ -45,11 +51,21 @@ public:
         std::vector<u8> prom;    // the flash image (1 MiB: OpenBoot, then POST)
         std::string nvram_path;  // NVRAM contents, loaded at start and saved on stop
         u8 mac[6] = {0x08, 0x00, 0x20, 0x55, 0x56, 0x01};
+        std::string disk_path;   // ATA disk image (primary master); empty: none
+        u64 disk_create_bytes = 0;  // create the disk image at this size if it does not exist
+        std::string cdrom_path;  // CD image in the drive (secondary master); empty: no disc
+        // The time of day at power-on, in seconds since 1970 (0: the host's
+        // clock at start). The clock then advances with the processor's
+        // cycles, so it agrees with TICK and the other timers.
+        std::time_t start_time = 0;
     };
 
     // On-board interrupt numbers (INO) of the EBus devices.
     static constexpr unsigned kInoParallel = 0x22, kInoAudioRecord = 0x23, kInoAudioPlay = 0x24, kInoPower = 0x25,
                               kInoFloppy = 0x27, kInoKeyboard = 0x29, kInoMouse = 0x2A, kInoSerial = 0x2B;
+    // INTA of the bus A devices, from the Simba's interrupt-map: RIO (device 1,
+    // its HME function), the Rage Pro (device 2) and the IDE controller (device 3).
+    static constexpr unsigned kInoRio = 0x21, kInoGraphics = 0x0F, kInoIde = 0x20;
 
     explicit Ultra5_10(const Options& options);
     ~Ultra5_10();
@@ -64,6 +80,12 @@ public:
     Scheduler& scheduler() { return sched_; }
     Sabre& sabre() { return sabre_; }
     M48t59& nvram() { return nvram_; }
+    Cmd646& ide() { return ide_; }
+    AtapiCdrom& cdrom() { return cdrom_; }
+    AtaDisk* disk() { return disk_.get(); }
+    // Changes the disc in the CD-ROM drive (empty path: no disc). False if
+    // the image cannot be opened.
+    bool insert_cdrom(const std::string& path);
 
     // Serial lines: ttya and ttyb (the SAB82532), and the keyboard and mouse
     // ports (SuperIO UARTs).
@@ -91,11 +113,16 @@ private:
     RioEbus ebus_;
     SerialLine ttya_, ttyb_, kbd_line_, mouse_line_;
     FlashProm flash_;
+    std::time_t start_time_ = 0;
     M48t59 nvram_;
     SuperIoConfig superio_;
     Ns16550 su_kbd_, su_mouse_;
     Sab82532 se_;
     Fdc82077 fdc_;
+    Cmd646 ide_;
+    DiskImage disk_image_, cd_image_;
+    std::unique_ptr<AtaDisk> disk_;
+    AtapiCdrom cdrom_;
     std::vector<std::unique_ptr<RegisterBlock>> blocks_;
     // An empty memory bank: reads as zero, writes are lost (no bus error).
     class EmptyBank final : public Device {

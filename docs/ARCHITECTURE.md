@@ -34,7 +34,9 @@ src/cpu/ultrasparc/  UltraSPARC IIi: interpreter, MMU and ASIs, FPU and VIS,
                      disassembler
 src/devices/         PCI framework; Sabre, Simba, RIO EBus; M48T59, 16550,
                      SAB82532, 82077 floppy controller, SuperIO configuration,
-                     flash PROM
+                     flash PROM; ATA channel and bus master, ATA disk, ATAPI
+                     CD-ROM, CMD646
+src/storage/         disk and CD image files
 src/machine/ultra5_10/  Ultra 5/10 assembly: memory banks, PCI topology, EBus map
 src/app/             command-line front end (ttya on the terminal)
 src/jit/             x86-64 and AArch64 code emitters, executable memory
@@ -56,8 +58,12 @@ and the native macOS menu bar, in `src/app/`.
 * **PCI:** the Sabre at 0x1FE.0000.0000 (registers), 0x1FE.0100.0000
   (configuration), 0x1FE.0200.0000 (I/O) and 0x1FF.0000.0000 (memory), with
   the byte swap to little-endian PCI. Bus 0 holds the Sabre and the APB's two
-  functions; bus A (APB function 1) carries the EBus at device 1, bus B the
-  slots.
+  functions; bus A (APB function 1) carries the EBus at device 1 and the
+  CMD646 IDE controller at device 3, bus B the slots.
+* **IDE:** the CMD646 runs both channels in native-PCI mode at the I/O
+  addresses OpenBoot assigns; the disk is the primary master (`disk`), the
+  CD-ROM drive the secondary master (`cdrom`). Its bus masters reach memory
+  through the Sabre's IOMMU, and its interrupt is INO 0x20.
 * **EBus:** BAR0 is the flash (the reset vector, 0x1FF.F000.0000, while BAR0
   is at its power-on 0xF000_0000); BAR1 holds the NVRAM (0x000000), audio
   (0x200000), the SuperIO devices (configuration 0x300398, floppy 0x3023F0,

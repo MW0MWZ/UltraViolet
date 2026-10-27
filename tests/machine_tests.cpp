@@ -8,6 +8,7 @@
 #include "devices/fdc82077.h"
 #include "devices/m48t59.h"
 #include "devices/ns16550.h"
+#include "devices/sab82532.h"
 #include "machine/ultra5_10/ultra5_10.h"
 #include "test.h"
 
@@ -197,6 +198,33 @@ TEST(ns16550_transmits_receives_and_identifies_interrupts) {
     CHECK_EQ(rd(2), 0x04u);  // received data available
     CHECK_EQ(rd(0), static_cast<unsigned>('z'));
     CHECK(!(rd(5) & 1));
+}
+
+TEST(sab82532_transmit_fifo_fills_in_order_at_any_address) {
+    Scheduler s;
+    u64 now = 0;
+    s.set_clock([&] { return now; });
+    SerialLine a, b;
+    std::string out;
+    a.transmit = [&](u8 c) { out.push_back(static_cast<char>(c)); };
+    Sab82532 se(s, a, b, Sab82532::kClockHz / 16.0);  // a bit time is one cycle at the reset baud rate
+    bool irq = false;
+    se.set_irq_sink([&](bool on) { irq = on; });
+    u64 v = 0;
+    se.read(0x3B, 1, v);  // clear the reset XPR/ALLS
+    se.write(0x3B, 1, 0xFE);  // IMR1: XPR only
+    for (char c : std::string("abc")) se.write(0x00, 1, static_cast<u8>(c));  // all to offset 0, as Solaris does
+    se.write(0x20, 1, 0x08);  // CMDR: XF
+    CHECK(!irq);
+    for (int i = 0; i < 10; ++i) {  // each character is 10 bit times
+        now += 11;
+        s.run_due(now);
+    }
+    CHECK(out == "abc");
+    CHECK(irq);
+    se.read(0x3B, 1, v);
+    CHECK_EQ(v & 0x21, 0x21u);  // XPR and ALLS
+    CHECK(!irq);
 }
 
 TEST(fdc82077_reset_reports_four_drives_and_version) {

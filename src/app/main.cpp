@@ -41,6 +41,9 @@ void usage() {
         "  --prom-dir DIR   folder holding the flash PROM images (default: roms)\n"
         "  --nvram FILE     NVRAM contents, kept between runs\n"
         "  --ram MB         memory size (default 256)\n"
+        "  --disk FILE      ATA disk image (primary master)\n"
+        "  --disk-size MB   create the disk image at this size if it does not exist\n"
+        "  --cdrom FILE     CD image in the drive (secondary master)\n"
         "  --cpu-mhz MHZ    processor clock (default 440)\n"
         "  --max N          stop after N instructions\n"
         "  --trace          disassemble every instruction to stderr\n"
@@ -107,6 +110,7 @@ int main(int argc, char** argv) {
     Ultra5_10::Options opt;
     u64 max = ~u64{0};
     bool trace = false;
+    u64 disk_mb = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -118,6 +122,9 @@ int main(int argc, char** argv) {
         };
         if (a == "--prom-dir") prom_dir = next();
         else if (a == "--nvram") nvram = next();
+        else if (a == "--disk") opt.disk_path = next();
+        else if (a == "--disk-size") disk_mb = std::strtoull(next().c_str(), nullptr, 0);
+        else if (a == "--cdrom") opt.cdrom_path = next();
         else if (a == "--ram") opt.ram_mb = static_cast<u32>(std::strtoul(next().c_str(), nullptr, 0));
         else if (a == "--cpu-mhz") opt.cpu_hz = std::strtod(next().c_str(), nullptr) * 1e6;
         else if (a == "--max") max = std::strtoull(next().c_str(), nullptr, 0);
@@ -148,6 +155,7 @@ int main(int argc, char** argv) {
     std::ifstream f(prom, std::ios::binary);
     opt.prom.assign(std::istreambuf_iterator<char>(f), {});
     opt.nvram_path = nvram;
+    if (disk_mb && !opt.disk_path.empty() && !fs::exists(opt.disk_path)) opt.disk_create_bytes = disk_mb << 20;
 
     Ultra5_10 m(opt);
     m.ttya().transmit = [](u8 b) {
