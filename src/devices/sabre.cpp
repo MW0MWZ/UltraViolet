@@ -12,12 +12,16 @@ namespace uv {
 namespace {
 
 // Register offsets
+constexpr u32 kUpaPortId = 0x0000;
 constexpr u32 kIommuCtl = 0x0200, kIommuTsb = 0x0208, kIommuFlush = 0x0210;
 constexpr u32 kPciImap = 0x0C00, kObioImap = 0x1000, kPciIclr = 0x1400, kObioIclr = 0x1800, kRetryTimer = 0x1A00;
 constexpr u32 kTimer = 0x1C00, kWriteSync = 0x1C20;
 constexpr u32 kPciCtl = 0x2000, kPciAfsr = 0x2010, kPciAfar = 0x2018, kPciDiag = 0x2020, kPciTasr = 0x2028;
 constexpr u32 kGfxImapAlias = 0x6000, kUpaImapAlias = 0x8000;
 constexpr u32 kResetCtl = 0xF020;
+
+// UPA port ID (read-only), as a real Ultra 10 reads it.
+constexpr u64 kUpaPortIdValue = 0x8E10002000000000ull;
 
 constexpr u64 kImapValid = 0x80000000ull, kImapTid = 0x7C000000ull;
 constexpr unsigned kStateIdle = 0, kStatePending = 3;
@@ -109,6 +113,11 @@ void Sabre::reset(bool power_on) {
     regs_.clear();
     for (unsigned i = 0; i < 8; ++i) pci_imap_[i] = (u64{kIgn} << 6) | (i << 2);
     for (unsigned i = 0; i < 32; ++i) obio_imap_[i] = (u64{kIgn} << 6) | (0x20 + i);
+    // On a real Ultra 10 the maps past the on-board devices' (0x1088-0x10C8)
+    // read with no interrupt number, and the graphics and UPA expansion maps
+    // (0x1098, 0x10A0) read 0.
+    for (unsigned i = 0x11; i <= 0x19; ++i) obio_imap_[i] = u64{kIgn} << 6;
+    obio_imap_[(0x1098 - kObioImap) >> 3] = obio_imap_[(0x10A0 - kObioImap) >> 3] = 0;
     state_.fill(kStateIdle);
     iommu_ctl_ = iommu_tsb_ = 0;
     pci_ctl_ = pci_afsr_ = pci_afar_ = pci_diag_ = pci_tasr_ = 0;
@@ -165,6 +174,7 @@ void Sabre::timer_update(unsigned n) {
 
 u64 Sabre::reg(u32 o) const {
     switch (o) {
+        case kUpaPortId: return kUpaPortIdValue;
         case kIommuCtl: return iommu_ctl_;
         case kIommuTsb: return iommu_tsb_;
         case kPciCtl: return pci_ctl_;
@@ -206,6 +216,7 @@ bool Sabre::regs_write(u64 offset, unsigned size, u64 value) {
         v = (reg(o) & ~mask) | ((value << shift) & mask);
     }
     switch (o) {
+        case kUpaPortId: return true;
         case kIommuCtl: iommu_ctl_ = v & 0x07F70007ull; return true;
         case kIommuTsb: iommu_tsb_ = v & 0x1FFFFFFE000ull; return true;
         case kIommuFlush: return true;  // translations are not cached

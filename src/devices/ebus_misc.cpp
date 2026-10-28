@@ -8,10 +8,21 @@
 
 namespace uv {
 
+namespace {
+// Registers 0x00-0x0F as a real Ultra 10 reads them at the ok prompt. OBP
+// writes 0x00-0x07 (FER 0x0F, FAR 0x11, PTR 0x80, the others 0) yet some of
+// their bits read back as 1: those bits are taken as reading 1 whatever is
+// written. 0x09-0x0F are not written by OBP and are the power-on values.
+constexpr u8 kSuperIoReadOnes[8] = {0xC0, 0x00, 0x00, 0x85, 0x80, 0x00, 0x09, 0x40};
+constexpr u8 kSuperIoPowerOn[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x36, 0x00, 0x00,
+                                    0x00, 0xCA, 0x00, 0xC7, 0x00, 0xC7, 0x0C, 0x3E};
+}  // namespace
+
 SuperIoConfig::SuperIoConfig(u8 sid) : sid_(sid) { reset(); }
 
 void SuperIoConfig::reset() {
     std::fill(std::begin(regs_), std::end(regs_), 0);
+    std::copy(std::begin(kSuperIoPowerOn), std::end(kSuperIoPowerOn), regs_);
     regs_[8] = sid_;  // SID: the chip's identification
     index_ = 0;
     first_read_ = true;
@@ -22,7 +33,7 @@ bool SuperIoConfig::read(u64 offset, unsigned, u64& value) {
         value = first_read_ ? 0x88 : index_;
         first_read_ = false;
     } else {
-        value = regs_[index_];
+        value = regs_[index_] | (index_ < 8 ? kSuperIoReadOnes[index_] : 0);
     }
     return true;
 }

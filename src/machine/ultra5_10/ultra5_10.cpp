@@ -21,7 +21,8 @@ usparc::UltraSparc::Options cpu_options(const Ultra5_10::Options& o) {
 // places them.
 constexpr u32 kEbusNvram = 0x000000, kEbusAudio = 0x200000, kEbusSuperIo = 0x300000, kEbusFloppy = 0x3023F0,
               kEbusParallel = 0x3043BC, kEbusMouse = 0x3062F8, kEbusKeyboard = 0x3083F8, kEbusSerial = 0x400000,
-              kEbusSmartCard = 0x500000, kEbusPll = 0x504000, kEbusDma = 0x700000, kEbusPower = 0x724000,
+              kEbusSmartCard = 0x500000, kEbusPll = 0x504000, kEbusEcppDma = 0x700000,
+              kEbusAudioPlayDma = 0x702000, kEbusAudioRecDma = 0x704000, kEbusFloppyDma = 0x706000, kEbusPower = 0x724000,
               kEbusAuxio = 0x726000;
 
 constexpr double kPciHz = 66.0e6;      // the APB's primary bus clock, which its tick register counts
@@ -92,14 +93,26 @@ Ultra5_10::Ultra5_10(const Options& options)
     block("ecpp", kEbusParallel, 8);
     block("smartcard", kEbusSmartCard, 0x100);
     block("pll", kEbusPll, 0x100);
-    block("ebus-dma", kEbusDma, 0x20000);
+    ebus_.add(kEbusEcppDma, EbusDma::kSize, &ecpp_dma_, false);
+    ebus_.add(kEbusAudioPlayDma, EbusDma::kSize, &audio_play_dma_, false);
+    ebus_.add(kEbusAudioRecDma, EbusDma::kSize, &audio_rec_dma_, false);
+    ebus_.add(kEbusFloppyDma, EbusDma::kSize, &fd_dma_, false);
     block("power", kEbusPower, 0x100);
     block("auxio", kEbusAuxio, 0x100);
 
     su_kbd_.set_irq_sink([this](bool a) { sabre_.set_interrupt(kInoKeyboard, a); });
     su_mouse_.set_irq_sink([this](bool a) { sabre_.set_interrupt(kInoMouse, a); });
     se_.set_irq_sink([this](bool a) { sabre_.set_interrupt(kInoSerial, a); });
-    fdc_.set_irq_sink([this](bool a) { sabre_.set_interrupt(kInoFloppy, a); });
+    // The floppy controller's interrupt reaches the system through its DMA
+    // channel (INT_PEND, gated by INT_EN), as do the other EBus DMA devices'.
+    fdc_.set_irq_sink([this](bool a) { fd_dma_.set_device_irq(a); });
+    fd_dma_.set_irq_sink([this](bool a) { sabre_.set_interrupt(kInoFloppy, a); });
+    ecpp_dma_.set_irq_sink([this](bool a) { sabre_.set_interrupt(kInoParallel, a); });
+    audio_play_dma_.set_irq_sink([this](bool a) { sabre_.set_interrupt(kInoAudioPlay, a); });
+    audio_rec_dma_.set_irq_sink([this](bool a) { sabre_.set_interrupt(kInoAudioRecord, a); });
+    for (EbusDma* d : {&ecpp_dma_, &audio_play_dma_, &audio_rec_dma_, &fd_dma_})
+        d->set_dma_port([this](u32 a, u8* p, std::size_t n) { return sabre_.dma_read(a, p, n); },
+                        [this](u32 a, const u8* p, std::size_t n) { return sabre_.dma_write(a, p, n); });
 
     // IDE: the disk (if any) on the primary channel, the CD-ROM drive as
     // master of the secondary.
@@ -151,6 +164,7 @@ void Ultra5_10::reset() {
     su_mouse_.reset();
     se_.reset();
     fdc_.reset();
+    for (EbusDma* d : {&ecpp_dma_, &audio_play_dma_, &audio_rec_dma_, &fd_dma_}) d->reset();
     cpu_.reset();
 }
 
