@@ -68,6 +68,9 @@ private:
     double cpu_hz_;
     std::unique_ptr<Channel> ch_[2];
     std::function<void(bool)> irq_;
+    // An interrupt status register's readable bits: all of them with IPC:VIS
+    // set, else only the unmasked ones.
+    u8 visible(u8 status, u8 mask) const;
     u8 ipc_ = 0, iva_ = 0, pvr_ = 0, pim_ = 0xFF, pcr_ = 0, pis_ = 0;
 };
 

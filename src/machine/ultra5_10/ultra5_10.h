@@ -20,6 +20,7 @@
 #include "cpu/ultrasparc/ultrasparc.h"
 #include "devices/atapi_cdrom.h"
 #include "devices/cmd646.h"
+#include "devices/ebus_dma.h"
 #include "devices/ebus_misc.h"
 #include "devices/fdc82077.h"
 #include "devices/m48t59.h"
@@ -119,6 +120,8 @@ private:
     Ns16550 su_kbd_, su_mouse_;
     Sab82532 se_;
     Fdc82077 fdc_;
+    // EBus DMA channels: parallel port, audio playback and capture, floppy.
+    EbusDma ecpp_dma_{"ecpp-dma"}, audio_play_dma_{"audio-play-dma"}, audio_rec_dma_{"audio-rec-dma"}, fd_dma_{"fd-dma"};
     Cmd646 ide_;
     DiskImage disk_image_, cd_image_;
     std::unique_ptr<AtaDisk> disk_;

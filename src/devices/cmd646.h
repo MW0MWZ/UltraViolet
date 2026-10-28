@@ -53,7 +53,7 @@ private:
     u8 intr_ = 0;     // latched interrupt status: bit 0 primary, bit 1 secondary
     u8 mrdmode_ = 0;  // MRDMODE without its status bits
     u8 bmidecsr_ = 0;
-    std::array<u8, 2> udidetcr_{};
+    std::array<u8, 2> udidetcr_{0xF0, 0xF0};  // as a real Ultra 10 reads them
 };
 
 }  // namespace uv

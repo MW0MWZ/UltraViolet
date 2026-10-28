@@ -55,6 +55,7 @@ add_library(uv_emu STATIC
   src/devices/sab82532.cpp
   src/devices/m48t59.cpp
   src/devices/ebus_misc.cpp
+  src/devices/ebus_dma.cpp
   src/devices/fdc82077.cpp
   src/devices/ata.cpp
   src/devices/atapi_cdrom.cpp

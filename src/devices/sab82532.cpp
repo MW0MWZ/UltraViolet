@@ -24,6 +24,7 @@ constexpr unsigned kStar = 0x20, kCmdr = 0x20, kMode = 0x22, kTimr = 0x23, kXon 
                    kIva = 0x38, kIpc = 0x39, kIsr0 = 0x3A, kImr0 = 0x3A, kIsr1 = 0x3B, kImr1 = 0x3B, kPvr = 0x3C,
                    kPis = 0x3D, kPim = 0x3D, kPcr = 0x3E, kCcr4 = 0x3F;
 constexpr u8 kVersion = 0x02;  // VSTR: version 3.2, carrier present (CD = 0)
+constexpr u8 kIpcVis = 0x80;   // IPC: masked interrupt statuses visible
 }  // namespace
 
 Sab82532::Channel::Channel(Sab82532& c, SerialLine& l)
@@ -181,14 +182,17 @@ bool Sab82532::Channel::read(unsigned reg, u8& v) {
         case kCcr2: v = ccr2; return true;
         case kCcr3: v = ccr3; return true;
         case kVstr: v = kVersion; return true;
+        // The status bits clear on read. Masked bits are shown (and cleared)
+        // only with IPC:VIS set; otherwise they stay stored, unseen, until
+        // their mask is withdrawn.
         case kIsr0:
-            v = isr0;
-            isr0 = 0;
+            v = chip.visible(isr0, imr0);
+            isr0 &= static_cast<u8>(~v);
             chip.update_irq();
             return true;
         case kIsr1:
-            v = isr1;
-            isr1 = 0;  // the event bits clear on read
+            v = chip.visible(isr1, imr1);
+            isr1 &= static_cast<u8>(~v);
             chip.update_irq();
             return true;
         case kCcr4: v = ccr4; return true;
@@ -263,6 +267,8 @@ void Sab82532::poll_lines() {
         if (!c->rx_timer.active() && c->line.rx_pending()) c->rx_timer.schedule_in(c->char_cycles());
 }
 
+u8 Sab82532::visible(u8 status, u8 mask) const { return (ipc_ & kIpcVis) ? status : static_cast<u8>(status & ~mask); }
+
 void Sab82532::update_irq() {
     bool pending = false;
     for (auto& c : ch_)
@@ -286,10 +292,12 @@ bool Sab82532::read(u64 offset, unsigned, u64& value) {
         }
         case kIpc: value = ipc_; return true;
         case kPvr: value = pvr_; return true;
-        case kPis:
-            value = pis_;
-            pis_ = 0;
+        case kPis: {
+            const u8 v = visible(pis_, pim_);
+            pis_ &= static_cast<u8>(~v);
+            value = v;
             return true;
+        }
         case kPcr: value = pcr_; return true;
         default: {
             u8 v;
