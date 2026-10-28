@@ -24,7 +24,9 @@ void RioEbus::set_prom(Device* prom, u32 size) {
     prom_size_ = size;
 }
 
-void RioEbus::add(u32 offset, u32 size, Device* device) { children_.push_back({offset, size, device}); }
+void RioEbus::add(u32 offset, u32 size, Device* device, bool byte_wide) {
+    children_.push_back({offset, size, device, byte_wide});
+}
 
 // The PCI side carries values in little-endian significance; EBus devices
 // see bytes in address order, as the processor's big-endian accesses do.
@@ -47,7 +49,15 @@ bool RioEbus::bar_read(unsigned bar, u32 offset, unsigned size, u64& value) {
     for (const Child& c : children_) {
         if (offset - c.offset < c.size) {
             u64 v = 0;
-            c.device->read(offset - c.offset, size, v);
+            if (c.byte_wide) {
+                for (unsigned i = 0; i < size; ++i) {
+                    u64 b = 0;
+                    c.device->read(offset - c.offset + i, 1, b);
+                    v = (v << 8) | (b & 0xFF);
+                }
+            } else {
+                c.device->read(offset - c.offset, size, v);
+            }
             value = to_bus(v, size);
             return true;
         }
@@ -67,7 +77,12 @@ bool RioEbus::bar_write(unsigned bar, u32 offset, unsigned size, u64 value) {
     }
     for (const Child& c : children_) {
         if (offset - c.offset < c.size) {
-            c.device->write(offset - c.offset, size, to_bus(value, size));
+            const u64 v = to_bus(value, size);
+            if (c.byte_wide) {
+                for (unsigned i = 0; i < size; ++i) c.device->write(offset - c.offset + i, 1, (v >> (8 * (size - 1 - i))) & 0xFF);
+            } else {
+                c.device->write(offset - c.offset, size, v);
+            }
             return true;
         }
     }

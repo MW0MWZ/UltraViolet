@@ -23,7 +23,14 @@ Cmd646::Cmd646(Scheduler& scheduler, double cpu_hz)
     set_cfg8(pci::kInterruptPin, 1);
     set_cfg8(pci::kMinGrant, 0x02);
     set_cfg8(pci::kMaxLatency, 0x04);
-    set_cfg8(kCntrl, 0x0C);  // both channels enabled
+    // Power-on values as a real Ultra 10 reads them at the ok prompt (OBP
+    // does not write them); CNTRL has both channels enabled.
+    set_cfg8(kCfr, 0x40);
+    set_cfg8(kCntrl, 0xEC);
+    set_cfg8(0x53, 0xC0);  // ARTTIM0
+    set_cfg8(0x55, 0xC0);  // ARTTIM1
+    set_cfg8(kArttim23, 0xCC);
+    set_cfg8(0x59, 0x40);  // BRST
     set_wmask(pci::kClassProg, 1, 0x05);
     set_wmask(kCfr, 1, 0xF8);
     set_wmask(kCntrl, 1, 0xFF);
@@ -43,7 +50,7 @@ Cmd646::Cmd646(Scheduler& scheduler, double cpu_hz)
 void Cmd646::reset() {
     pci::Function::reset();
     intr_ = mrdmode_ = bmidecsr_ = 0;
-    udidetcr_ = {};
+    udidetcr_ = {0xF0, 0xF0};
     level_ = {};
     ch0_.reset();
     ch1_.reset();

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andy Taylor
+#include <algorithm>
 #include <ctime>
 #include <string>
 #include <vector>
 
 #include "core/endian.h"
+#include "devices/ebus_dma.h"
 #include "devices/fdc82077.h"
 #include "devices/m48t59.h"
 #include "devices/ns16550.h"
@@ -67,6 +69,51 @@ TEST(machine_boot_prom_and_nvram_are_reachable_at_power_on) {
     u16 n = 0;
     CHECK(m.bus().read(0x1FFF1000010ull, n));
     CHECK_EQ(n, 0x1234u);
+}
+
+TEST(machine_wide_ebus_accesses_reach_byte_devices_as_byte_cycles) {
+    Ultra5_10 m(small_options());
+    // A 16-bit store to the serial controller's MODE/TIMR pair writes both
+    // registers, in address order, as the EBus splits it into byte cycles.
+    CHECK(m.bus().write(0x1FFF1400022ull, u16{0x1234}));
+    u8 mode = 0, timr = 0;
+    CHECK(m.bus().read(0x1FFF1400022ull, mode));
+    CHECK(m.bus().read(0x1FFF1400023ull, timr));
+    CHECK_EQ(mode, 0x12u);
+    CHECK_EQ(timr, 0x34u);
+    u16 both = 0;
+    CHECK(m.bus().read(0x1FFF1400022ull, both));
+    CHECK_EQ(both, 0x1234u);
+}
+
+TEST(machine_power_on_registers_read_as_on_a_real_ultra_10) {
+    Ultra5_10 m(small_options());
+    u64 port_id = 0, imap = 1;
+    CHECK(m.bus().read(Sabre::kRegsBase, port_id));
+    CHECK_EQ(port_id, 0x8E10002000000000ull);
+    CHECK(m.bus().read(Sabre::kRegsBase + 0x1098, imap));  // graphics interrupt map
+    CHECK_EQ(imap, 0u);
+    CHECK(m.bus().read(Sabre::kRegsBase + 0x10A8, imap));
+    CHECK_EQ(imap, 0x7C0u);
+    cfg_write32(m, cfg(0, 1, 1, 0x18), 0x00010100);  // bus A as bus 1
+    CHECK_EQ(cfg_read32(m, cfg(1, 3, 0, 0x50)), 0xC000EC40u);  // CMD646 CFR, CNTRL, CMDTIM, ARTTIM0
+    CHECK_EQ(cfg_read32(m, cfg(1, 3, 0, 0x54)), 0xCC00C000u);
+    CHECK_EQ(cfg_read32(m, cfg(1, 3, 0, 0x58)), 0x00004000u);
+    CHECK_EQ(cfg_read32(m, cfg(1, 3, 0, 0x70)) >> 24, 0xF0u);  // UDIDETCR0
+    // SuperIO: OBP's FER value reads back with bits 7:6 set; SID 0x90.
+    const u64 sio = 0x1FFF130015Cull;
+    CHECK(m.bus().write(sio, u8{0}));
+    CHECK(m.bus().write(sio + 1, u8{0x0F}));
+    u8 b = 0;
+    CHECK(m.bus().read(sio + 1, b));
+    CHECK_EQ(b, 0xCFu);
+    CHECK(m.bus().write(sio, u8{8}));
+    CHECK(m.bus().read(sio + 1, b));
+    CHECK_EQ(b, 0x90u);
+    // EBus DMA channels report device ID 0xC.
+    u32 csr = 0;
+    CHECK(m.bus().read(0x1FFF1706000ull, csr));
+    CHECK_EQ(byteswap(csr) >> 28, 0xCu);
 }
 
 TEST(machine_memory_banks_mirror_and_empty_banks_read_zero) {
@@ -223,7 +270,84 @@ TEST(sab82532_transmit_fifo_fills_in_order_at_any_address) {
     CHECK(out == "abc");
     CHECK(irq);
     se.read(0x3B, 1, v);
-    CHECK_EQ(v & 0x21, 0x21u);  // XPR and ALLS
+    CHECK_EQ(v, 0x01u);  // XPR; ALLS is masked, so not shown (IPC:VIS clear)
+    CHECK(!irq);
+}
+
+TEST(sab82532_masked_statuses_stay_hidden_and_stored_unless_ipc_vis) {
+    Scheduler s;
+    u64 now = 0;
+    s.set_clock([&] { return now; });
+    SerialLine a, b;
+    Sab82532 se(s, a, b, Sab82532::kClockHz / 16.0);
+    bool irq = false;
+    se.set_irq_sink([&](bool on) { irq = on; });
+    u64 v = 0;
+    se.read(0x3B, 1, v);      // clear the reset XPR/ALLS
+    se.write(0x3A, 1, 0xFF);  // IMR0: receive statuses masked
+    se.write(0x28, 1, 0x04);  // RFC: threshold 4, so a lone character ends in TIME
+    a.receive('x');
+    se.poll_lines();
+    for (int i = 0; i < 40; ++i) {  // the character, then the line idle: TIME
+        now += 11;
+        s.run_due(now);
+    }
+    CHECK(!irq);
+    se.read(0x3A, 1, v);  // IPC:VIS clear: the masked TIME is not shown...
+    CHECK_EQ(v, 0u);
+    se.write(0x3A, 1, 0xBF);  // ...and is still there when TIME is unmasked
+    CHECK(irq);
+    se.read(0x3A, 1, v);
+    CHECK_EQ(v, 0x40u);
+    CHECK(!irq);
+    // With IPC:VIS set, masked statuses are shown and cleared by the read.
+    se.write(0x39, 1, 0x80);
+    se.write(0x3A, 1, 0xFF);
+    se.write(0x20, 1, 0x20);  // CMDR: RFRD gives TCD for the byte still in the FIFO
+    CHECK(!irq);
+    se.read(0x3A, 1, v);
+    CHECK_EQ(v, 0x80u);
+    se.write(0x3A, 1, 0x00);
+    CHECK(!irq);
+}
+
+TEST(ebus_dma_routes_device_interrupts_and_counts_to_terminal_count) {
+    EbusDma dma("test-dma");
+    std::vector<u8> mem(64);
+    dma.set_dma_port([&](u32 a, u8* d, std::size_t n) { std::copy_n(mem.begin() + a, n, d); return true; },
+                     [&](u32 a, const u8* d, std::size_t n) { std::copy_n(d, n, mem.begin() + a); return true; });
+    bool irq = false;
+    dma.set_irq_sink([&](bool on) { irq = on; });
+    // The registers are little-endian: the bus carries bytes in address order.
+    auto put = [&](unsigned reg, u32 v) { dma.write(reg, 4, byteswap(v)); };
+    auto get = [&](unsigned reg) {
+        u64 v = 0;
+        dma.read(reg, 4, v);
+        return byteswap(static_cast<u32>(v));
+    };
+    dma.set_device_irq(true);
+    CHECK(get(0) & EbusDma::kIntPend);
+    CHECK(!irq);  // INT_EN is clear
+    put(0, EbusDma::kIntEn);
+    CHECK(irq);
+    dma.set_device_irq(false);
+    CHECK(!irq);
+    CHECK(!(get(0) & EbusDma::kIntPend));
+    // Four bytes to memory at 0x10, counted to terminal count.
+    put(0, EbusDma::kIntEn | EbusDma::kWrite | EbusDma::kEnDma | EbusDma::kEnCnt);
+    put(4, 0x10);
+    put(8, 4);
+    CHECK(get(0) & EbusDma::kALoaded);
+    const u8 data[6] = {1, 2, 3, 4, 5, 6};
+    CHECK_EQ(dma.to_memory(data, 6), 4u);
+    CHECK(mem[0x10] == 1 && mem[0x13] == 4 && mem[0x14] == 0);
+    CHECK_EQ(get(4), 0x14u);
+    CHECK_EQ(get(8), 0u);
+    CHECK((get(0) & (EbusDma::kTc | EbusDma::kIntPend | EbusDma::kALoaded)) == (EbusDma::kTc | EbusDma::kIntPend));
+    CHECK(irq);
+    CHECK_EQ(dma.to_memory(data, 6), 0u);  // nothing loaded
+    put(0, get(0));  // writing the CSR back clears TC, as drivers do
+    CHECK(!(get(0) & EbusDma::kTc));
     CHECK(!irq);
 }
 

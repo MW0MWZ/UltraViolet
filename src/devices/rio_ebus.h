@@ -24,9 +24,12 @@ public:
     RioEbus();
     const char* name() const override { return "ebus"; }
 
-    // Devices in BAR0 (the PROM) and BAR1 (the rest), at `offset`.
+    // Devices in BAR0 (the PROM) and BAR1 (the rest), at `offset`. The
+    // EBus is 8 bits wide: an access wider than a byte reaches a device as
+    // byte cycles in address order, except for the RIO's own registers
+    // (its DMA engines), which take the access whole (`byte_wide` false).
     void set_prom(Device* prom, u32 size);
-    void add(u32 offset, u32 size, Device* device);
+    void add(u32 offset, u32 size, Device* device, bool byte_wide = true);
 
 protected:
     bool bar_read(unsigned bar, u32 offset, unsigned size, u64& value) override;
@@ -36,6 +39,7 @@ private:
     struct Child {
         u32 offset, size;
         Device* device;
+        bool byte_wide;
     };
     // PCI byte order to EBus (address order) and back.
     static u64 to_bus(u64 v, unsigned size);
