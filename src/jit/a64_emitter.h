@@ -105,9 +105,13 @@ public:
         return emit_site(0x36000000u | ((bit >> 5) << 31) | ((bit & 31) << 19) | r, Fix::B14);
     }
     void b_to(std::size_t target) { bind_to(b(), target); }
-    // A branch to `target`, this code being placed at `base` (within 128 MiB).
+    // A branch (or BL, with the return address in x30) to `target`, this
+    // code being placed at `base` (within 128 MiB).
     void b_abs(const u8* target, const u8* base) {
         emit(0x14000000u | (static_cast<u32>((target - (base + code_.size())) / 4) & 0x03FFFFFFu));
+    }
+    void bl_abs(const u8* target, const u8* base) {
+        emit(0x94000000u | (static_cast<u32>((target - (base + code_.size())) / 4) & 0x03FFFFFFu));
     }
     // ADR: d = the address the site is bound to.
     Site adr(Reg d) { return emit_site(0x10000000u | d, Fix::Adr); }
@@ -203,7 +207,9 @@ public:
     void sub(Reg d, Reg n, Reg m, bool w64 = true) { rrr(0x4B000000u, d, n, m, w64); }
     void cmp(Reg n, Reg m, bool w64 = true) { rrr(0x6B000000u, xzr, n, m, w64); }
     void and_(Reg d, Reg n, Reg m, bool w64 = true) { rrr(0x0A000000u, d, n, m, w64); }
-    void orr(Reg d, Reg n, Reg m, bool w64 = true) { rrr(0x2A000000u, d, n, m, w64); }
+    void orr(Reg d, Reg n, Reg m, bool w64 = true, Shift sh = Shift::Lsl, unsigned amount = 0) {
+        rrr(0x2A000000u, d, n, m, w64, sh, amount);
+    }
     void eor(Reg d, Reg n, Reg m, bool w64 = true) { rrr(0x4A000000u, d, n, m, w64); }
     void mvn(Reg d, Reg m, bool w64 = true) { rrr(0x2A200000u, d, xzr, m, w64); }  // ORN d, zr, m
     void tst(Reg n, Reg m, bool w64 = true) { rrr(0x6A000000u, xzr, n, m, w64); }
@@ -221,6 +227,10 @@ public:
     void lsr(Reg d, Reg n, unsigned s, bool w64 = true) { bfm(0x53000000u, d, n, s, w64 ? 63 : 31, w64); }
     void asr(Reg d, Reg n, unsigned s, bool w64 = true) { bfm(0x13000000u, d, n, s, w64 ? 63 : 31, w64); }
     void ubfiz(Reg d, Reg n, unsigned lsb, unsigned width) { bfm(0x53000000u, d, n, (64 - lsb) % 64, width - 1, true); }
+    void ubfx(Reg d, Reg n, unsigned lsb, unsigned width, bool w64 = true) { bfm(0x53000000u, d, n, lsb, lsb + width - 1, w64); }
+    void ror(Reg d, Reg n, unsigned s, bool w64 = true) {  // EXTR d, n, n, #s
+        emit((w64 ? 0x93C00000u : 0x13800000u) | (u32{n} << 16) | (s << 10) | (u32{n} << 5) | d);
+    }
     void sxtw(Reg d, Reg n) { bfm(0x13000000u, d, n, 0, 31, true); }
     void sxth(Reg d, Reg n) { bfm(0x13000000u, d, n, 0, 15, true); }
     void sxtb(Reg d, Reg n) { bfm(0x13000000u, d, n, 0, 7, true); }
@@ -234,6 +244,9 @@ public:
     void csel(Reg d, Reg n, Reg m, Cond c) {  // d = c ? n : m (64-bit)
         emit(0x9A800000u | (u32{m} << 16) | (static_cast<u32>(c) << 12) | (u32{n} << 5) | d);
     }
+    void csinc(Reg d, Reg n, Reg m, Cond c, bool w64 = true) {  // d = c ? n : m + 1
+        emit((w64 ? 0x9A800400u : 0x1A800400u) | (u32{m} << 16) | (static_cast<u32>(c) << 12) | (u32{n} << 5) | d);
+    }
     void cset(Reg d, Cond c) {  // CSINC d, zr, zr, !c
         emit(0x9A800400u | (31u << 16) | (static_cast<u32>(invert(c)) << 12) | (31u << 5) | d);
     }
@@ -246,6 +259,11 @@ public:
         if (v < 0) return add_sub_imm(true, true, d, n, static_cast<u64>(-v), w64);
         add_sub_imm(false, true, d, n, static_cast<u64>(v), w64);
     }
+    // With carry in (C; for SBC, C = no borrow), and setting the flags.
+    void adc(Reg d, Reg n, Reg m, bool w64 = true) { rrr(0x1A000000u, d, n, m, w64); }
+    void adcs(Reg d, Reg n, Reg m, bool w64 = true) { rrr(0x3A000000u, d, n, m, w64); }
+    void sbc(Reg d, Reg n, Reg m, bool w64 = true) { rrr(0x5A000000u, d, n, m, w64); }
+    void sbcs(Reg d, Reg n, Reg m, bool w64 = true) { rrr(0x7A000000u, d, n, m, w64); }
     void sdiv(Reg d, Reg n, Reg m, bool w64 = true) { rrr(0x1AC00C00u, d, n, m, w64); }
     void udiv(Reg d, Reg n, Reg m, bool w64 = true) { rrr(0x1AC00800u, d, n, m, w64); }
     void msub(Reg d, Reg n, Reg m, Reg a, bool w64 = true) {  // d = a - n * m
@@ -259,6 +277,9 @@ public:
     void fop(Fop op, bool dbl, unsigned d, unsigned n, unsigned m) {
         emit(0x1E200000u | (dbl ? 0x400000u : 0) | (m << 16) | static_cast<u32>(op) | (n << 5) | d);
     }
+    // CNT Vd.8B, Vn.8B (ones in each byte) and ADDV Bd, Vn.8B (their sum).
+    void cnt8b(unsigned d, unsigned n) { emit(0x0E205800u | (n << 5) | d); }
+    void addv8b(unsigned d, unsigned n) { emit(0x0E31B800u | (n << 5) | d); }
     void fsqrt(bool dbl, unsigned d, unsigned n) { emit(0x1E21C000u | (dbl ? 0x400000u : 0) | (n << 5) | d); }
     void fmov(bool dbl, unsigned d, unsigned n) { emit(0x1E204000u | (dbl ? 0x400000u : 0) | (n << 5) | d); }
     // d = a - n * m (FMSUB), d = n * m - a (FNMSUB)
@@ -269,6 +290,7 @@ public:
         emit(0x1F208000u | (dbl ? 0x400000u : 0) | (m << 16) | (a << 10) | (n << 5) | d);
     }
     void fcmp(bool dbl, unsigned n, unsigned m) { emit(0x1E202000u | (dbl ? 0x400000u : 0) | (m << 16) | (n << 5)); }
+    void fcmpe(bool dbl, unsigned n, unsigned m) { emit(0x1E202010u | (dbl ? 0x400000u : 0) | (m << 16) | (n << 5)); }  // invalid on any NaN
     void fcvt_to_single(unsigned d, unsigned n) { emit(0x1E624000u | (n << 5) | d); }  // FCVT Sd, Dn
     void fcvt_to_double(unsigned d, unsigned n) { emit(0x1E22C000u | (n << 5) | d); }  // FCVT Dd, Sn
     // To a 32- or 64-bit integer, rounding as `rm` (SPARC FSR.RD order; 0 nearest even:
@@ -281,7 +303,9 @@ public:
     void scvtf(bool dbl, unsigned d, Reg n, bool x64 = false) {
         emit(0x1E220000u | (x64 ? 0x80000000u : 0) | (dbl ? 0x400000u : 0) | (u32{n} << 5) | d);
     }
-    // MRS and MSR of FPCR and FPSR.
+    // MRS and MSR of NZCV (the flags at bits 31:28), FPCR and FPSR.
+    void mrs_nzcv(Reg t) { emit(0xD53B4200u | t); }
+    void msr_nzcv(Reg t) { emit(0xD51B4200u | t); }
     void mrs_fpcr(Reg t) { emit(0xD53B4400u | t); }
     void msr_fpcr(Reg t) { emit(0xD51B4400u | t); }
     void mrs_fpsr(Reg t) { emit(0xD53B4420u | t); }

@@ -35,7 +35,7 @@ struct Rig {
     }
     void put(u64 addr, std::initializer_list<u32> code) {
         for (u32 w : code) {
-            store_be<u32>(ram.data() + addr, w);
+            bus.write(addr, w);  // through the bus, so decoded copies of it are dropped
             addr += 4;
         }
     }

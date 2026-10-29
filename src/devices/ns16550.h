@@ -22,6 +22,7 @@ public:
 
     const char* name() const override { return "ns16550"; }
     bool read(u64 offset, unsigned size, u64& value) override;
+    u64 stable_until(u64 offset, unsigned size) const override;
     bool write(u64 offset, unsigned size, u64 value) override;
 
     void reset();
@@ -33,17 +34,30 @@ public:
     void set_modem_inputs(bool cts, bool dsr, bool ri, bool dcd);
 
 private:
+    // A received character and its errors (LSR PE, FE and BI bits).
+    struct RxChar {
+        u8 byte, errors;
+    };
+
     void update_irq();
+    LineFormat format() const;
     u64 char_cycles() const;
+    u64 device_cycles() const;  // a character time on the line (the device's, if it has one)
     void tx_done();
     void rx_tick();
+    void rx_push(u8 byte, u8 errors);
+    void rx_top_errors();
 
     SerialLine& line_;
     double clock_hz_, cpu_hz_;
     Timer tx_timer_, rx_timer_;
     std::function<void(bool)> irq_;
 
-    std::deque<u8> rx_fifo_, tx_fifo_;
+    std::deque<RxChar> rx_fifo_;
+    std::deque<u8> tx_fifo_;
+    // To a device with a rate of its own: its bit stream, each way.
+    WireDecoder rx_wire_, tx_wire_;
+    bool rx_streaming_ = false, tx_streaming_ = false;  // the last character straight after the one before
     u8 ier_ = 0, lcr_ = 0, mcr_ = 0, lsr_ = 0x60, msr_ = 0, scr_ = 0, fcr_ = 0;
     u16 divisor_ = 12;
     bool thre_pending_ = false;  // THR empty interrupt not yet acknowledged

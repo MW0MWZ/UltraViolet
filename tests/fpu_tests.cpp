@@ -42,6 +42,56 @@ TEST(fpu_rounding_follows_fsr_rd) {
     CHECK_EQ(r.cpu.freg32(3), 0x3EAAAAAAu);
 }
 
+TEST(fpu_conversions_and_square_roots_round_by_fsr_rd_and_report_inexact) {
+    // FxTOs, FxTOd, FiTOs, FdTOs and FSQRTd of values none of them can give
+    // exactly, in each rounding mode (nearest, zero, +inf, -inf).
+    constexpr u32 xtos[4] = {0x5EE00000, 0x5EDFFFFF, 0x5EE00000, 0x5EDFFFFF};
+    constexpr u64 xtod[4] = {0x43DC000000000000, 0x43DBFFFFFFFFFFFF, 0x43DC000000000000, 0x43DBFFFFFFFFFFFF};
+    constexpr u32 itos[4] = {0x4F000000, 0x4EFFFFFF, 0x4F000000, 0x4EFFFFFF};
+    constexpr u32 dtos[4] = {0x3EAAAAAB, 0x3EAAAAAA, 0x3EAAAAAB, 0x3EAAAAAA};
+    constexpr u64 sqrt2[4] = {0x3FF6A09E667F3BCD, 0x3FF6A09E667F3BCC, 0x3FF6A09E667F3BCD, 0x3FF6A09E667F3BCC};
+    for (unsigned rd = 0; rd < 4; ++rd) {
+        Rig r;
+        r.cpu.set_freg64(dreg(2), 0x6FFFFFFFFFFFFFFF);
+        r.cpu.set_freg32(4, 0x7FFFFFFF);
+        r.cpu.set_freg64(dreg(6), fd(1.0 / 3.0));
+        r.cpu.set_freg64(dreg(8), fd(2.0));
+        const u32 ops[] = {FPOP1(10, 0, dreg(2), 0x084), FPOP1(dreg(12), 0, dreg(2), 0x088), FPOP1(14, 0, 4, 0x0C4),
+                           FPOP1(15, 0, dreg(6), 0x0C6), FPOP1(dreg(16), 0, dreg(8), 0x02A)};
+        for (u32 op : ops) {
+            r.cpu.set_fsr(u64{rd} << 30);
+            r.exec({op});
+            CHECK_EQ(r.cpu.fsr() & 0x3FF, 0x21u);  // cexc and aexc: inexact
+        }
+        CHECK_EQ(r.cpu.freg32(10), xtos[rd]);
+        CHECK_EQ(r.cpu.freg64(dreg(12)), xtod[rd]);
+        CHECK_EQ(r.cpu.freg32(14), itos[rd]);
+        CHECK_EQ(r.cpu.freg32(15), dtos[rd]);
+        CHECK_EQ(r.cpu.freg64(dreg(16)), sqrt2[rd]);
+    }
+}
+
+TEST(vis_array_converts_3d_fixed_point_to_blocked_byte_offsets) {
+    // x, y, z integers 0x5A5, 0x3C3, 0x1A3 with fractions in every fraction
+    // field; X/Y size n of 0, 3 and 5, and 7 (taken as 5); ARRAY8, 16, 32.
+    Rig r;
+    r.cpu.set_reg(g1, 0xD1DA5786AC6D2ED3);
+    const u64 want[3][3] = {{0x1A213D, 0x34427A, 0x6884F4},
+                            {0x6FC213D, 0xDF8427A, 0x1BF084F4},
+                            {0x6BEC213D, 0xD7D8427A, 0x1AFB084F4}};
+    const unsigned sizes[3] = {0, 3, 5};
+    for (unsigned k = 0; k < 3; ++k) {
+        r.cpu.set_reg(g2, sizes[k]);
+        r.exec({VIS(l0, g1, g2, 0x010), VIS(l1, g1, g2, 0x012), VIS(l2, g1, g2, 0x014)});
+        CHECK_EQ(r.cpu.reg(l0), want[k][0]);
+        CHECK_EQ(r.cpu.reg(l1), want[k][1]);
+        CHECK_EQ(r.cpu.reg(l2), want[k][2]);
+    }
+    r.cpu.set_reg(g2, 0xF0F7);  // upper bits ignored, 7 as 5
+    r.exec({VIS(l0, g1, g2, 0x010)});
+    CHECK_EQ(r.cpu.reg(l0), want[2][0]);
+}
+
 TEST(fpu_nans_follow_sparc_rules) {
     Rig r;
     r.cpu.set_freg32(1, 0x7FC00001);  // quiet NaN
@@ -55,6 +105,32 @@ TEST(fpu_nans_follow_sparc_rules) {
     r.exec({FPOP1(3, 1, 2, 0x049)});
     CHECK_EQ(r.cpu.freg32(3), 0x7FFFFFFFu);  // the default NaN
     CHECK(r.cpu.fsr() & 0x10);
+}
+
+TEST(fpu_square_roots_of_negatives_are_invalid_and_of_minus_zero_are_minus_zero) {
+    Rig r;
+    r.cpu.set_freg32(1, fs(-4.0f));
+    r.cpu.set_freg64(dreg(2), fd(-1e-300));
+    r.exec({FPOP1(3, 0, 1, 0x029)});
+    CHECK_EQ(r.cpu.freg32(3), 0x7FFFFFFFu);  // the default NaN
+    CHECK_EQ(r.cpu.fsr() & 0x1F, 0x10u);     // nv only
+    CHECK_EQ((r.cpu.fsr() >> 5) & 0x1F, 0x10u);
+    r.cpu.set_fsr(0);
+    r.exec({FPOP1(dreg(4), 0, dreg(2), 0x02A)});
+    CHECK_EQ(r.cpu.freg64(dreg(4)), 0x7FFFFFFFFFFFFFFFull);
+    CHECK_EQ(r.cpu.fsr() & 0x1F, 0x10u);
+    r.cpu.set_fsr(0);
+    r.cpu.set_freg64(dreg(2), fd(-0.0));
+    r.exec({FPOP1(dreg(4), 0, dreg(2), 0x02A)});
+    CHECK_EQ(r.cpu.freg64(dreg(4)), fd(-0.0));
+    CHECK_EQ(r.cpu.fsr() & 0x1F, 0u);
+    // With the invalid trap enabled, it traps and rd keeps its value.
+    r.cpu.set_fsr(kTemNv);
+    r.cpu.set_freg32(3, fs(42.0f));
+    r.exec({FPOP1(3, 0, 1, 0x029)}, 1);
+    CHECK_EQ(r.cpu.trap_type(1), tt::kFpExceptionIeee754);
+    CHECK_EQ(r.cpu.fsr() & 0x1F, 0x10u);
+    CHECK_EQ(r.cpu.freg32(3), fs(42.0f));
 }
 
 TEST(fpu_enabled_exception_traps_without_writing_the_result) {

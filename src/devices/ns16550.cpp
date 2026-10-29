@@ -7,7 +7,8 @@
 namespace uv {
 
 namespace {
-constexpr u8 kLsrDr = 0x01, kLsrOe = 0x02, kLsrThre = 0x20, kLsrTemt = 0x40;
+constexpr u8 kLsrDr = 0x01, kLsrOe = 0x02, kLsrPe = 0x04, kLsrFe = 0x08, kLsrBi = 0x10, kLsrThre = 0x20,
+             kLsrTemt = 0x40, kLsrFifoError = 0x80;
 constexpr u8 kIerRda = 0x01, kIerThre = 0x02, kIerRls = 0x04, kIerMs = 0x08;
 constexpr u8 kMcrLoop = 0x10;
 constexpr unsigned kFifoDepth = 16;
@@ -28,16 +29,24 @@ void Ns16550::reset() {
     lsr_ = kLsrThre | kLsrTemt;
     msr_ = msr_inputs_;
     divisor_ = 12;
+    rx_wire_ = {}, tx_wire_ = {};
+    rx_streaming_ = tx_streaming_ = false;
     thre_pending_ = false;
     rx_timeout_ = false;
     update_irq();
 }
 
-u64 Ns16550::char_cycles() const {
-    const unsigned data = 5 + (lcr_ & 3), stop = (lcr_ & 4) ? 2 : 1, parity = (lcr_ & 8) ? 1 : 0;
-    const double baud = clock_hz_ / (16.0 * std::max<u16>(divisor_, 1));
-    return static_cast<u64>(cpu_hz_ * (1 + data + parity + stop) / baud) + 1;
+LineFormat Ns16550::format() const {
+    LineFormat f;
+    f.baud = clock_hz_ / (16.0 * std::max<u16>(divisor_, 1));
+    f.data_bits = 5 + (lcr_ & 3);
+    f.parity = lcr_ & 8;
+    f.odd = !(lcr_ & 0x10);
+    f.stop_bits = (lcr_ & 4) ? 2 : 1;  // (1.5 with 5 data bits: taken as 2)
+    return f;
 }
+
+u64 Ns16550::char_cycles() const { return static_cast<u64>(cpu_hz_ * format().frame_seconds()) + 1; }
 
 void Ns16550::set_modem_inputs(bool cts, bool dsr, bool ri, bool dcd) {
     const u8 in = static_cast<u8>((cts ? 0x10 : 0) | (dsr ? 0x20 : 0) | (ri ? 0x40 : 0) | (dcd ? 0x80 : 0));
@@ -67,12 +76,19 @@ void Ns16550::tx_done() {
     const u8 b = tx_fifo_.front();
     tx_fifo_.pop_front();
     if (mcr_ & kMcrLoop) {
-        if (rx_fifo_.size() < kFifoDepth) rx_fifo_.push_back(b);
-        else lsr_ |= kLsrOe;
-        lsr_ |= kLsrDr;
+        rx_push(b, 0);
+    } else if (line_.device.baud > 0) {
+        // To the device as it samples the UART's characters; it takes those
+        // that arrive whole.
+        std::vector<WireChar> got;
+        tx_wire_.send(b, format(), tx_streaming_, line_.device, got);
+        if (tx_fifo_.empty()) tx_wire_.idle(line_.device, got);
+        for (const WireChar& c : got)
+            if (!c.framing_error && !c.parity_error && line_.transmit) line_.transmit(c.byte);
     } else if (line_.transmit) {
         line_.transmit(b);
     }
+    tx_streaming_ = !tx_fifo_.empty();
     if (tx_fifo_.empty()) {
         lsr_ |= kLsrThre | kLsrTemt;
         thre_pending_ = true;
@@ -82,24 +98,77 @@ void Ns16550::tx_done() {
     update_irq();
 }
 
+// A character into the receive FIFO (or lost to an overrun). Its errors
+// show in LSR once it is at the top.
+void Ns16550::rx_push(u8 byte, u8 errors) {
+    if (rx_fifo_.size() < ((fcr_ & 1) ? kFifoDepth : 1)) {
+        rx_fifo_.push_back({byte, errors});
+        if (rx_fifo_.size() == 1) rx_top_errors();
+    } else {
+        lsr_ |= kLsrOe;
+    }
+    lsr_ |= kLsrDr;
+    rx_timeout_ = false;
+}
+
+void Ns16550::rx_top_errors() {
+    if (!rx_fifo_.empty()) lsr_ |= rx_fifo_.front().errors;
+}
+
+u64 Ns16550::device_cycles() const {
+    return line_.device.baud > 0 ? static_cast<u64>(cpu_hz_ * line_.device.frame_seconds()) + 1 : char_cycles();
+}
+
 void Ns16550::poll_line() {
-    if (!rx_timer_.active() && line_.rx_pending() && !(mcr_ & kMcrLoop)) rx_timer_.schedule_in(char_cycles());
+    if (!rx_timer_.active() && line_.rx_pending() && !(mcr_ & kMcrLoop)) rx_timer_.schedule_in(device_cycles());
 }
 
 void Ns16550::rx_tick() {
     if (line_.rx_pending() && !(mcr_ & kMcrLoop)) {
         const u8 b = line_.rx_take();
-        if (rx_fifo_.size() < ((fcr_ & 1) ? kFifoDepth : 1)) rx_fifo_.push_back(b);
-        else lsr_ |= kLsrOe;
-        lsr_ |= kLsrDr;
-        rx_timeout_ = false;
-        rx_timer_.schedule_in(char_cycles());
+        if (line_.device.baud > 0) {
+            // The device's character as the UART samples it at its own rate:
+            // none, one or several characters, with their errors.
+            std::vector<WireChar> got;
+            rx_wire_.send(b, line_.device, rx_streaming_, format(), got);
+            for (const WireChar& c : got)
+                rx_push(c.byte, static_cast<u8>((c.parity_error ? kLsrPe : 0) | (c.framing_error ? kLsrFe : 0) |
+                                                (c.brk ? kLsrBi : 0)));
+            rx_streaming_ = true;
+        } else {
+            rx_push(b, 0);
+        }
+        rx_timer_.schedule_in(device_cycles());
+    } else if (rx_streaming_) {
+        // The device's line idles: what the UART had started finishes.
+        std::vector<WireChar> got;
+        rx_wire_.idle(format(), got);
+        for (const WireChar& c : got)
+            rx_push(c.byte, static_cast<u8>((c.parity_error ? kLsrPe : 0) | (c.framing_error ? kLsrFe : 0) |
+                                            (c.brk ? kLsrBi : 0)));
+        rx_streaming_ = false;
+        if (!rx_fifo_.empty() && (fcr_ & 1)) rx_timer_.schedule_in(4 * char_cycles());
     } else if (!rx_fifo_.empty() && (fcr_ & 1)) {
         // No more characters: the FIFO timeout raises the interrupt for
         // data below the trigger level (after four character times).
         rx_timeout_ = true;
     }
     update_irq();
+}
+
+// Every register but the receive buffer and the interrupt identification
+// reads without side effects, while no error or modem status bit is
+// waiting to be cleared by the read; their values change only by writes,
+// scheduled events (transmit and receive timing) and input.
+u64 Ns16550::stable_until(u64 offset, unsigned) const {
+    const bool dlab = lcr_ & 0x80;
+    switch (offset & 7) {
+        case 0: return dlab ? kForever : 0;
+        case 2: return 0;
+        case 5: return (lsr_ & 0x1E) ? 0 : kForever;
+        case 6: return (mcr_ & kMcrLoop) || !(msr_ & 0x0F) ? kForever : 0;
+        default: return kForever;
+    }
 }
 
 bool Ns16550::read(u64 offset, unsigned, u64& value) {
@@ -113,8 +182,9 @@ bool Ns16550::read(u64 offset, unsigned, u64& value) {
             if (rx_fifo_.empty()) {
                 value = 0;
             } else {
-                value = rx_fifo_.front();
+                value = rx_fifo_.front().byte;
                 rx_fifo_.pop_front();
+                rx_top_errors();
             }
             if (rx_fifo_.empty()) {
                 lsr_ &= static_cast<u8>(~kLsrDr);
@@ -144,11 +214,16 @@ bool Ns16550::read(u64 offset, unsigned, u64& value) {
         }
         case 3: value = lcr_; break;
         case 4: value = mcr_; break;
-        case 5:
+        case 5: {
             value = lsr_;
+            // FIFO mode: some character in the FIFO has an error.
+            if (fcr_ & 1)
+                for (const RxChar& c : rx_fifo_)
+                    if (c.errors) value |= kLsrFifoError;
             lsr_ &= static_cast<u8>(~0x1E);  // the error bits clear on read
             update_irq();
             break;
+        }
         case 6:
             if (mcr_ & kMcrLoop) {
                 value = static_cast<u8>(((mcr_ & 2) ? 0x10 : 0) | ((mcr_ & 1) ? 0x20 : 0) | ((mcr_ & 4) ? 0x40 : 0) |

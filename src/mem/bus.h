@@ -31,14 +31,21 @@ public:
     virtual bool read(u64 offset, unsigned size, u64& value) = 0;
     virtual bool write(u64 offset, unsigned size, u64 value) = 0;
 
-    // True if reading this register has no side effects and its value can
-    // only change through a scheduled event, a write, or input delivered
-    // between run slices. The CPU's idle detection may then treat a loop
-    // polling it as a spin. Conservative default: no.
-    virtual bool read_is_pure(u64 offset, unsigned size) const {
+    // The guest time (in cycles) until which reading here returns the value
+    // it does now and changes nothing: kForever if only a write, a scheduled
+    // event or input delivered between run slices can change it; 0 if the
+    // device promises nothing (the default). The processor may then run a
+    // loop polling it many iterations at once.
+    // kClock: the register counts guest time: reading it changes nothing,
+    // and its value, as read (big-endian), never falls as guest time goes
+    // on (and depends on nothing else that can change but by a write or a
+    // scheduled event); kClockLittle: the same with its bytes reversed
+    // (read little-endian).
+    static constexpr u64 kForever = ~u64{0}, kClock = ~u64{0} - 1, kClockLittle = ~u64{0} - 2;
+    virtual u64 stable_until(u64 offset, unsigned size) const {
         (void)offset;
         (void)size;
-        return false;
+        return 0;
     }
 };
 
@@ -111,8 +118,13 @@ public:
     // Device DMA from memory. Returns false if any of it is not host memory.
     bool read_block(u64 paddr, u8* data, std::size_t length) const;
 
-    // See Device::read_is_pure. RAM and ROM reads are always pure.
-    bool read_is_pure(u64 paddr, unsigned size) const;
+    // See Device::stable_until. Host memory (RAM and ROM) changes only by
+    // writes and DMA, which run between slices or are writes themselves.
+    u64 stable_until(u64 paddr, unsigned size) const;
+
+    // Accesses that went past host memory (to a device, ROM writes and bus
+    // errors): one that leaves this unchanged reached host memory.
+    u64 slow_accesses() const { return slow_accesses_; }
 
     // Debugger hook: every device (MMIO) read, after it completes.
     std::function<void(u64 paddr, unsigned size, u64 value)> device_read_hook;
@@ -176,6 +188,7 @@ private:
     void check_range(u64 base, u64 size) const;
     bool read_slow(u64 paddr, unsigned size, u64& out);
     bool write_slow(u64 paddr, unsigned size, u64 value);
+    u64 slow_accesses_ = 0;
 
     std::unique_ptr<Chunk> empty_;               // shared by chunks nothing is mapped in
     std::vector<Chunk*> chunks_;                 // kNumChunks entries, each empty_ or owned

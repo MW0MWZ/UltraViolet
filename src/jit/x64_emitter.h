@@ -19,10 +19,12 @@ struct Mem {
     s32 disp;
 };
 
-enum class Alu : unsigned { Add = 0, Or = 1, And = 4, Sub = 5, Xor = 6, Cmp = 7 };
-enum class Shift : unsigned { Shl = 4, Shr = 5, Sar = 7 };
+enum class Alu : unsigned { Add = 0, Or = 1, Adc = 2, Sbb = 3, And = 4, Sub = 5, Xor = 6, Cmp = 7 };
+enum class Shift : unsigned { Rol = 0, Ror = 1, Shl = 4, Shr = 5, Sar = 7 };
 enum class Cond : unsigned {
-    O = 0x0, No = 0x1, B = 0x2, Ae = 0x3, E = 0x4, Ne = 0x5, Be = 0x6, A = 0x7, L = 0xC, Ge = 0xD, Le = 0xE, G = 0xF
+    O = 0x0, No = 0x1, B = 0x2, Ae = 0x3, E = 0x4, Ne = 0x5, Be = 0x6, A = 0x7, S = 0x8, Ns = 0x9, P = 0xA, Np = 0xB,
+    L = 0xC, Ge = 0xD, Le = 0xE,
+    G = 0xF
 };
 
 class Emitter {
@@ -46,6 +48,11 @@ public:
         rex(true, 0, dst);
         byte(0xB8 + (dst & 7));
         u64v(imm);
+    }
+    void mov_imm_sx(Reg dst, s32 imm) {  // sign-extended to 64 bits
+        rex(true, 0, dst);
+        byte(0xC7), byte(0xC0 | (dst & 7));
+        u32v(static_cast<u32>(imm));
     }
     void mov_imm32(Reg dst, u32 imm) {  // zero-extends
         rex_opt(false, 0, dst);
@@ -93,6 +100,15 @@ public:
         rex_opt(w, 0, r);
         byte(0xD3);
         byte(0xC0 | (static_cast<unsigned>(op) << 3) | (r & 7));
+    }
+    void popcnt(Reg dst, Reg src) {  // 64-bit (needs the host's POPCNT)
+        byte(0xF3);
+        rex(true, dst, src);
+        byte(0x0F), byte(0xB8), byte(0xC0 | ((dst & 7) << 3) | (src & 7));
+    }
+    void shld_cl(Reg dst, Reg src) {  // dst = dst << cl | src >> (64 - cl) (64-bit; cl 0: dst unchanged)
+        rex(true, src, dst);
+        byte(0x0F), byte(0xA5), byte(0xC0 | ((src & 7) << 3) | (dst & 7));
     }
     void imul(Reg dst, Reg src) {  // 64-bit, low half
         rex(true, dst, src);
@@ -183,11 +199,17 @@ public:
         u32v(imm);
     }
     void test(Reg a, Reg b) { op_rr(true, 0x85, b, a); }
+    void test32(Reg a, Reg b) { op_rr(false, 0x85, b, a); }
+    void pushfq() { byte(0x9C); }
     // Narrow stores of the low bits of src (src must be rax/rcx/rdx/rbx or r8-r15)
     void mov8(Mem m, Reg src) { op_mem(false, 0x88, src, m); }
     void mov16(Mem m, Reg src) {
         byte(0x66);
         op_mem(false, 0x89, src, m);
+    }
+    void alu8_imm(Alu op, Mem m, u8 imm) {  // op byte [m], imm8
+        op_mem(false, 0x80, Reg(static_cast<unsigned>(op)), m);
+        byte(imm);
     }
     void test8_imm(Mem m, u8 imm) {  // test byte [m], imm8
         op_mem(false, 0xF6, Reg(0), m);
@@ -200,6 +222,7 @@ public:
         xmm_rr(dbl ? 0xF2 : 0xF3, false, static_cast<unsigned>(op), dst, src);
     }
     void ucomis(bool dbl, unsigned a, unsigned b) { xmm_rr(dbl ? 0x66 : 0, false, 0x2E, a, b); }
+    void comis(bool dbl, unsigned a, unsigned b) { xmm_rr(dbl ? 0x66 : 0, false, 0x2F, a, b); }  // invalid on any NaN
     void movq_to_xmm(unsigned x, Reg r, bool w = true) { xmm_rr(0x66, w, 0x6E, x, r); }
     void movq_from_xmm(Reg r, unsigned x, bool w = true) { xmm_rr(0x66, w, 0x7E, x, r); }
     // cvtsd2si / cvttsd2si (and ss) to a 32- or 64-bit register; cvtsi2sd (ss) from one.
@@ -249,9 +272,13 @@ public:
         byte(0xE9);
         u32v(static_cast<u32>(static_cast<s64>(target) - static_cast<s64>(n_ + 4)));
     }
-    // A jump to `target`, this code being placed at `base`.
+    // A jump or call to `target`, this code being placed at `base`.
     void jmp_abs(const u8* target, const u8* base) {
         byte(0xE9);
+        u32v(static_cast<u32>(target - (base + n_ + 4)));
+    }
+    void call_abs(const u8* target, const u8* base) {
+        byte(0xE8);
         u32v(static_cast<u32>(target - (base + n_ + 4)));
     }
     // LEA r, [rip + rel32], bound like a jump; returns the patch site.

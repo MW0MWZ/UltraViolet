@@ -52,16 +52,19 @@ class Sabre::Window final : public Device {
 public:
     using Read = bool (Sabre::*)(u64, unsigned, u64&);
     using Write = bool (Sabre::*)(u64, unsigned, u64);
-    Window(Sabre& s, const char* n, Read r, Write w) : s_(s), name_(n), r_(r), w_(w) {}
+    using Stable = u64 (Sabre::*)(u64, unsigned);
+    Window(Sabre& s, const char* n, Read r, Write w, Stable st = nullptr) : s_(s), name_(n), r_(r), w_(w), st_(st) {}
     const char* name() const override { return name_; }
     bool read(u64 offset, unsigned size, u64& value) override { return (s_.*r_)(offset, size, value); }
     bool write(u64 offset, unsigned size, u64 value) override { return (s_.*w_)(offset, size, value); }
+    u64 stable_until(u64 offset, unsigned size) const override { return st_ ? (s_.*st_)(offset, size) : 0; }
 
 private:
     Sabre& s_;
     const char* name_;
     Read r_;
     Write w_;
+    Stable st_;
 };
 
 // The module's own configuration header: bus 0, device 0.
@@ -80,9 +83,10 @@ Sabre::Sabre(Bus& bus, Scheduler& scheduler, double cpu_hz, std::function<bool(u
     : bus_(bus), sched_(scheduler), cpu_hz_(cpu_hz), send_vector_(std::move(send_vector)),
       host_(std::make_unique<HostFunction>()),
       regs_win_(std::make_unique<Window>(*this, "sabre-regs", &Sabre::regs_read, &Sabre::regs_write)),
-      config_win_(std::make_unique<Window>(*this, "pci-config", &Sabre::config_read, &Sabre::config_write)),
+      config_win_(std::make_unique<Window>(*this, "pci-config", &Sabre::config_read, &Sabre::config_write,
+                                           &Sabre::config_stable)),
       io_win_(std::make_unique<Window>(*this, "pci-io", &Sabre::io_read, &Sabre::io_write)),
-      mem_win_(std::make_unique<Window>(*this, "pci-mem", &Sabre::mem_read, &Sabre::mem_write)),
+      mem_win_(std::make_unique<Window>(*this, "pci-mem", &Sabre::mem_read, &Sabre::mem_write, &Sabre::mem_stable)),
       retry_timer_(scheduler, [this] { dispatch_all(); }) {
     root_.attach(0, 0, host_.get());
     for (unsigned n = 0; n < 2; ++n)
@@ -284,6 +288,27 @@ bool Sabre::config_read(u64 offset, unsigned size, u64& value) {
     return true;
 }
 
+// (Configuration space is little-endian: a function's clock is one read
+// little-endian here.)
+u64 Sabre::config_stable(u64 offset, unsigned size) {
+    const unsigned busn = static_cast<unsigned>(offset >> 16) & 0xFF, dev = static_cast<unsigned>(offset >> 11) & 31,
+                   fn = static_cast<unsigned>(offset >> 8) & 7;
+    const u8 reg = static_cast<u8>(offset);
+    u64 st;
+    if (size != 8) {
+        st = root_.config_stable(busn, dev, fn, reg, size);
+    } else {
+        // Two cycles, read together: a clock if both halves are (or one is
+        // and the other never changes).
+        const u64 lo = root_.config_stable(busn, dev, fn, reg, 4), hi = root_.config_stable(busn, dev, fn, static_cast<u8>(reg + 4), 4);
+        if (lo == Device::kClock || hi == Device::kClock)
+            st = (lo == Device::kClock || lo == Device::kForever) && (hi == Device::kClock || hi == Device::kForever) ? Device::kClock : 0;
+        else
+            st = std::min(lo, hi);
+    }
+    return st == Device::kClock ? Device::kClockLittle : st;
+}
+
 bool Sabre::config_write(u64 offset, unsigned size, u64 value) {
     const unsigned busn = static_cast<unsigned>(offset >> 16) & 0xFF, dev = static_cast<unsigned>(offset >> 11) & 31,
                    fn = static_cast<unsigned>(offset >> 8) & 7;
@@ -333,6 +358,8 @@ bool Sabre::mem_read(u64 offset, unsigned size, u64& value) {
     value = swap_size(v, size);
     return true;
 }
+
+u64 Sabre::mem_stable(u64 offset, unsigned size) { return root_.mem_stable(static_cast<u32>(offset), size); }
 
 bool Sabre::mem_write(u64 offset, unsigned size, u64 value) {
     if (!root_.mem_write(static_cast<u32>(offset), size, swap_size(value, size))) {

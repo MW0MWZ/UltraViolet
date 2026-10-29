@@ -336,3 +336,20 @@ TEST(cmd646_answers_on_bus_a_and_latches_interrupts) {
     m.bus().read(cfg(1, 3, 0x57), b);
     CHECK_EQ(b & 0x10, 0x00u);
 }
+
+// With device 1 absent, selecting it reads zero in every register,
+// device/head included (device 0 does not answer for it), and alternate
+// status too; selecting device 0 again finds it as it was.
+TEST(ata_absent_device_reads_zero_in_every_register) {
+    DiskImage img;
+    CHECK(img.open(make_image("uv-ata-absent.img", 64, 512), false));
+    Rig r;
+    AtaDisk disk(r.sched, 1e6, img);
+    r.ch.attach(0, &disk);
+    r.reg(6, 0xB0);  // device 1
+    for (unsigned reg = 1; reg <= 7; ++reg) CHECK_EQ(r.reg(reg), 0u);
+    CHECK_EQ(r.ch.read_control(2), 0u);
+    r.reg(6, 0xA0);  // device 0
+    CHECK_EQ(r.reg(6), 0xA0u);
+    CHECK_EQ(r.ch.read_control(2) & 0xC0, 0x40u);  // ready, not busy
+}

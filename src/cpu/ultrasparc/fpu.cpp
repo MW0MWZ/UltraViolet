@@ -16,6 +16,7 @@
 
 #include "core/log.h"
 #include "cpu/ultrasparc/ultrasparc.h"
+#include "cpu/ultrasparc/vis.h"
 
 namespace uv::usparc {
 
@@ -82,6 +83,21 @@ public:
 private:
     int saved_;
 };
+
+// The value, as if read from memory here: an operation whose operands and
+// result pass through this stays between the HostFp calls around it, which
+// the compiler would otherwise feel free to move it across (it does not
+// know that the calls change the rounding mode and read the flags).
+template <typename T>
+inline T opaque(T v) {
+#if defined(__GNUC__) || defined(__clang__)
+    asm volatile("" : "+m"(v) : : "memory");
+#else
+    volatile T t = v;
+    v = t;
+#endif
+    return v;
+}
 
 // Nonstandard mode (FSR.NS): subnormal operands are read as zero and
 // subnormal results flushed to zero.
@@ -191,7 +207,7 @@ void UltraSparc::fpop1(u32 insn) {
             r = nan_result32(a, b, exc);
         } else {
             HostFp h(rnd);
-            const float v = op(f32(a), f32(b));
+            const float v = opaque(op(opaque(f32(a)), opaque(f32(b))));
             exc |= h.exceptions();
             r = std::isnan(v) ? kDefaultNan32 : ns_out32(bits(v), ns, exc);
         }
@@ -204,7 +220,7 @@ void UltraSparc::fpop1(u32 insn) {
             r = nan_result64(a, b, exc);
         } else {
             HostFp h(rnd);
-            const double v = op(f64(a), f64(b));
+            const double v = opaque(op(opaque(f64(a)), opaque(f64(b))));
             exc |= h.exceptions();
             r = std::isnan(v) ? kDefaultNan64 : ns_out64(bits(v), ns, exc);
         }
@@ -228,7 +244,7 @@ void UltraSparc::fpop1(u32 insn) {
                 r = bits(static_cast<double>(f32(n | 0x00400000)));
             } else {
                 HostFp h(rnd);
-                const double v = static_cast<double>(f32(a)) * static_cast<double>(f32(b));
+                const double v = opaque(static_cast<double>(opaque(f32(a))) * static_cast<double>(opaque(f32(b))));
                 exc |= h.exceptions();
                 r = std::isnan(v) ? kDefaultNan64 : bits(v);
             }
@@ -240,9 +256,12 @@ void UltraSparc::fpop1(u32 insn) {
             u32 r;
             if (is_nan32(b)) {
                 r = nan_result32(b, b, exc);
+            } else if (f32(b) < 0) {  // (invalid, whatever the host library's sqrt raises: some raise nothing)
+                exc |= kNv;
+                r = kDefaultNan32;
             } else {
                 HostFp h(rnd);
-                const float v = std::sqrt(f32(b));
+                const float v = opaque(std::sqrt(opaque(f32(b))));
                 exc |= h.exceptions();
                 r = std::isnan(v) ? kDefaultNan32 : bits(v);
             }
@@ -254,9 +273,12 @@ void UltraSparc::fpop1(u32 insn) {
             u64 r;
             if (is_nan64(b)) {
                 r = nan_result64(b, b, exc);
+            } else if (f64(b) < 0) {  // (as FSQRTs)
+                exc |= kNv;
+                r = kDefaultNan64;
             } else {
                 HostFp h(rnd);
-                const double v = std::sqrt(f64(b));
+                const double v = opaque(std::sqrt(opaque(f64(b))));
                 exc |= h.exceptions();
                 r = std::isnan(v) ? kDefaultNan64 : bits(v);
             }
@@ -285,21 +307,21 @@ void UltraSparc::fpop1(u32 insn) {
         }
         case 0x084: {  // FxTOs
             HostFp h(rnd);
-            const float v = static_cast<float>(static_cast<s64>(freg64(rs2)));
+            const float v = opaque(static_cast<float>(opaque(static_cast<s64>(freg64(rs2)))));
             exc |= h.exceptions();
             if (fp_finish(exc)) set_f32(rd, bits(v));
             return;
         }
         case 0x088: {  // FxTOd
             HostFp h(rnd);
-            const double v = static_cast<double>(static_cast<s64>(freg64(rs2)));
+            const double v = opaque(static_cast<double>(opaque(static_cast<s64>(freg64(rs2)))));
             exc |= h.exceptions();
             if (fp_finish(exc)) set_f64(rd, bits(v));
             return;
         }
         case 0x0C4: {  // FiTOs
             HostFp h(rnd);
-            const float v = static_cast<float>(static_cast<s32>(f_[rs2]));
+            const float v = opaque(static_cast<float>(opaque(static_cast<s32>(f_[rs2]))));
             exc |= h.exceptions();
             if (fp_finish(exc)) set_f32(rd, bits(v));
             return;
@@ -327,7 +349,7 @@ void UltraSparc::fpop1(u32 insn) {
                 r = static_cast<u32>((b >> 32) & 0x80000000u) | 0x7FC00000u | static_cast<u32>((b >> 29) & 0x003FFFFFu);
             } else {
                 HostFp h(rnd);
-                const float v = static_cast<float>(f64(b));
+                const float v = opaque(static_cast<float>(opaque(f64(b))));
                 exc |= h.exceptions();
                 r = ns_out32(bits(v), ns, exc);
             }
@@ -417,7 +439,6 @@ void UltraSparc::impdep1(u32 insn) {
     const unsigned opf = (insn >> 5) & 0x1FF;
     const u64 a = freg64(rs1), b = freg64(rs2);
     const u32 as = f_[rs1], bs = f_[rs2];
-    const unsigned scale = static_cast<unsigned>(gsr_ >> 3) & 15;
 
     // Logical operations: even opf is the double form, odd the single.
     if (opf >= 0x060 && opf <= 0x07F) {
@@ -446,44 +467,36 @@ void UltraSparc::impdep1(u32 insn) {
         return;
     }
 
-    auto lanes16 = [](u64 v, unsigned i) { return static_cast<s16>(v >> (48 - 16 * i)); };
-    auto lanes32 = [](u64 v, unsigned i) { return static_cast<s32>(v >> (32 - 32 * i)); };
+    if (const vis::Op* o = vis::op(opf)) {
+        auto operand = [&](vis::Src k, unsigned r) -> u64 {
+            switch (k) {
+                case vis::Src::R: return o->edge ? mask_address(reg(r)) : reg(r);
+                case vis::Src::S: return f_[r];
+                case vis::Src::D: return freg64(r);
+                case vis::Src::Gsr: return gsr_;
+                case vis::Src::Rd: return freg64(rd);
+                default: return 0;
+            }
+        };
+        const u64 r = o->fn(operand(o->a, rs1), operand(o->b, rs2), operand(o->c, rd));
+        if (o->edge) {  // the condition codes as by SUBcc rs1, rs2
+            const u64 ra = reg(rs1), rb = reg(rs2), diff = ra - rb;
+            const u64 c32 = (ra & 0xFFFFFFFFull) < (rb & 0xFFFFFFFFull) ? 1 : 0, c64 = ra < rb ? 1 : 0;
+            const u64 v32 = (((ra ^ rb) & (ra ^ diff)) >> 31) & 1, v64 = ((ra ^ rb) & (ra ^ diff)) >> 63;
+            const unsigned icc =
+                ((diff >> 28) & 8) | (static_cast<u32>(diff) == 0 ? 4 : 0) | (v32 ? 2 : 0) | (c32 ? 1 : 0);
+            const unsigned xcc = ((diff >> 60) & 8) | (diff == 0 ? 4 : 0) | (v64 ? 2 : 0) | (c64 ? 1 : 0);
+            ccr_ = static_cast<u8>((xcc << 4) | icc);
+        }
+        switch (o->dst) {
+            case vis::Src::R: set_reg(rd, r); break;
+            case vis::Src::S: set_f32(rd, static_cast<u32>(r)); break;
+            default: set_f64(rd, r); break;
+        }
+        return;
+    }
 
     switch (opf) {
-        case 0x000:  // EDGE8, EDGE8L, EDGE16, EDGE16L, EDGE32, EDGE32L
-        case 0x002:
-        case 0x004:
-        case 0x006:
-        case 0x008:
-        case 0x00A: {
-            static constexpr u8 kLeft[6][8] = {{0xFF, 0x7F, 0x3F, 0x1F, 0x0F, 0x07, 0x03, 0x01},
-                                               {0xFF, 0xFE, 0xFC, 0xF8, 0xF0, 0xE0, 0xC0, 0x80},
-                                               {0xF, 0x7, 0x3, 0x1},
-                                               {0xF, 0xE, 0xC, 0x8},
-                                               {0x3, 0x1},
-                                               {0x3, 0x2}};
-            static constexpr u8 kRight[6][8] = {{0x80, 0xC0, 0xE0, 0xF0, 0xF8, 0xFC, 0xFE, 0xFF},
-                                                {0x01, 0x03, 0x07, 0x0F, 0x1F, 0x3F, 0x7F, 0xFF},
-                                                {0x8, 0xC, 0xE, 0xF},
-                                                {0x1, 0x3, 0x7, 0xF},
-                                                {0x2, 0x3},
-                                                {0x1, 0x3}};
-            const unsigned k = opf >> 1;
-            const unsigned shift = k / 2;  // element size: 1, 2 or 4 bytes
-            const u64 x = mask_address(reg(rs1)), y = mask_address(reg(rs2));
-            const unsigned li = static_cast<unsigned>(x & 7) >> shift, ri = static_cast<unsigned>(y & 7) >> shift;
-            u64 mask = kLeft[k][li];
-            if ((x & ~u64{7}) == (y & ~u64{7})) mask &= kRight[k][ri];
-            // The condition codes are set as by SUBcc rs1, rs2.
-            const u64 ra = reg(rs1), rb = reg(rs2), r = ra - rb;
-            const u64 c32 = (ra & 0xFFFFFFFFull) < (rb & 0xFFFFFFFFull) ? 1 : 0, c64 = ra < rb ? 1 : 0;
-            const u64 v32 = (((ra ^ rb) & (ra ^ r)) >> 31) & 1, v64 = ((ra ^ rb) & (ra ^ r)) >> 63;
-            const unsigned icc = ((r >> 28) & 8) | (static_cast<u32>(r) == 0 ? 4 : 0) | (v32 ? 2 : 0) | (c32 ? 1 : 0);
-            const unsigned xcc = ((r >> 60) & 8) | (r == 0 ? 4 : 0) | (v64 ? 2 : 0) | (c64 ? 1 : 0);
-            ccr_ = static_cast<u8>((xcc << 4) | icc);
-            set_reg(rd, mask);
-            return;
-        }
         case 0x018:    // ALIGNADDRESS
         case 0x01A: {  // ALIGNADDRESS_LITTLE
             const u64 sum = reg(rs1) + reg(rs2);
@@ -497,154 +510,11 @@ void UltraSparc::impdep1(u32 insn) {
             set_f64(rd, off == 0 ? a : (a << (8 * off)) | (b >> (64 - 8 * off)));
             return;
         }
-        case 0x04B: {  // FPMERGE
-            u64 r = 0;
-            for (unsigned i = 0; i < 4; ++i) {
-                r = (r << 8) | ((as >> (24 - 8 * i)) & 0xFF);
-                r = (r << 8) | ((bs >> (24 - 8 * i)) & 0xFF);
-            }
-            set_f64(rd, r);
-            return;
-        }
-        case 0x04D: {  // FEXPAND
-            u64 r = 0;
-            for (unsigned i = 0; i < 4; ++i) r = (r << 16) | (u64{(bs >> (24 - 8 * i)) & 0xFF} << 4);
-            set_f64(rd, r);
-            return;
-        }
-        case 0x03B: {  // FPACK16: four signed 16-bit to unsigned bytes
-            u32 r = 0;
-            for (unsigned i = 0; i < 4; ++i) {
-                const s64 v = (static_cast<s64>(lanes16(b, i)) << scale) >> 7;
-                r = (r << 8) | static_cast<u32>(v < 0 ? 0 : v > 255 ? 255 : v);
-            }
-            set_f32(rd, r);
-            return;
-        }
-        case 0x03A: {  // FPACK32: shift rs1 left a byte, insert two packed bytes from rs2
-            u64 r = 0;
-            for (unsigned i = 0; i < 2; ++i) {
-                const s64 v = (static_cast<s64>(lanes32(b, i)) << scale) >> 23;
-                const u64 byte = static_cast<u64>(v < 0 ? 0 : v > 255 ? 255 : v);
-                const u64 word = ((a >> (32 - 32 * i)) << 8) & 0xFFFFFF00ull;
-                r = (r << 32) | word | byte;
-            }
-            set_f64(rd, r);
-            return;
-        }
-        case 0x03D: {  // FPACKFIX: two signed 32-bit to signed 16-bit
-            u32 r = 0;
-            for (unsigned i = 0; i < 2; ++i) {
-                const s64 v = (static_cast<s64>(lanes32(b, i)) << scale) >> 16;
-                const s64 c = v < -32768 ? -32768 : v > 32767 ? 32767 : v;
-                r = (r << 16) | (static_cast<u32>(c) & 0xFFFF);
-            }
-            set_f32(rd, r);
-            return;
-        }
-        case 0x03E: {  // PDIST
-            u64 sum = freg64(rd);
-            for (unsigned i = 0; i < 8; ++i) {
-                const int x = static_cast<int>((a >> (8 * i)) & 0xFF), y = static_cast<int>((b >> (8 * i)) & 0xFF);
-                sum += static_cast<u64>(x > y ? x - y : y - x);
-            }
-            set_f64(rd, sum);
-            return;
-        }
-        case 0x031:    // FMUL8x16: unsigned bytes of rs1 (single) by signed 16-bit lanes of rs2
-        case 0x033:    // FMUL8x16AU: by the upper 16 bits of rs2 (single)
-        case 0x035: {  // FMUL8x16AL: by the lower 16 bits
-            u64 r = 0;
-            for (unsigned i = 0; i < 4; ++i) {
-                const s32 x = static_cast<s32>((as >> (24 - 8 * i)) & 0xFF);
-                const s32 y = opf == 0x031 ? lanes16(b, i) : opf == 0x033 ? static_cast<s16>(bs >> 16) : static_cast<s16>(bs);
-                const s32 p = (x * y + 128) >> 8;
-                r = (r << 16) | (static_cast<u32>(p) & 0xFFFF);
-            }
-            set_f64(rd, r);
-            return;
-        }
-        case 0x036:    // FMUL8SUx16: upper signed byte of each 16-bit lane of rs1
-        case 0x037: {  // FMUL8ULx16: lower unsigned byte
-            u64 r = 0;
-            for (unsigned i = 0; i < 4; ++i) {
-                const s32 lane = lanes16(a, i);
-                const s32 y = lanes16(b, i);
-                s32 p;
-                if (opf == 0x036) p = ((lane >> 8) * y + 128) >> 8;
-                else p = ((lane & 0xFF) * y + 128) >> 8;
-                r = (r << 16) | (static_cast<u32>(p) & 0xFFFF);
-            }
-            set_f64(rd, r);
-            return;
-        }
-        case 0x038:    // FMULD8SUx16
-        case 0x039: {  // FMULD8ULx16
-            u64 r = 0;
-            for (unsigned i = 0; i < 2; ++i) {
-                const s32 lane = static_cast<s16>(as >> (16 - 16 * i));
-                const s32 y = static_cast<s16>(bs >> (16 - 16 * i));
-                const s64 p = opf == 0x038 ? static_cast<s64>((lane >> 8) * y) << 8 : static_cast<s64>((lane & 0xFF) * y);
-                r = (r << 32) | (static_cast<u64>(p) & 0xFFFFFFFFull);
-            }
-            set_f64(rd, r);
-            return;
-        }
-        case 0x050:  // FPADD16, FPADD16S, FPADD32, FPADD32S, FPSUB16, FPSUB16S, FPSUB32, FPSUB32S
-        case 0x051:
-        case 0x052:
-        case 0x053:
-        case 0x054:
-        case 0x055:
-        case 0x056:
-        case 0x057: {
-            const bool sub = opf & 4, wide = opf & 2, single = opf & 1;
-            const u64 x = single ? as : a, y = single ? bs : b;
-            const unsigned esize = wide ? 32 : 16, count = (single ? 32 : 64) / esize;
-            const u64 emask = (u64{1} << esize) - 1;
-            u64 r = 0;
-            for (unsigned i = 0; i < count; ++i) {
-                const unsigned sh = esize * i;
-                const u64 e = ((sub ? ((x >> sh) - (y >> sh)) : ((x >> sh) + (y >> sh))) & emask) << sh;
-                r |= e;
-            }
-            if (single) set_f32(rd, static_cast<u32>(r));
-            else set_f64(rd, r);
-            return;
-        }
-        case 0x020:  // FCMPLE16, FCMPNE16, FCMPLE32, FCMPNE32, FCMPGT16, FCMPEQ16, FCMPGT32, FCMPEQ32
-        case 0x022:
-        case 0x024:
-        case 0x026:
-        case 0x028:
-        case 0x02A:
-        case 0x02C:
-        case 0x02E: {
-            const bool wide = opf & 4;
-            const unsigned kind = ((opf >> 1) & 1) | ((opf >> 2) & 2);  // 0 LE, 1 NE, 2 GT, 3 EQ
-            const unsigned count = wide ? 2 : 4;
-            u64 r = 0;
-            for (unsigned i = 0; i < count; ++i) {
-                // Bit 0 of the result is the least significant element.
-                const s64 x = wide ? lanes32(a, count - 1 - i) : lanes16(a, count - 1 - i);
-                const s64 y = wide ? lanes32(b, count - 1 - i) : lanes16(b, count - 1 - i);
-                bool t;
-                switch (kind) {
-                    case 0: t = x <= y; break;
-                    case 1: t = x != y; break;
-                    case 2: t = x > y; break;
-                    default: t = x == y; break;
-                }
-                if (t) r |= u64{1} << i;
-            }
-            set_reg(rd, r);
-            return;
-        }
         case 0x080:  // SHUTDOWN: privileged; there is no power-down to enter
             if (!(pstate_ & pstate::PRIV)) return take_trap(tt::kPrivilegedOpcode);
             return;
         default:
-            // ARRAY8/16/32 (0x010/0x012/0x014) and unassigned opf values.
+            // Unassigned opf values.
             UV_LOG(Warn, "cpu", "unimplemented VIS opf %03x at %016llx", opf, static_cast<unsigned long long>(pc_));
             return take_trap(tt::kIllegalInstruction);
     }

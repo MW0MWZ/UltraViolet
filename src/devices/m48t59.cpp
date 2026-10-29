@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Andy Taylor
 #include "devices/m48t59.h"
 
+#include <algorithm>
 #include <cstdio>
 
 namespace uv {
@@ -52,14 +53,22 @@ std::time_t M48t59::now() const {
 }
 
 void M48t59::latch_clock() {
-    const std::tm tm = time_to_utc(now());
-    mem_[kSeconds] = static_cast<u8>(to_bcd(tm.tm_sec) | (stopped_ ? kSecStop : 0));
-    mem_[kMinutes] = to_bcd(tm.tm_min);
-    mem_[kHours] = to_bcd(tm.tm_hour);
-    mem_[kDay] = static_cast<u8>((mem_[kDay] & 0x40) | (tm.tm_wday == 0 ? 7 : tm.tm_wday));
-    mem_[kDate] = to_bcd(tm.tm_mday);
-    mem_[kMonth] = to_bcd(tm.tm_mon + 1);
-    mem_[kYear] = to_bcd(((tm.tm_year + 1900 - kYearBase) % 100 + 100) % 100);
+    const std::time_t t = now();
+    if (t != converted_) {
+        const std::tm tm = time_to_utc(t);
+        converted_regs_ = {to_bcd(tm.tm_sec), to_bcd(tm.tm_min), to_bcd(tm.tm_hour),
+                           static_cast<u8>(tm.tm_wday == 0 ? 7 : tm.tm_wday), to_bcd(tm.tm_mday), to_bcd(tm.tm_mon + 1),
+                           to_bcd(((tm.tm_year + 1900 - kYearBase) % 100 + 100) % 100)};
+        converted_ = t;
+    }
+    const auto& r = converted_regs_;
+    mem_[kSeconds] = static_cast<u8>(r[0] | (stopped_ ? kSecStop : 0));
+    mem_[kMinutes] = r[1];
+    mem_[kHours] = r[2];
+    mem_[kDay] = static_cast<u8>((mem_[kDay] & 0x40) | r[3]);
+    mem_[kDate] = r[4];
+    mem_[kMonth] = r[5];
+    mem_[kYear] = r[6];
 }
 
 u8 M48t59::read_byte(unsigned addr) {
@@ -135,6 +144,21 @@ void M48t59::write_byte(unsigned addr, u8 v) {
             (void)kWatchdog;
             break;
     }
+}
+
+// The NVRAM and the control registers read without side effects; the
+// flags too while none of the bits a read clears is set; the clock
+// registers, which a read latches from the running clock, until the next
+// second (unless the clock is stopped or held for reading or writing).
+u64 M48t59::stable_until(u64 offset, unsigned size) const {
+    u64 t = kForever;
+    for (unsigned i = 0; i < size; ++i) {
+        const unsigned addr = static_cast<unsigned>((offset + i) & (kSize - 1));
+        if (addr == kFlags && (mem_[kFlags] & 0xC0)) return 0;
+        if (addr >= kSeconds && !(mem_[kControl] & (kCtlRead | kCtlWrite)) && !stopped_)
+            t = std::min(t, next_second_ ? next_second_() : 0);
+    }
+    return t;
 }
 
 bool M48t59::read(u64 offset, unsigned size, u64& value) {

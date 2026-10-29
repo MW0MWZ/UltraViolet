@@ -347,8 +347,16 @@ bool UltraSparc::load(u64 va, u8 a, unsigned size, u64& value, AccessKind kind) 
         return internal_asi_read(a, va, size, value);
     }
     Access acc;
+    if (fast_device(va, a, kind, acc)) return phys_read(acc, size, value);
     if (!translate_data(va, a, kind, size, acc)) return false;
-    return phys_read(acc, size, value);
+    const u64 slow = bus_.slow_accesses();
+    if (!phys_read(acc, size, value)) return false;
+    if (bus_.slow_accesses() == slow) {
+        if (kind != AccessKind::Fetch) fast_fill(va, a, acc, kind);
+    } else {
+        fast_fill_device(va, a, acc, kind);
+    }
+    return true;
 }
 
 bool UltraSparc::store(u64 va, u8 a, unsigned size, u64 value) {
@@ -361,8 +369,56 @@ bool UltraSparc::store(u64 va, u8 a, unsigned size, u64 value) {
         return internal_asi_write(a, va, size, value);
     }
     Access acc;
+    if (fast_device(va, a, AccessKind::Store, acc)) return phys_write(acc, size, value);
     if (!translate_data(va, a, AccessKind::Store, size, acc)) return false;
-    return phys_write(acc, size, value);
+    const u64 slow = bus_.slow_accesses();
+    if (!phys_write(acc, size, value)) return false;
+    if (bus_.slow_accesses() == slow) fast_fill(va, a, acc, AccessKind::Store);
+    else fast_fill_device(va, a, acc, AccessKind::Store);
+    return true;
+}
+
+// An atomic access that translated also passed the store checks, on a
+// cacheable page.
+void UltraSparc::fast_fill(u64 va, u8 a, const Access& acc, AccessKind kind) {
+    const int mode = fast_class(a);
+    if (mode < 0 || acc.little != asi_is_little(a)) return;  // (TTE.IE)
+    constexpr u64 kPage = 0x1FFF;
+    const bool write = kind != AccessKind::Load;
+    u8* const host = write ? bus_.host_write_ptr(acc.pa & ~kPage) : bus_.host_read_ptr(acc.pa & ~kPage);
+    if (!host) return;
+    const u8* const code = write ? bus_.code_flag(host) : nullptr;
+    if (write && !code) return;
+    FastEntry& f = fast_[mode][(va >> 13) & (kFastEntries - 1)];
+    const u64 key = (va >> 13) | fast_key_;
+    const s64 addend = static_cast<s64>(reinterpret_cast<uintptr_t>(host) - (va & ~kPage));
+    if (f.key != key || f.addend != addend || (f.perms & kFastDev)) f = FastEntry{key, addend, nullptr, 0};
+    if (write) f.code = code;
+    f.perms |= kind == AccessKind::Load ? kFastRead : kind == AccessKind::Store ? kFastWrite : kFastRead | kFastWrite | kFastAtomic;
+}
+
+bool UltraSparc::fast_device(u64 va, u8 a, AccessKind kind, Access& acc) const {
+    if (kind != AccessKind::Load && kind != AccessKind::Store) return false;
+    const int mode = fast_class(a);  // (none for no-fault loads, which fault on side effects)
+    if (mode < 0) return false;
+    const FastEntry& f = fast_[mode][(va >> 13) & (kFastEntries - 1)];
+    if (f.key != ((va >> 13) | fast_key_) || !(f.perms & (kind == AccessKind::Load ? kFastDevRead : kFastDevWrite))) return false;
+    acc.pa = static_cast<u64>(static_cast<s64>(va) + f.addend);
+    acc.little = asi_is_little(a);
+    acc.side_effect = f.perms & kFastDevSide;
+    return true;
+}
+
+void UltraSparc::fast_fill_device(u64 va, u8 a, const Access& acc, AccessKind kind) {
+    if (kind != AccessKind::Load && kind != AccessKind::Store) return;
+    const int mode = fast_class(a);
+    if (mode < 0 || acc.little != asi_is_little(a)) return;  // (TTE.IE)
+    constexpr u64 kPage = 0x1FFF;
+    FastEntry& f = fast_[mode][(va >> 13) & (kFastEntries - 1)];
+    const u64 key = (va >> 13) | fast_key_;
+    const s64 addend = static_cast<s64>((acc.pa & ~kPage) - (va & ~kPage));
+    if (f.key != key || f.addend != addend || !(f.perms & kFastDev)) f = FastEntry{key, addend, nullptr, 0};
+    f.perms |= static_cast<u8>((kind == AccessKind::Load ? kFastDevRead : kFastDevWrite) | (acc.side_effect ? kFastDevSide : 0));
 }
 
 // Block load: eight doublewords into an aligned group of eight double registers.
@@ -385,6 +441,7 @@ bool UltraSparc::block_load(u64 va, u8 a, unsigned rd) {
     for (unsigned i = 0; i < 8; ++i) {
         Access acc;
         if (!translate_data(va + 8 * i, base, AccessKind::Load, 8, acc) || !phys_read(acc, 8, v[i])) return false;
+        if (i == 0) fast_fill(va, base, acc, AccessKind::Load);  // (one page)
     }
     for (unsigned i = 0; i < 8; ++i) set_f64(rd + 2 * i, v[i]);
     return true;
@@ -404,6 +461,7 @@ bool UltraSparc::block_store(u64 va, u8 a, unsigned rd) {
     for (unsigned i = 0; i < 8; ++i)
         if (!translate_data(va + 8 * i, base, AccessKind::Store, 8, acc[i])) return false;
     for (unsigned i = 0; i < 8; ++i) phys_write(acc[i], 8, freg64(rd + 2 * i));
+    fast_fill(va, base, acc[0], AccessKind::Store);  // (one page)
     return true;
 }
 
@@ -418,6 +476,7 @@ bool UltraSparc::short_fp_load(u64 va, u8 a, unsigned rd) {
     Access acc;
     u64 v;
     if (!translate_data(va, base_memory_asi(a), AccessKind::Load, size, acc)) return false;
+    fast_fill(va, base_memory_asi(a), acc, AccessKind::Load);
     acc.little = asi_is_little(a);
     if (!phys_read(acc, size, v)) return false;
     set_f64(rd, v);
@@ -432,6 +491,7 @@ bool UltraSparc::short_fp_store(u64 va, u8 a, unsigned rd) {
     }
     Access acc;
     if (!translate_data(va, base_memory_asi(a), AccessKind::Store, size, acc)) return false;
+    fast_fill(va, base_memory_asi(a), acc, AccessKind::Store);
     acc.little = asi_is_little(a);
     return phys_write(acc, size, freg64(rd));
 }
@@ -448,6 +508,7 @@ bool UltraSparc::partial_store(u64 va, u8 a, unsigned rd, u64 mask) {
     const unsigned count = 8 / esize;
     Access acc;
     if (!translate_data(va, base_memory_asi(a), AccessKind::Store, 8, acc)) return false;
+    fast_fill(va, base_memory_asi(a), acc, AccessKind::Store);
     const u64 v = freg64(rd);
     const bool little = asi_is_little(a);
     for (unsigned i = 0; i < count; ++i) {
@@ -489,8 +550,11 @@ void UltraSparc::tlb_data_in(MmuRegs& mmu, u64 data) {
             }
     }
     if (!slot) {
+        // Every entry used: clear the used bits, and the translations made
+        // from the entries (hits through those do not set the bits again).
         for (TlbEntry& e : mmu.tlb)
             if (!(e.data & tte::L)) e.used = false;
+        flush_soft_tlb();
         for (TlbEntry& e : mmu.tlb)
             if (!(e.data & tte::L)) {
                 slot = &e;
@@ -498,10 +562,33 @@ void UltraSparc::tlb_data_in(MmuRegs& mmu, u64 data) {
             }
     }
     if (!slot) slot = &mmu.tlb[kTlbEntries - 1];  // every entry locked: replace the last
+    if (slot->data & tte::V) forget_translations(mmu, *slot);
     slot->tag = mmu.tag_access;
     slot->data = data;
     slot->used = false;
-    flush_soft_tlb();
+    attention_ = true;
+}
+
+void UltraSparc::forget_translations(MmuRegs& mmu, const TlbEntry& e) {
+    const bool data_side = &mmu == &dmmu_;
+    const unsigned shift = tte::page_shift(tte::size(e.data));
+    const u64 first = (e.tag >> shift) << (shift - 13), count = u64{1} << (shift - 13);  // in 8 KiB pages
+    auto in_range = [&](u64 page) { return page - first < count; };
+    for (SoftTlbEntry& s : soft_tlb_[data_side])
+        if (s.entry == &e) s.gen = 0;
+    if (data_side) {
+        for (unsigned c = 0; c < kFastClasses; ++c) {
+            if (c == 5) continue;  // (physical: no TLB)
+            for (u64 k = 0; k < std::min<u64>(count, kFastEntries); ++k) {
+                FastEntry& f = fast_[c][(first + k) & (kFastEntries - 1)];
+                if (in_range(f.key & ((u64{1} << 51) - 1))) f = FastEntry{};
+            }
+        }
+    } else {
+        for (FetchEntry& f : fetch_cache_)
+            if (in_range(f.va_page)) f.gen = 0;
+    }
+    attention_ = true;
 }
 
 void UltraSparc::tlb_demap(MmuRegs& mmu, u64 va) {
@@ -516,15 +603,18 @@ void UltraSparc::tlb_demap(MmuRegs& mmu, u64 va) {
     }
     for (TlbEntry& e : mmu.tlb) {
         if (!(e.data & tte::V)) continue;
+        bool demap;
         if (context_demap) {
-            if (!(e.data & tte::G) && (e.tag & 0x1FFF) == context) e.data &= ~tte::V;
+            demap = !(e.data & tte::G) && (e.tag & 0x1FFF) == context;
         } else {
             const unsigned shift = tte::page_shift(tte::size(e.data));
-            if (((e.tag ^ va) >> shift) != 0) continue;
-            if ((e.data & tte::G) || (e.tag & 0x1FFF) == context) e.data &= ~tte::V;
+            demap = ((e.tag ^ va) >> shift) == 0 && ((e.data & tte::G) || (e.tag & 0x1FFF) == context);
+        }
+        if (demap) {
+            forget_translations(mmu, e);
+            e.data &= ~tte::V;
         }
     }
-    flush_soft_tlb();
 }
 
 u64 UltraSparc::mmu_read(bool data_side, u64 va) const {
@@ -569,6 +659,37 @@ void UltraSparc::mmu_write(bool data_side, u64 va, u64 value) {
             break;
         default: break;
     }
+}
+
+bool UltraSparc::internal_read_is_plain(u8 a) {
+    switch (a) {
+        case asi::LSU_CONTROL:
+        case asi::ESTATE_ERROR_EN:
+        case asi::AFSR:
+        case asi::AFAR:
+        case asi::UPA_CONFIG:
+        case asi::INTR_DISPATCH_STATUS:
+        case asi::INTR_RECEIVE:
+        case asi::IMMU:
+        case asi::DMMU:
+        case asi::IMMU_TSB_8K_PTR:
+        case asi::IMMU_TSB_64K_PTR:
+        case asi::DMMU_TSB_8K_PTR:
+        case asi::DMMU_TSB_64K_PTR:
+        case asi::DMMU_TSB_DIRECT_PTR:
+        case asi::ITLB_DATA_ACCESS:
+        case asi::DTLB_DATA_ACCESS:
+        case asi::ITLB_TAG_READ:
+        case asi::DTLB_TAG_READ:
+        case asi::ECACHE_TAG_DATA: return true;
+        default: return false;
+    }
+}
+
+u64 UltraSparc::jit_internal_read(UltraSparc* cpu, u64 a, u64 va) {
+    u64 value = 0;
+    cpu->internal_asi_read(static_cast<u8>(a), va, 8, value);
+    return value;
 }
 
 bool UltraSparc::internal_asi_read(u8 a, u64 va, unsigned size, u64& value) {
@@ -633,6 +754,7 @@ bool UltraSparc::internal_asi_read(u8 a, u64 va, unsigned size, u64& value) {
 }
 
 bool UltraSparc::internal_asi_write(u8 a, u64 va, unsigned size, u64 value) {
+    attention_ = true;
     switch (a) {
         case asi::LSU_CONTROL:
             lsu_control_ = value;

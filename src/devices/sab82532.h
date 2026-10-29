@@ -27,6 +27,7 @@ public:
 
     const char* name() const override { return "sab82532"; }
     bool read(u64 offset, unsigned size, u64& value) override;
+    u64 stable_until(u64 offset, unsigned size) const override;
     bool write(u64 offset, unsigned size, u64 value) override;
 
     void reset();
