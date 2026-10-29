@@ -26,6 +26,7 @@ public:
     const char* name() const override { return bus_a_ ? "simba-a" : "simba-b"; }
     void reset() override;
     u32 config_read(u8 reg, unsigned size) override;
+    u64 config_stable(u8 reg, unsigned size) const override;
     void config_write(u8 reg, unsigned size, u32 value) override;
 
 protected:

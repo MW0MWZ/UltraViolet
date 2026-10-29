@@ -27,6 +27,10 @@ public:
     const char* name() const override { return "m48t59"; }
     bool read(u64 offset, unsigned size, u64& value) override;
     bool write(u64 offset, unsigned size, u64 value) override;
+    u64 stable_until(u64 offset, unsigned size) const override;
+    // The guest time (cycles) at which the host clock next moves to a new
+    // second; without it, the running clock registers promise nothing.
+    void set_next_second(std::function<u64()> f) { next_second_ = std::move(f); }
 
     u8* data() { return mem_.data(); }
     const u8* data() const { return mem_.data(); }
@@ -46,10 +50,16 @@ private:
 
     std::array<u8, kSize> mem_{};
     std::function<std::time_t()> host_clock_;
+    std::function<u64()> next_second_;
     long long offset_ = 0;   // guest time minus host time, seconds
     bool stopped_ = false;   // ST: oscillator stopped
     std::time_t stopped_at_ = 0;
     bool dirty_ = false;
+    // The last time latch_clock() converted, and its register values
+    // (seconds, minutes, hours, day of week, date, month, year), since the
+    // clock is often read many times a second.
+    std::time_t converted_ = -1;
+    std::array<u8, 7> converted_regs_{};
 };
 
 }  // namespace uv

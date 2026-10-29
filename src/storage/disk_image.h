@@ -30,12 +30,15 @@ public:
     bool read(u64 offset, u8* data, std::size_t length);
     bool write(u64 offset, const u8* data, std::size_t length);
     void flush();
+    // Reads and writes so far (for an activity light).
+    u64 accesses() const { return accesses_; }
 
 private:
     std::fstream f_;
     std::string path_;
     u64 size_ = 0;
     bool read_only_ = true;
+    u64 accesses_ = 0;
 };
 
 }  // namespace uv

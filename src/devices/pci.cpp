@@ -6,6 +6,15 @@
 
 namespace uv::pci {
 
+namespace {
+u32 g_decode_generation = 1;
+}  // namespace
+
+u32 decode_generation() { return g_decode_generation; }
+void decode_changed() {
+    if (++g_decode_generation == 0) ++g_decode_generation;
+}
+
 Function::Function(u16 vendor, u16 device, u8 revision, u32 class_code, u8 header_type) {
     set_cfg16(kVendorId, vendor);
     set_cfg16(kDeviceId, device);
@@ -21,7 +30,10 @@ Function::Function(u16 vendor, u16 device, u8 revision, u32 class_code, u8 heade
     save_reset_state();
 }
 
-void Function::reset() { cfg_ = reset_cfg_; }
+void Function::reset() {
+    cfg_ = reset_cfg_;
+    decode_changed();
+}
 
 void Function::set_wmask(u8 reg, unsigned size, u32 mask) {
     for (unsigned i = 0; i < size; ++i) wmask_[reg + i] = static_cast<u8>(mask >> (8 * i));
@@ -58,6 +70,7 @@ void Function::config_write(u8 reg, unsigned size, u32 value) {
         cfg_[r] = static_cast<u8>((cfg_[r] & ~wmask_[r]) | (b & wmask_[r]));
         cfg_[r] &= static_cast<u8>(~(b & w1c_[r]));
     }
+    decode_changed();
     if (on_config_write) on_config_write();
 }
 
@@ -71,6 +84,13 @@ int Function::decode(u32 addr, bool io) const {
         if (addr - base < b.size) return static_cast<int>(i);
     }
     return -1;
+}
+
+Function::Claim Function::claim(u32 addr, bool io, Decoded& d) const {
+    const int b = decode(addr, io);
+    if (b < 0) return Claim::None;
+    d = {static_cast<unsigned>(b), bar_address(static_cast<unsigned>(b)), bars_[static_cast<unsigned>(b)].size};
+    return Claim::Plain;
 }
 
 bool Function::mem_read(u32 addr, unsigned size, u64& value) {
@@ -103,10 +123,51 @@ void Bus::attach(unsigned device, unsigned function, Function* f) {
     slots_[device & 31][function & 7] = f;
     functions_.push_back(f);
     if (auto* b = dynamic_cast<Bridge*>(f)) bridges_.push_back(b);
+    decode_changed();
+}
+
+Function::Claim Bus::resolve(u32 addr, bool io, Function*& f, Function::Decoded& d) const {
+    for (Function* fn : functions_) {
+        if (auto* b = dynamic_cast<Bridge*>(fn)) {
+            if (io ? b->forwards_io(addr) : b->forwards_mem(addr)) {
+                const Function::Claim c = b->secondary_.resolve(addr, io, f, d);
+                if (c != Function::Claim::None) return c;
+            }
+            continue;
+        }
+        const Function::Claim c = fn->claim(addr, io, d);
+        if (c != Function::Claim::None) {
+            f = fn;
+            return c;
+        }
+    }
+    return Function::Claim::None;
+}
+
+const Bus::CacheEntry* Bus::decoded(u32 addr, bool io) {
+    const u32 granule = addr >> (io ? 2 : 4);
+    CacheEntry& e = (io ? io_cache_ : mem_cache_)[granule & (kCacheEntries - 1)];
+    const u32 gen = decode_generation();
+    if (e.gen == gen && e.granule == granule) return &e;
+    Function* f = nullptr;
+    Function::Decoded d;
+    if (resolve(addr, io, f, d) != Function::Claim::Plain) return nullptr;
+    e = {granule, gen, f, d};
+    return &e;
 }
 
 void Bus::reset() {
     for (Function* f : functions_) f->reset();
+}
+
+u64 Bus::config_stable(unsigned bus, unsigned device, unsigned function, u8 reg, unsigned size) const {
+    if (bus == number) {
+        const Function* f = slots_[device & 31][function & 7];
+        return f ? f->config_stable(reg, size) : Device::kForever;  // (no function: all ones)
+    }
+    for (const Bridge* b : bridges_)
+        if (b->claims_bus(bus)) return b->secondary_.config_stable(bus, device, function, reg, size);
+    return Device::kForever;
 }
 
 u32 Bus::config_read(unsigned bus, unsigned device, unsigned function, u8 reg, unsigned size) {
@@ -131,24 +192,43 @@ void Bus::config_write(unsigned bus, unsigned device, unsigned function, u8 reg,
 }
 
 bool Bus::mem_read(u32 addr, unsigned size, u64& value) {
+    // A claimed cycle the function refuses goes on to the others, as uncached.
+    if (const CacheEntry* e = decoded(addr, false))
+        if (e->f->bar_read(e->d.bar, addr - e->d.base, size, value)) return true;
     for (Function* f : functions_)
         if (f->mem_read(addr, size, value)) return true;
     return false;
 }
 
+u64 Bus::mem_stable(u32 addr, unsigned size) {
+    const CacheEntry* e = decoded(addr, false);
+    return e ? e->f->bar_stable(e->d.bar, addr - e->d.base, size) : 0;
+}
+
 bool Bus::mem_write(u32 addr, unsigned size, u64 value) {
+    if (const CacheEntry* e = decoded(addr, false))
+        if (e->f->bar_write(e->d.bar, addr - e->d.base, size, value)) return true;
     for (Function* f : functions_)
         if (f->mem_write(addr, size, value)) return true;
     return false;
 }
 
 bool Bus::io_read(u32 addr, unsigned size, u32& value) {
+    if (const CacheEntry* e = decoded(addr, true)) {
+        u64 v = 0;
+        if (e->f->bar_read(e->d.bar, addr - e->d.base, size, v)) {
+            value = static_cast<u32>(v);
+            return true;
+        }
+    }
     for (Function* f : functions_)
         if (f->io_read(addr, size, value)) return true;
     return false;
 }
 
 bool Bus::io_write(u32 addr, unsigned size, u32 value) {
+    if (const CacheEntry* e = decoded(addr, true))
+        if (e->f->bar_write(e->d.bar, addr - e->d.base, size, value)) return true;
     for (Function* f : functions_)
         if (f->io_write(addr, size, value)) return true;
     return false;

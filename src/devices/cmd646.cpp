@@ -178,6 +178,17 @@ bool Cmd646::bar_write(unsigned bar, u32 offset, unsigned size, u64 value) {
 }
 
 // A channel in compatibility mode answers at the legacy ports.
+pci::Function::Claim Cmd646::claim(u32 addr, bool io, Decoded& d) const {
+    if (io && (command() & pci::kCmdIo)) {  // the legacy ports of a channel in compatibility mode
+        for (unsigned ch = 0; ch < 2; ++ch) {
+            if (native(ch) || !enabled(ch)) continue;
+            if (addr - kLegacyCommand[ch] < 8 || addr - kLegacyControl[ch] < 4)
+                return Claim::Special;
+        }
+    }
+    return pci::Function::claim(addr, io, d);
+}
+
 bool Cmd646::io_read(u32 addr, unsigned size, u32& value) {
     if (command() & pci::kCmdIo) {
         for (unsigned ch = 0; ch < 2; ++ch) {

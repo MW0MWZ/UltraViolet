@@ -186,7 +186,6 @@ private:
     void dma_run();
     void execute_diagnostic();
 
-    Scheduler& sched_;
     double cpu_hz_;
     std::array<AtaDevice*, 2> dev_{};
     unsigned select_ = 0;

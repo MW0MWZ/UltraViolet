@@ -118,11 +118,11 @@ u8* Bus::host_write_ptr(u64 paddr) const {
     return (p.host && p.writable) ? p.host + (paddr & kPageMask) : nullptr;
 }
 
-bool Bus::read_is_pure(u64 paddr, unsigned size) const {
-    if (paddr > kAddressMask) return false;
+u64 Bus::stable_until(u64 paddr, unsigned size) const {
+    if (paddr > kAddressMask) return 0;
     const Page& p = page(paddr);
-    if (p.host) return true;
-    return p.device && p.device->read_is_pure(paddr - p.device_base, size);
+    if (p.host) return Device::kForever;
+    return p.device ? p.device->stable_until(paddr - p.device_base, size) : 0;
 }
 
 void Bus::set_read_stall(u64 base, u64 size, u16 cycles) {
@@ -131,6 +131,7 @@ void Bus::set_read_stall(u64 base, u64 size, u16 cycles) {
 }
 
 bool Bus::read_slow(u64 paddr, unsigned size, u64& out) {
+    ++slow_accesses_;
     if (paddr <= kAddressMask) {
         const Page& p = page(paddr);
         if (p.device && p.device->read(paddr - p.device_base, size, out)) {
@@ -146,6 +147,7 @@ bool Bus::read_slow(u64 paddr, unsigned size, u64& out) {
 }
 
 bool Bus::write_slow(u64 paddr, unsigned size, u64 value) {
+    ++slow_accesses_;
     if (paddr <= kAddressMask) {
         const Page& p = page(paddr);
         if (p.device) {

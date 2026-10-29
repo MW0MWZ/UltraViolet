@@ -39,6 +39,19 @@ u64 RioEbus::to_bus(u64 v, unsigned size) {
     }
 }
 
+u64 RioEbus::bar_stable(unsigned bar, u32 offset, unsigned size) const {
+    if (bar == 0) return prom_ && prom_size_ ? prom_->stable_until(offset % prom_size_, size) : Device::kForever;
+    for (const Child& c : children_) {
+        if (offset - c.offset < c.size) {
+            if (!c.byte_wide) return c.device->stable_until(offset - c.offset, size);
+            u64 t = Device::kForever;
+            for (unsigned i = 0; i < size; ++i) t = std::min(t, c.device->stable_until(offset - c.offset + i, 1));
+            return t;
+        }
+    }
+    return Device::kForever;  // (empty space)
+}
+
 bool RioEbus::bar_read(unsigned bar, u32 offset, unsigned size, u64& value) {
     if (bar == 0) {
         u64 v = ~u64{0};

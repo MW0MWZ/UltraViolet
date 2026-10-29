@@ -11,12 +11,17 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "core/types.h"
 #include "mem/bus.h"
+
+namespace uv::jit {
+class ExecBuffer;
+}
 
 namespace uv::usparc {
 
@@ -104,6 +109,9 @@ public:
 
     explicit UltraSparc(Bus& bus) : UltraSparc(bus, Options{}) {}
     UltraSparc(Bus& bus, const Options& options);
+    ~UltraSparc();
+    UltraSparc(const UltraSparc&) = delete;
+    UltraSparc& operator=(const UltraSparc&) = delete;
 
     // Power-on reset: RED_state at the reset vector + 0x20, TL = MAXTL.
     void reset();
@@ -112,6 +120,28 @@ public:
     // Executes up to `instructions` instructions (fewer if halted).
     void run(u64 instructions);
     void step();
+    // Decoded-block cache: run() executes straight-line runs of instructions
+    // fetched and translated once per block instead of once per instruction.
+    // Results are identical to step(); blocks are dropped when their memory
+    // is written or remapped. On by default; off while trace_hook is set.
+    void set_block_cache(bool enabled) {
+        block_cache_ = enabled;
+        flush_blocks();
+    }
+    // Dynamic recompiler: blocks run often are translated to host code
+    // (x86-64), with the same results as the decoded-block cache. On by
+    // default where the host has one; needs the block cache.
+    static bool jit_available() { return jit_compile_supported(); }
+    // (`buffer`: the space for translations; when it fills, they are all
+    // discarded and translation starts again.)
+    static constexpr std::size_t kJitBuffer = std::size_t{64} << 20;
+    void set_jit(bool enabled, std::size_t buffer = kJitBuffer);
+    bool jit_enabled() const { return jit_buf_ != nullptr; }
+    u64 jit_compiles() const { return jit_compiles_; }
+    // Validation: every translated block that does all its work itself is
+    // also run by execute() from the same state, and the CPU halts on the
+    // first difference (halt_reason() says where).
+    void set_jit_check(bool enabled) { jit_check_ = enabled; }
 
     // --- architectural state, for machines, debuggers and tests ----------------
     u64 pc() const { return pc_; }
@@ -125,9 +155,9 @@ public:
         npc_ = npc;
     }
     // Integer register in the current window and global set.
-    u64 reg(unsigned r) const { return r == 0 ? 0 : *r_[r]; }
+    u64 reg(unsigned r) const { return r == 0 ? 0 : base_[r >> 3][r & 7]; }
     void set_reg(unsigned r, u64 v) {
-        if (r != 0) *r_[r] = v;
+        if (r != 0) base_[r >> 3][r & 7] = v;
     }
     u8 ccr() const { return ccr_; }
     void set_ccr(u8 v) { ccr_ = v; }
@@ -173,8 +203,33 @@ public:
     // Returns false if it is busy (the sender must retry).
     bool deliver_interrupt_vector(u64 d0, u64 d1, u64 d2);
 
-    u64 cycles() const { return cycles_; }
+    // Guest time, in cycles of the processor's clock: what TICK counts and
+    // every other clock of the machine follows. Each step of the processor
+    // (an instruction started, or a trap taken) is charged cycles_per_step
+    // of it, which the machine sets to keep guest time to the wall clock (a
+    // faster host is then a faster processor, not a faster clock).
+    u64 cycles() const { return time_base_ + (((cycles_ - step_base_) * cpi_fx_) >> 16); }
     u64 instructions() const { return instret_; }
+    u64 steps() const { return cycles_; }
+    // From now on, `cpi` cycles a step (at least 1/65536).
+    void set_cycles_per_step(double cpi);
+    double cycles_per_step() const { return static_cast<double>(cpi_fx_) / 65536.0; }
+    // Steps until guest time reaches `cycles` (at least 1).
+    u64 steps_until(u64 cycles) const;
+    // Delay loops run at once (see jit_loops.h) are charged the time they
+    // take the real CPU, `cpi` being its charge for an instruction at one a
+    // cycle (0, the default: they are charged as any other steps). The IIi
+    // runs an iteration, a branch to itself and its delay slot, a cycle
+    // (OBP counts clock-frequency / 1000 of them for a millisecond), so a
+    // step costs half that. With a charge other than the usual one, run()
+    // ends after such a loop, since its count of steps was worked out at
+    // the usual rate.
+    void set_delay_cycles_per_step(double cpi);
+    // The steps of delay loops run at once (counted and timed), and the
+    // guest time charged for them (the pacer leaves them out of the host's
+    // speed).
+    u64 delay_steps() const { return delay_steps_; }
+    u64 delay_cycles() const { return delay_time_fx_ >> 16; }
 
     // Stops run() (the machine wants control, or the CPU entered error_state).
     bool halted() const { return halted_; }
@@ -204,6 +259,92 @@ private:
     };
     enum class AccessKind : u8 { Load, Store, Atomic, Fetch };
 
+    // Decoded blocks, by the host address of their first instruction. A
+    // block lies within one 4 KiB code page (and so within one I-MMU page).
+    static constexpr unsigned kBlockBits = 16;
+    static constexpr unsigned kMaxBlockLength = 32;
+    // Translated block: runs the block from its first instruction at `pc`,
+    // and may go on into other translated blocks of the same page while
+    // their instructions fit in `budget`; returns how many instructions it
+    // started (see jit_x64.cpp).
+    using JitFn = u32 (*)(UltraSparc* cpu, u64 pc, u64 budget);
+    struct Block {
+        const u8* host = nullptr;
+        unsigned length = 0;
+        JitFn code = nullptr;
+        u16 runs = 0;
+        u8 jit_mode = 0;        // jit_mode() the code was translated for
+        bool jit_self = false;  // the code never calls execute()
+        u32 loop = 0;           // a delay loop (CountedLoop::code(), TimedLoop::code(), or the last
+                                // block of a polling loop: 3 << 30 | how far back the loop starts
+                                // in instructions << 16 | its block index; 0: none)
+        u16 page_off = 0;       // where it starts in its 4 KiB code page, in instructions
+        std::array<u32, kMaxBlockLength> insns{};
+    };
+    static constexpr u16 kJitThreshold = 16;  // runs before a block is translated
+    bool jit_compile(Block& b);
+    static bool jit_compile_supported();
+    // An instruction the translated code does not do itself; true if the
+    // block must end after it (trap, attention or halt).
+    static bool jit_execute(UltraSparc* cpu, u32 insn);
+    // The back edge of a delay loop (Block::loop; see jit_loops.h), with
+    // `room` instructions left that may start and `next` the step the next
+    // would be: runs all but the last of the iterations that fit at once,
+    // and returns how many instructions that was (0 if none). A translation
+    // leaves after one charged other than the usual rate (delay_charged_).
+    u64 loop_at_once(u32 loop, u64 room, u64 next);
+    u64 count_down(u32 loop, u64 room);
+    u64 wait_for_tick(u32 loop, u64 room, u64 next);
+    u64 cycle_at_once(const Block& b, unsigned back, u64 room, u64 next);
+    // TICK as an instruction at `step` reads it.
+    u64 tick_at_step(u64 step) const;
+    // A polling loop's registers and condition codes at its last back edge
+    // (`next`: the step after it), to see whether the next iteration
+    // changed them.
+    struct PollSnapshot {
+        const u8* host = nullptr;
+        u64 next = 0;
+        u8 ccr = 0;
+        unsigned count = 0;
+        std::array<u64, 16> regs{};
+    };
+    PollSnapshot poll_snap_;
+    static u64 jit_loop_at_once(UltraSparc* cpu, u64 loop, u64 room, u64 next) {
+        return cpu->loop_at_once(static_cast<u32>(loop), room, next);
+    }
+    std::unique_ptr<jit::ExecBuffer> jit_buf_;
+    std::size_t jit_link_offset_ = 0;  // where blocks going on from another enter every translation
+    // The code translations call to run an instruction through execute()
+    // (made again whenever the buffer is emptied; jit_x64.cpp): with
+    // npc = pc + 4, and with npc in a register.
+    const void* jit_stub_seq_ = nullptr;
+    const void* jit_stub_dyn_ = nullptr;
+    bool jit_make_stubs();
+    u64 jit_compiles_ = 0;
+    bool jit_check_ = false;
+    u32 jit_run_checked(Block& b);
+    void run_blocks(u64 instructions);
+    void decode_block(Block& b, const u8* host, u64 pa);
+    // Recent fetch translations, by 8 KiB virtual page: valid while the soft
+    // TLB generation and the state that selects the translation (RED_state,
+    // privilege, TL > 0 for the nucleus context) are unchanged. `host` is
+    // the page's host memory, or null if it is not host-backed.
+    struct FetchEntry {
+        u64 va_page = ~u64{0};
+        u32 gen = 0;
+        u16 mode = 0;
+        const u8* host = nullptr;
+        u64 pa = 0;
+    };
+    static constexpr unsigned kFetchEntries = 256;
+    std::array<FetchEntry, kFetchEntries> fetch_cache_{};
+    u16 fetch_mode() const { return static_cast<u16>((pstate_ & (pstate::RED | pstate::PRIV)) | (tl_ > 0 ? 0x8000 : 0)); }
+    static unsigned block_index(const u8* host) {
+        return static_cast<unsigned>(reinterpret_cast<uintptr_t>(host) >> 2) & ((1u << kBlockBits) - 1);
+    }
+    void code_written(const u8* page);
+    void flush_blocks();
+
     // execution
     void execute(u32 insn);
     void take_trap(unsigned type);
@@ -231,6 +372,11 @@ private:
     bool phys_read(const Access& a, unsigned size, u64& value);
     bool phys_write(const Access& a, unsigned size, u64 value);
     bool internal_asi_read(u8 asi, u64 va, unsigned size, u64& value);
+    // Internal registers whose reads never fault and change nothing (the
+    // MMU and LSU registers, TSB pointers, TLB reads, error and interrupt
+    // status): translated code reads them through jit_internal_read().
+    static bool internal_read_is_plain(u8 asi);
+    static u64 jit_internal_read(UltraSparc* cpu, u64 asi, u64 va);
     bool internal_asi_write(u8 asi, u64 va, unsigned size, u64 value);
     static bool asi_is_memory(u8 asi);
     static bool asi_is_little(u8 asi);
@@ -252,7 +398,89 @@ private:
     u64 tsb_pointer(const MmuRegs& mmu, bool size_64k) const;
     void tlb_data_in(MmuRegs& mmu, u64 data);
     void tlb_demap(MmuRegs& mmu, u64 va);
-    void flush_soft_tlb() { ++soft_gen_; }
+    // Before a valid TLB entry is replaced or demapped: drops what was made
+    // from it (its soft TLB entries, and the fast data translations or
+    // fetch cache entries in its virtual range).
+    void forget_translations(MmuRegs& mmu, const TlbEntry& e);
+    void flush_soft_tlb() {
+        // (The fast tables' keys hold the low 13 bits of the generation,
+        // never 0: when those wrap, the tables are emptied.)
+        if ((++soft_gen_ & 0x1FFF) == 0) {
+            ++soft_gen_;
+            for (auto& table : fast_) table.fill(FastEntry{});
+        }
+        fast_key_ = u64{soft_gen_ & 0x1FFF} << 51;
+        attention_ = true;
+    }
+    // Fast data translations for translated code's loads and stores, by
+    // 8 KiB virtual page, one table for each way a memory ASI translates
+    // (fast_class()). An entry is made by a load or store execute()
+    // completed to host memory, so it allows only what translate_data()
+    // allowed; pages whose TTE.IE reverses the byte order get none.
+    //
+    // An entry for a page that is not host memory (a device) instead holds
+    // its translation for load() and store(), which then need not
+    // translate again: addend is the physical address - va, and the perms
+    // are kFastDevRead and kFastDevWrite (kFastDevSide: side effects),
+    // which translated code does not take for its own.
+    struct FastEntry {
+        u64 key = 0;               // (va >> 13) | fast_key_
+        s64 addend = 0;            // host address - va
+        const u8* code = nullptr;  // the code flags of the page's two 4 KiB halves
+        u8 perms = 0;              // kFastRead, kFastWrite, kFastAtomic: what execute() has done there
+    };
+    static constexpr u8 kFastRead = 1, kFastWrite = 2, kFastAtomic = 4;
+    static constexpr u8 kFastDevRead = 8, kFastDevWrite = 16, kFastDevSide = 32, kFastDev = kFastDevRead | kFastDevWrite;
+    static constexpr unsigned kFastEntries = 512, kFastClasses = 6;
+    std::array<std::array<FastEntry, kFastEntries>, kFastClasses> fast_{};
+    u64 fast_key_ = u64{1} << 51;
+    // The table for a memory ASI used now: 0 primary context with user
+    // permissions (P, PL in user code; AIUP, AIUPL), 1 primary with
+    // privileged (P, PL in privileged code), 2 nucleus (N, NL), 3 secondary
+    // privileged (S, SL), 4 secondary user (AIUS, AIUSL; S, SL in user
+    // code), 5 physical (the PHYS_* ASIs: virtual address = physical); -1
+    // none (other ASIs, and the restricted ones in user code). (No-fault
+    // loads translate as P or S but make no entries: on a no-fault-only
+    // page they succeed where P and S fault.)
+    int fast_class(u8 asi) const {
+        const bool priv = pstate_ & pstate::PRIV;
+        switch (asi) {
+            case asi::P:
+            case asi::PL: return priv ? 1 : 0;
+            case asi::N:
+            case asi::NL: return priv ? 2 : -1;
+            case asi::AIUP:
+            case asi::AIUPL: return priv ? 0 : -1;
+            case asi::S:
+            case asi::SL: return priv ? 3 : 4;
+            case asi::AIUS:
+            case asi::AIUSL: return priv ? 4 : -1;
+            case asi::PHYS_USE_EC:
+            case asi::PHYS_BYPASS_EC_E:
+            case asi::PHYS_USE_EC_L:
+            case asi::PHYS_BYPASS_EC_E_L: return priv ? 5 : -1;
+            case asi::NQUAD_LDD:
+            case asi::NQUAD_LDD_L: return priv ? 2 : -1;  // (the quad loads, as N)
+            default: return -1;
+        }
+    }
+    // 0 user, 1 privileged, 2 nucleus (TL > 0); 3: no fast path (little-endian
+    // accesses with PSTATE.CLE, or TL > 0 without privilege).
+    unsigned fast_mode() const {
+        if (pstate_ & pstate::CLE) return 3;
+        if (tl_ > 0) return (pstate_ & pstate::PRIV) ? 2 : 3;
+        return (pstate_ & pstate::PRIV) ? 1 : 0;
+    }
+    void fast_fill(u64 va, u8 asi, const Access& acc, AccessKind kind);
+    // The device entries (see FastEntry): a translation already made for a
+    // load or store, and the entry made after one.
+    bool fast_device(u64 va, u8 asi, AccessKind kind, Access& acc) const;
+    void fast_fill_device(u64 va, u8 asi, const Access& acc, AccessKind kind);
+    // What a translation depends on: PSTATE.AM, fast_mode() and fetch_mode().
+    unsigned jit_mode() const {
+        return ((pstate_ & pstate::AM) ? 1 : 0) | fast_mode() << 1 | ((pstate_ & pstate::RED) ? 8 : 0) |
+               ((pstate_ & pstate::PRIV) ? 16 : 0) | (tl_ > 0 ? 32 : 0);
+    }
 
     // privileged and ancillary registers
     bool read_pr(unsigned r, u64& v);
@@ -285,8 +513,9 @@ private:
     u64 pc_ = 0, npc_ = 0;
     std::array<std::array<u64, 8>, 4> globals_{};      // normal, alternate, MMU, interrupt
     std::array<u64, kWindows * 16> windows_{};         // ins and locals of each window
-    std::array<u64*, 32> r_{};                         // current mapping of r0..r31
-    u64 zero_sink_ = 0;
+    // Where r0-r31 are, eight at a time: the current global set, then the
+    // current window's outs, locals and ins (the locals follow the ins).
+    std::array<u64*, 4> base_{};
 
     u8 ccr_ = 0, asi_ = 0, fprs_ = 0;
     u64 y_ = 0;
@@ -296,10 +525,10 @@ private:
     std::array<TrapLevel, kMaxTl + 1> trap_{};
     u64 tba_ = 0;
 
-    u64 tick_offset_ = 0;  // TICK = cycles_ + tick_offset_ (bits 62:0)
+    u64 tick_offset_ = 0;  // TICK = cycles() + tick_offset_ (bits 62:0)
     bool tick_npt_ = true;
     u64 tick_cmpr_ = u64{1} << 63;
-    u64 tick_match_ = ~u64{0};  // cycles_ value at which TICK reaches TICK_CMPR
+    u64 tick_match_ = ~u64{0};  // the step (cycles_ value) at which TICK reaches TICK_CMPR
     u64 softint_ = 0;
     u64 dcr_ = 0, pcr_ = 0, pic_ = 0, gsr_ = 0;
 
@@ -313,8 +542,10 @@ private:
 
     MmuRegs immu_, dmmu_;
     // Soft TLB: recent hits of each TLB by 8 KiB virtual page and context,
-    // so most translations skip the 64-entry search. Any change to the TLBs,
-    // the contexts or the LSU control register starts a new generation.
+    // so most translations skip the 64-entry search. A TLB entry replaced or
+    // demapped drops what was made from it (forget_translations()); other
+    // changes to the TLBs, the contexts or the LSU control register start a
+    // new generation.
     struct SoftTlbEntry {
         u64 va_page = ~u64{0};
         unsigned context = 0;
@@ -338,9 +569,22 @@ private:
     std::array<u32, 64> f_{};  // f0..f63 as 32-bit halves
     u64 fsr_ = 0;
 
-    u64 cycles_ = 0, instret_ = 0;
+    u64 cycles_ = 0, instret_ = 0;  // steps, and instructions retired
+    // Guest time = time_base_ + (cycles_ - step_base_) * cpi_fx_ / 65536.
+    u64 time_base_ = 0, step_base_ = 0, cpi_fx_ = 65536;
+    // Delay loops run at once: the charge for a step (16.16; 0: the usual
+    // one), the part of a cycle charged apart from the usual charge and not
+    // yet in time_base_, the steps run and the time charged for them (16.16).
+    u64 delay_fx_ = 0, delay_frac_ = 0, delay_steps_ = 0, delay_time_fx_ = 0;
+    bool delay_charged_ = false;  // a delay loop was charged other than the usual rate
     bool halted_ = false;
     bool trapped_ = false;  // the current instruction trapped (its effects are discarded)
+    // The current instruction changed state that run_blocks() would
+    // otherwise only look at between blocks: the interrupt conditions, the
+    // fetch translation, or the code being run.
+    bool attention_ = false;
+    bool block_cache_ = true;
+    std::vector<Block> blocks_;
     std::string halt_reason_;
 };
 

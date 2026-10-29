@@ -30,6 +30,10 @@ void Simba::reset() {
     tick_base_ = ticks_ ? ticks_() : 0;
 }
 
+// The tick register counts guest time (in PCI clocks): a clock. The rest
+// of the configuration space promises nothing here.
+u64 Simba::config_stable(u8 reg, unsigned) const { return reg >= kTick && reg < kTick + 8 ? Device::kClock : 0; }
+
 u32 Simba::config_read(u8 reg, unsigned size) {
     if (reg >= kTick && reg < kTick + 8) {
         const u64 t = (ticks_ ? ticks_() : 0) - tick_base_;

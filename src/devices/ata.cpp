@@ -274,7 +274,7 @@ void AtaDevice::set_lba48_regs(u64 lba) {
 // --- AtaChannel ---
 
 AtaChannel::AtaChannel(Scheduler& scheduler, double cpu_hz)
-    : sched_(scheduler), cpu_hz_(cpu_hz), bm_timer_(scheduler, [this] { dma_run(); }) {}
+    : cpu_hz_(cpu_hz), bm_timer_(scheduler, [this] { dma_run(); }) {}
 
 AtaChannel::~AtaChannel() = default;
 
@@ -319,9 +319,10 @@ u32 AtaChannel::read_command(unsigned reg, unsigned size) {
         }
         return v;
     }
-    // Device 0 answers for an absent device 1: Status reads zero, the other
-    // registers as device 0 holds them.
-    if (const AtaDevice* other = dev_[select_ ^ 1]) return reg == 7 ? 0 : other->read_register(reg, hob);
+    // An absent device reads zero in every register, device/head included,
+    // even with the other device present: the other does not answer for it
+    // (measured on an Ultra 10's CMD646, device 1 absent behind an ATAPI
+    // device 0).
     return 0;
 }
 

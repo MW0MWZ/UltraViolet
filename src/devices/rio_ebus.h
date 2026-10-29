@@ -34,6 +34,7 @@ public:
 protected:
     bool bar_read(unsigned bar, u32 offset, unsigned size, u64& value) override;
     bool bar_write(unsigned bar, u32 offset, unsigned size, u64 value) override;
+    u64 bar_stable(unsigned bar, u32 offset, unsigned size) const override;
 
 private:
     struct Child {
