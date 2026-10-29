@@ -258,6 +258,126 @@ TEST(cpu_dmmu_translates_through_the_tlb_and_misses_to_the_mmu_globals) {
     CHECK_EQ(r.cpu.dmmu().tag_access, 0x50000000u);
 }
 
+namespace {
+// D-MMU helpers for the tests below: map an 8 KiB page in context 0 and
+// turn the D-MMU on.
+void dmmu_map(Rig& r, u64 va, u64 pa) {
+    r.cpu.set_reg(g1, va);
+    r.cpu.set_reg(g2, tte::V | tte::CP | tte::P | tte::W | pa);
+    r.cpu.set_reg(g3, 0x30);
+    r.exec({STXA(g1, g3, g0, asi::DMMU), STXA(g2, g0, g0, asi::DTLB_DATA_IN)});
+}
+void dmmu_on(Rig& r) {
+    r.cpu.set_reg(g4, 8);
+    r.exec({STXA(g4, g0, g0, asi::LSU_CONTROL)});
+}
+}  // namespace
+
+TEST(cpu_dmmu_demap_drops_translations_already_used) {
+    Rig r;
+    dmmu_map(r, 0x40000000, 0x4000);
+    dmmu_on(r);
+    r.cpu.set_reg(g5, 0x40000000);
+    r.exec({LDX(g6, g5, 0), LDX(g6, g5, 8)});  // (remembered now)
+    r.exec({STXA(g0, g5, g0, asi::DMMU_DEMAP)});
+    r.exec({LDX(g6, g5, 0)}, 1);
+    CHECK_EQ(r.cpu.trap_type(1), tt::kFastDataAccessMmuMiss);
+}
+
+TEST(cpu_dtlb_entry_replaced_stops_translating_even_after_use) {
+    // Page A fills entry 0; 63 more fill the rest; all are used; the next
+    // insert replaces entry 0 (no unused ones left), so A must then miss.
+    Rig r;
+    dmmu_map(r, 0x40000000, 0x4000);
+    for (u64 k = 1; k < 64; ++k) dmmu_map(r, 0x50000000 + 0x2000 * k, 0x6000);
+    dmmu_on(r);
+    r.cpu.set_reg(g5, 0x40000000);
+    r.exec({LDX(g6, g5, 0)});
+    for (u64 k = 1; k < 64; ++k) {
+        r.cpu.set_reg(g5, 0x50000000 + 0x2000 * k);
+        r.exec({LDX(g6, g5, 0)});
+    }
+    r.cpu.set_reg(g5, 0x40000000);
+    r.exec({LDX(g6, g5, 8)});  // A again (remembered)
+    dmmu_map(r, 0x70000000, 0x8000);
+    CHECK_EQ(r.cpu.dmmu().tlb[0].tag, 0x70000000u);  // (entry 0 replaced)
+    r.cpu.set_reg(g5, 0x40000000);
+    r.exec({LDX(g6, g5, 0)}, 1);
+    CHECK_EQ(r.cpu.trap_type(1), tt::kFastDataAccessMmuMiss);
+}
+
+TEST(cpu_dtlb_used_bits_count_accesses_after_they_are_cleared) {
+    // All 64 entries used; the next insert clears the used bits and takes
+    // entry 0. Entries 0 and 1 are then used (1 a page used before the
+    // bits were cleared): the insert after must take entry 2, not 1.
+    Rig r;
+    for (u64 k = 0; k < 64; ++k) dmmu_map(r, 0x50000000 + 0x2000 * k, 0x6000);
+    dmmu_on(r);
+    for (u64 k = 0; k < 64; ++k) {
+        r.cpu.set_reg(g5, 0x50000000 + 0x2000 * k);
+        r.exec({LDX(g6, g5, 0)});
+    }
+    dmmu_map(r, 0x70000000, 0x8000);
+    CHECK_EQ(r.cpu.dmmu().tlb[0].tag, 0x70000000u);
+    r.cpu.set_reg(g5, 0x70000000);
+    r.exec({LDX(g6, g5, 0)});
+    r.cpu.set_reg(g5, 0x50002000);
+    r.exec({LDX(g6, g5, 0)});
+    dmmu_map(r, 0x72000000, 0x8000);
+    CHECK_EQ(r.cpu.dmmu().tlb[2].tag, 0x72000000u);
+    CHECK_EQ(r.cpu.dmmu().tlb[1].tag, 0x50002000u);
+}
+
+TEST(cpu_dtlb_entry_replaced_stops_translating_in_translated_code) {
+    // As above, with A read by a loop run often enough to be translated
+    // (through the fast translations), then by the same loop once A's
+    // entry has been replaced: it must miss.
+    Rig r;
+    dmmu_map(r, 0x40000000, 0x4000);
+    for (u64 k = 1; k < 64; ++k) dmmu_map(r, 0x50000000 + 0x2000 * k, 0x6000);
+    dmmu_on(r);
+    for (u64 k = 1; k < 64; ++k) {
+        r.cpu.set_reg(g5, 0x50000000 + 0x2000 * k);
+        r.exec({LDX(g6, g5, 0)});
+    }
+    r.cpu.set_reg(g5, 0x40000000);
+    r.cpu.set_reg(g1, 40);
+    const std::initializer_list<u32> loop = {LDX(g6, g5, 0), SUBcci(g1, g1, 1), BPcc(cNE, kXcc, -2), NOP};
+    r.exec(loop, 4 * 40);
+    if (UltraSparc::jit_available()) CHECK(r.cpu.jit_compiles() > 0);
+    r.cpu.set_reg(g1, 0x70000000);
+    r.cpu.set_reg(g2, tte::V | tte::CP | tte::P | tte::W | 0x8000);
+    r.cpu.set_reg(g3, 0x30);
+    r.put(0x600, {STXA(g1, g3, g0, asi::DMMU), STXA(g2, g0, g0, asi::DTLB_DATA_IN)});  // (away from the loop)
+    r.run_at(0x600, 2);
+    CHECK_EQ(r.cpu.dmmu().tlb[0].tag, 0x70000000u);
+    r.cpu.set_reg(g1, 40);
+    r.run_at(Rig::kCode, 4);  // one pass of the loop as translated
+    CHECK(r.cpu.tl() >= 1);  // (and on into the empty trap table)
+    CHECK_EQ(r.cpu.trap_type(1), tt::kFastDataAccessMmuMiss);
+    CHECK_EQ(r.cpu.tpc(1), Rig::kCode);
+}
+
+TEST(cpu_dmmu_demap_drops_translations_in_translated_code) {
+    Rig r;
+    dmmu_map(r, 0x40000000, 0x4000);
+    dmmu_map(r, 0x50002000, 0x6000);  // (another fast-table slot)
+    dmmu_on(r);
+    r.cpu.set_reg(g5, 0x40000000);
+    r.cpu.set_reg(g4, 0x50002000);
+    r.cpu.set_reg(g1, 40);
+    const std::initializer_list<u32> loop = {LDX(g6, g5, 0), LDX(g7, g4, 0), SUBcci(g1, g1, 1), BPcc(cNE, kXcc, -3), NOP};
+    r.exec(loop, 5 * 40);
+    if (UltraSparc::jit_available()) CHECK(r.cpu.jit_compiles() > 0);
+    r.put(0x600, {STXA(g0, g5, g0, asi::DMMU_DEMAP)});  // A only: B stays (code away from the loop's)
+    r.run_at(0x600, 1);
+    r.cpu.set_reg(g1, 40);
+    r.run_at(Rig::kCode, 5);  // one pass of the loop as translated
+    CHECK(r.cpu.tl() >= 1);  // (and on into the empty trap table)
+    CHECK_EQ(r.cpu.trap_type(1), tt::kFastDataAccessMmuMiss);
+    CHECK_EQ(r.cpu.tpc(1), Rig::kCode);
+}
+
 TEST(cpu_dmmu_write_to_a_read_only_page_is_a_protection_trap) {
     Rig r;
     r.cpu.set_reg(g1, 0x40000000);
@@ -319,6 +439,39 @@ TEST(cpu_tick_compare_sets_softint_tick_int) {
     CHECK(r.cpu.softint() & 1);
 }
 
+TEST(cpu_guest_time_follows_the_charge_per_step) {
+    // At a quarter of a cycle a step, TICK advances a quarter as fast as
+    // the steps; at three cycles, three times as fast; the change keeps
+    // the time already counted.
+    Rig r;
+    r.cpu.set_cycles_per_step(0.25);
+    const u64 t0 = r.cpu.cycles();
+    std::vector<u32> nops(400, NOP);
+    for (std::size_t k = 0; k < nops.size(); ++k) r.bus.write(Rig::kCode + 4 * k, nops[k]);
+    r.run_at(Rig::kCode, 400);
+    CHECK_EQ(r.cpu.cycles() - t0, 100u);
+    r.cpu.set_cycles_per_step(3.0);
+    r.run_at(Rig::kCode, 100);
+    CHECK_EQ(r.cpu.cycles() - t0, 400u);
+    r.exec({RDPR(g1, prTICK)});  // (TICK as the RDPR's step charged it)
+    const u64 now = r.cpu.tick() & ~(u64{1} << 63), read = r.cpu.reg(g1) & ~(u64{1} << 63);
+    CHECK(read <= now && now - read <= 3);
+}
+
+TEST(cpu_tick_compare_matches_guest_time_not_steps) {
+    // TICK_CMPR 100 ahead at a quarter of a cycle a step: the interrupt
+    // comes after 400 steps, not 100.
+    Rig r;
+    r.cpu.set_cycles_per_step(0.25);
+    r.exec({WRPR(prTICK, g0, g0), WRASRi(23, g0, 100)});  // TICK = 0, TICK_CMPR = 100
+    std::vector<u32> nops(500, NOP);
+    for (std::size_t k = 0; k < nops.size(); ++k) r.bus.write(Rig::kCode + 4 * k, nops[k]);
+    r.run_at(Rig::kCode, 380);
+    CHECK(!(r.cpu.softint() & 1));
+    r.run_at(Rig::kCode, 40);
+    CHECK(r.cpu.softint() & 1);
+}
+
 TEST(cpu_popc_and_mulx) {
     Rig r;
     r.cpu.set_reg(g1, 0xF0F0);
@@ -352,4 +505,97 @@ TEST(disasm_common_forms) {
     CHECK(disassemble(WRPR(prPSTATE, g1, g0), 0) == "wrpr %g1, %g0, %pstate");
     CHECK(disassemble(RETRY, 0) == "retry");
     CHECK(disassemble(JMPLi(g0, i7, 8), 0) == "ret");
+}
+
+namespace {
+
+// A device that answers each read with its offset + 0x1100 and counts the
+// reads and writes it sees.
+struct CountingDevice : Device {
+    const char* name() const override { return "counting"; }
+    bool read(u64 offset, unsigned, u64& value) override {
+        ++reads;
+        value = offset + 0x1100;
+        return true;
+    }
+    bool write(u64 offset, unsigned, u64 value) override {
+        ++writes;
+        last = offset << 32 | (value & 0xFFFFFFFF);
+        return true;
+    }
+    unsigned reads = 0, writes = 0;
+    u64 last = 0;
+};
+
+constexpr u64 kDevPa = 0x100000000;  // (above the rig's RAM)
+
+void dmmu_map_tte(Rig& r, u64 va, u64 data) {
+    r.cpu.set_reg(g1, va);
+    r.cpu.set_reg(g2, data);
+    r.cpu.set_reg(g3, 0x30);
+    r.exec({STXA(g1, g3, g0, asi::DMMU), STXA(g2, g0, g0, asi::DTLB_DATA_IN)});
+}
+
+}  // namespace
+
+// Loads and stores that reach a device keep its translation, and use it
+// only where translating again would give the same: the values and the
+// device's accesses as before, a demap, a read-only page, a no-fault load
+// of a page with side effects and user code on a privileged page all
+// still fault.
+TEST(cpu_device_accesses_reuse_their_translation_only_where_it_holds) {
+    Rig r;
+    CountingDevice dev;
+    r.bus.map_device(kDevPa, Bus::kPageSize, &dev);
+    dmmu_map_tte(r, 0x40000000, tte::V | tte::E | tte::P | tte::W | kDevPa);
+    dmmu_map_tte(r, 0x40002000, tte::V | tte::E | tte::P | (kDevPa + 0x2000));  // read-only
+    dmmu_on(r);
+    r.cpu.set_reg(g5, 0x40000000);
+    r.cpu.set_reg(g6, 0x40002000);
+    r.cpu.set_reg(g7, 0x55);
+    for (int k = 0; k < 3; ++k) r.exec({LDUW(o1, g5, 8), STW(g7, g5, 12), LDUW(o2, g6, 4)});
+    CHECK_EQ(r.cpu.reg(o1), 0x1108u);
+    CHECK_EQ(r.cpu.reg(o2), 0x3104u);
+    CHECK_EQ(dev.reads, 6u);
+    CHECK_EQ(dev.writes, 3u);
+    CHECK_EQ(dev.last, (u64{12} << 32) | 0x55);
+    // An unmapped page that shares the entry's slot.
+    r.cpu.set_reg(o4, 0x40400000);
+    r.exec({LDUW(o1, o4, 8)}, 1);
+    CHECK_EQ(r.cpu.trap_type(1), tt::kFastDataAccessMmuMiss);
+    CHECK_EQ(dev.reads, 6u);
+    r.cpu.set_tl(0);
+    r.cpu.set_pstate(pstate::PRIV | pstate::PEF);
+    // A store to the read-only page.
+    r.exec({STW(g7, g6, 4)}, 1);
+    CHECK_EQ(r.cpu.trap_type(1), tt::kFastDataAccessProtection);
+    CHECK_EQ(dev.writes, 3u);
+    // A no-fault load of a page with side effects. (After each trap, back
+    // to TL 0 and the normal globals.)
+    auto recover = [&](u16 pstate) {
+        r.cpu.set_tl(0);
+        r.cpu.set_pstate(pstate);
+    };
+    recover(pstate::PRIV | pstate::PEF);
+    r.exec({LDUWA(o3, g5, g0, asi::PNF)}, 1);
+    CHECK_EQ(r.cpu.trap_type(1), tt::kDataAccessException);
+    CHECK_EQ(dev.reads, 6u);
+    // User code on the privileged page.
+    recover(pstate::PEF);
+    r.exec({LDUW(o1, g5, 8)}, 1);
+    CHECK_EQ(r.cpu.trap_type(1), tt::kDataAccessException);
+    CHECK_EQ(dev.reads, 6u);
+    // A demap.
+    recover(pstate::PRIV | pstate::PEF);
+    r.exec({STXA(g0, g5, g0, asi::DMMU_DEMAP)});
+    r.exec({LDUW(o1, g5, 8)}, 1);
+    CHECK_EQ(r.cpu.trap_type(1), tt::kFastDataAccessMmuMiss);
+    CHECK_EQ(dev.reads, 6u);
+    // Through the physical ASIs, big- and little-endian.
+    recover(pstate::PRIV | pstate::PEF);
+    r.cpu.set_reg(g5, kDevPa);
+    for (int k = 0; k < 3; ++k) r.exec({LDUWA(o1, g5, g0, asi::PHYS_BYPASS_EC_E), LDUWA(o2, g5, g0, asi::PHYS_BYPASS_EC_E_L)});
+    CHECK_EQ(r.cpu.reg(o1), 0x1100u);
+    CHECK_EQ(r.cpu.reg(o2), 0x00110000u);
+    CHECK_EQ(dev.reads, 12u);
 }

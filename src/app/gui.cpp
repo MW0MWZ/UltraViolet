@@ -1,0 +1,1632 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
+// The main window: the Rage Pro's picture between a menu bar and a status
+// bar, with the Settings dialog and the serial terminal windows. The
+// machine runs on this thread, a millisecond of guest time at a go between
+// frames.
+#include <SDL3/SDL.h>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <deque>
+#include <filesystem>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <vector>
+
+#include "app/display_sdl.h"
+#include "app/menu_model.h"
+#include "app/proms.h"
+#include "app/session.h"
+#include "app/terminal.h"
+#include "app/terminal_window.h"
+#include "backends/imgui_impl_sdl3.h"
+#include "backends/imgui_impl_sdlrenderer3.h"
+#include "core/log.h"
+#include "imgui.h"
+#include "misc/cpp/imgui_stdlib.h"
+#include "net/slirp_backend.h"
+#include "net/tap_backend.h"
+
+#ifndef UV_VERSION
+#define UV_VERSION "dev"
+#endif
+
+namespace uv::app {
+
+namespace {
+
+#if defined(__APPLE__)
+constexpr const char* kAlt = "Option";
+#else
+constexpr const char* kAlt = "Alt";
+#endif
+constexpr const char* kAppName = "UltraViolet";
+
+// Sun Type 5 key numbers the window sends itself.
+constexpr u8 kSunStop = 0x01, kSunA = 0x4D, kSunUp = 0x14, kSunDown = 0x1B, kSunPageUp = 0x60, kSunPageDown = 0x7B;
+
+std::string file_name(const std::string& path) {
+    return path.empty() ? std::string() : std::filesystem::path(path).filename().string();
+}
+
+std::string folder_of(const std::string& path) {
+    if (path.empty()) return {};
+    std::error_code ec;
+    const auto dir = std::filesystem::absolute(path, ec).parent_path();
+    return ec ? std::string() : dir.string() + "/";
+}
+
+std::string default_settings_path() { return user_file("settings.ini"); }
+
+// What a file chooser was opened for.
+enum class Pick { PromDir, Nvram, NewNvram, Disk, NewDisk, AddDisc, InsertDisc, OpenSettings, SaveSettings };
+
+constexpr SDL_DialogFileFilter kNvramFilters[] = {{"NVRAM images", "bin;nvram;nvr"}, {"All files", "*"}};
+constexpr SDL_DialogFileFilter kDiskFilters[] = {{"Disk images", "img;raw;dsk;hd;hdd"}, {"All files", "*"}};
+constexpr SDL_DialogFileFilter kDiscFilters[] = {{"CD-ROM images", "iso;img;bin;raw;cdr"}, {"All files", "*"}};
+constexpr SDL_DialogFileFilter kSettingsFilters[] = {{"Settings", "ini;conf;cfg"}, {"All files", "*"}};
+
+constexpr std::array<u64, 7> kDiskSizesMiB = {1024, 2048, 4096, 8192, 16384, 32768, 65536};
+
+// An activity light: lit for a moment whenever its counter moves.
+struct Light {
+    u64 last = 0;
+    u64 lit_until_ns = 0;
+    void update(u64 value, u64 now_ns) {
+        if (value != last) lit_until_ns = now_ns + 120000000ull;
+        last = value;
+    }
+    bool lit(u64 now_ns) const { return now_ns < lit_until_ns; }
+};
+
+class Gui {
+public:
+    Gui(Settings settings, GuiOptions options, volatile std::sig_atomic_t& stop, volatile std::sig_atomic_t& next_disc)
+        : session_(std::move(settings)), options_(std::move(options)), stop_(stop), next_disc_(next_disc) {}
+    int run();
+
+private:
+    struct PickRequest {
+        Gui* gui;
+        Pick what;
+        std::string location;
+    };
+    struct PickResult {
+        Pick what;
+        std::string path;
+    };
+
+    // Machine
+    void power_on();
+    void power_off();
+    void reset();
+    void stop_a();
+    void eject();
+    void status(std::string text) {
+        status_text_ = std::move(text);
+        status_until_ns_ = SDL_GetTicksNS() + 4000000000ull;
+    }
+    void message(std::string text) {
+        message_ = std::move(text);
+        open_message_ = true;
+    }
+
+    // Input
+    void handle_event(const SDL_Event& ev);
+    bool hotkey(const SDL_KeyboardEvent& key);
+    void key(SDL_Scancode sc, bool down);
+    void tap_key(u8 sun);
+    void set_captured(bool on);
+    void capture_at(float x, float y);
+    bool auto_capture(float x, float y);
+    void mouse_frame();
+    void release_keys();
+    void update_title();
+
+    // Drawing
+    void frame();
+    void draw_menu();
+    std::vector<MenuEntry> menus();
+    void draw_entries(const std::vector<MenuEntry>& entries);
+    void toggle_fullscreen();
+    void draw_status_bar();
+    void draw_settings();
+    void draw_popups();
+    void update_picture();
+    void update_meters(u64 now_ns);
+
+    // Files
+    void choose(Pick what, const std::string& current);
+    static void on_chosen(void* userdata, const char* const* files, int filter);
+    void apply_choice(const PickResult& r);
+    void open_settings();
+    bool accept_settings();
+    void save_settings_to(const std::string& path);
+
+    Session session_;
+    GuiOptions options_;
+    volatile std::sig_atomic_t& stop_;
+    volatile std::sig_atomic_t& next_disc_;
+    std::string settings_path_;
+    bool quit_ = false;
+
+    SDL_Window* window_ = nullptr;
+    SDL_Renderer* renderer_ = nullptr;
+    ImGuiContext* ctx_ = nullptr;
+    float scale_ = 1.0f;    // UI scale, in window coordinates
+    float density_ = 1.0f;  // pixels per window coordinate (2 on Retina)
+    SDL_Texture* texture_ = nullptr;
+    unsigned tex_w_ = 0, tex_h_ = 0;
+    std::vector<u32> pixels_;
+    u64 shown_version_ = 0;
+    bool picture_ = false, picture_stale_ = true;
+    SDL_FRect dest_{};  // where the picture is drawn, in window coordinates
+    bool fullscreen_ = false, show_status_ = true;
+    bool native_menus_ = false;                   // macOS: the system menu bar has the menus
+    std::vector<std::function<void()>> posted_;  // actions chosen there, run from the main loop
+    int pending_frames_ = 3;
+    u64 picture_ns_ = 0;  // host time the last picture of the display took to make
+
+    bool captured_ = false;
+    // Following the guest's hardware cursor (see mouse_frame)
+    bool have_cursor_ = false, syncing_ = false;
+    int last_cx_ = 0, last_cy_ = 0, hot_x_ = 0, hot_y_ = 0, sync_frames_ = 0;
+    int push_[4] = {};  // pushed against the left, right, top and bottom edges
+    float sync_x_ = 0, sync_y_ = 0;
+    int sent_x_ = 0, sent_y_ = 0;          // the last steering step
+    float gain_x_ = 1.0f, gain_y_ = 1.0f;  // the guest's pointer acceleration, as seen
+    // Moving onto the screen may capture the mouse; not again after a release
+    // until the pointer has been off the screen.
+    bool capture_armed_ = true;
+    unsigned buttons_ = 0;  // left 1, middle 2, right 4
+    float wheel_ = 0;       // wheel movement not yet sent: less than a step
+    float dx_ = 0, dy_ = 0;
+    // Host keys held (by scancode), and how many hold each Sun key (two host
+    // keys can be the same Sun key, as both Controls).
+    std::array<bool, SDL_SCANCODE_COUNT> keys_down_{};
+    std::array<u8, 128> sun_held_{};
+
+    std::array<Terminal, 2> terminals_;
+    std::array<std::unique_ptr<TerminalWindow>, 2> terminal_windows_;
+
+    // Status bar
+    Light disk_light_, cd_light_, net_light_;
+    u64 last_instructions_ = 0, meter_time_ns_ = 0, next_status_ns_ = 0;
+    double mips_ = 0;
+    std::string status_text_, status_shown_;
+    u64 status_until_ns_ = 0;
+
+    // Dialogs
+    bool settings_open_ = false, about_open_ = false, keys_open_ = false;
+    bool open_message_ = false, open_quit_ = false;
+    std::string message_;
+    Settings edit_;
+    int net_mode_ = 0;  // user, tap, none
+    std::string tap_name_, mac_text_, settings_error_;
+    std::vector<std::string> forward_texts_;
+    int disc_selected_ = -1;
+    int new_disk_size_ = 3;  // index into kDiskSizesMiB
+    std::mutex picks_mutex_;
+    std::deque<PickResult> picks_;
+
+    // The PROM the settings being edited would start with (or why there is
+    // none), worked out again only when the folder changes.
+    struct PromChoice {
+        std::string key, text;
+        bool ok = false;
+    } prom_choice_;
+    const PromChoice& prom_choice(const Settings& s);
+};
+
+const Gui::PromChoice& Gui::prom_choice(const Settings& s) {
+    const std::string key = prom_folder(s);
+    if (key == prom_choice_.key) return prom_choice_;
+    prom_choice_.key = key;
+    PromImage p;
+    std::string error;
+    prom_choice_.ok = select_prom(s, p, error);
+    if (prom_choice_.ok)
+        prom_choice_.text = "Flash PROM: " + file_name(p.path) + " (OpenBoot " + p.version + ", " + p.date + ")";
+    else
+        prom_choice_.text = error;
+    return prom_choice_;
+}
+
+int Gui::run() {
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
+        UV_LOG(Error, "display", "SDL_Init failed: %s", SDL_GetError());
+        return -1;
+    }
+    settings_path_ = options_.settings_file.empty() ? default_settings_path() : options_.settings_file;
+    if (!options_.power_on && options_.settings_file.empty()) {
+        Settings saved;
+        std::string error;
+        if (std::filesystem::exists(settings_path_) && load_settings(settings_path_, saved, error))
+            session_.set_settings(saved);
+    }
+
+    const SDL_DisplayID display = SDL_GetPrimaryDisplay();
+    scale_ = std::clamp(SDL_GetDisplayContentScale(display), 1.0f, 4.0f);
+    // Room for a 1152x900 picture with the bars, shrunk to fit the screen:
+    // the status bar, and the menu bar except on macOS (whose menus are in
+    // the system menu bar).
+#if defined(__APPLE__)
+    constexpr float kBars = 1;
+#else
+    constexpr float kBars = 2;
+#endif
+    const float bars = kBars * (13.0f + 6.0f) * scale_;
+    float w = 1152, h = 900 + bars;
+    SDL_Rect usable;
+    if (SDL_GetDisplayUsableBounds(display, &usable)) {
+        const float fit = std::min({1.0f, usable.w * 0.95f / w, usable.h * 0.9f / h});
+        w *= fit;
+        h = (h - bars) * fit + bars;
+    }
+    window_ = SDL_CreateWindow(kAppName, static_cast<int>(w), static_cast<int>(h),
+                               SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    renderer_ = window_ ? SDL_CreateRenderer(window_, nullptr) : nullptr;
+    if (!renderer_) {
+        UV_LOG(Error, "display", "cannot create window: %s", SDL_GetError());
+        if (window_) SDL_DestroyWindow(window_);
+        SDL_Quit();
+        return -1;
+    }
+    // Sizes are in window coordinates, scaled for the desktop's UI scale; on
+    // a high-density screen (Retina) text is rasterised at the pixel density
+    // and drawn at the coordinate size, so it stays sharp.
+    density_ = std::max(1.0f, SDL_GetWindowPixelDensity(window_));
+    scale_ = std::clamp(SDL_GetWindowDisplayScale(window_) / density_, 1.0f, 4.0f);
+    {
+        // The bars at the window's own scale (the display's may differ): the
+        // picture keeps its size.
+        const float exact = kBars * (13.0f + 6.0f) * scale_;
+        if (std::fabs(exact - bars) >= 1)
+            SDL_SetWindowSize(window_, static_cast<int>(w), static_cast<int>(h - bars + exact));
+    }
+    ctx_ = ImGui::CreateContext();
+    ImGui::SetCurrentContext(ctx_);
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    ImGui::StyleColorsDark();
+    ImGui::GetStyle().ScaleAllSizes(scale_);
+    ImFontConfig font;
+    font.SizePixels = 13.0f * scale_ * density_;
+    io.Fonts->AddFontDefault(&font);
+    io.FontGlobalScale = 1.0f / density_;
+    ImGui_ImplSDL3_InitForSDLRenderer(window_, renderer_);
+    ImGui_ImplSDLRenderer3_Init(renderer_);
+
+    // The serial ports, each in a terminal window of its own.
+    static const char* const kPortNames[2] = {"Serial Port A (ttya)", "Serial Port B (ttyb)"};
+    for (unsigned port = 0; port < 2; ++port) {
+        terminals_[port].set_reply([this, port](const std::string& s) { session_.serial_input(port, s); });
+        terminal_windows_[port] = std::make_unique<TerminalWindow>(
+            std::string(kAppName) + " - " + kPortNames[port], terminals_[port],
+            [this, port](const std::string& s) { session_.serial_input(port, s); }, scale_);
+    }
+    session_.set_serial_output([this](unsigned port, u8 byte) {
+        if (port < 2) terminals_[port].feed(byte);
+    });
+    // After everything the menus describe exists.
+    native_menus_ = install_native_menus([this] { return menus(); },
+                                         [this](std::function<void()> a) { posted_.push_back(std::move(a)); });
+
+    if (options_.power_on) power_on();
+    else if (!prom_choice(session_.settings()).ok) open_settings();  // no PROM image yet
+    update_title();
+
+    constexpr u64 kFrameNs = 1000000000ull / 60;
+    u64 next_frame_ns = SDL_GetTicksNS();
+    u64 next_periodic_ns = next_frame_ns + 1000000000ull;
+    while (!quit_) {
+        if (stop_) break;
+        if (next_disc_) {
+            next_disc_ = 0;
+            session_.next_disc();
+        }
+        if (session_.on()) {
+            const u64 slice = static_cast<u64>(session_.settings().cpu_mhz * 1000);  // about 1 ms of guest time
+            while (SDL_GetTicksNS() < next_frame_ns && session_.stopped().empty()) session_.run(slice);
+            if (const std::string why = session_.stopped(); !why.empty()) {
+                power_off();
+                message("The machine has stopped:\n\n" + why);
+            }
+        } else {
+            SDL_WaitEventTimeout(nullptr, 50);
+        }
+        const u64 now = SDL_GetTicksNS();
+        if (now < next_frame_ns) continue;
+        next_frame_ns = std::max(next_frame_ns + kFrameNs, now);
+        if (now >= next_periodic_ns) {
+            next_periodic_ns = now + 1000000000ull;
+            session_.periodic();
+        }
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) handle_event(ev);
+        if (!posted_.empty()) {  // chosen from the system menu bar
+            auto actions = std::move(posted_);
+            posted_.clear();
+            for (auto& a : actions) a();
+            pending_frames_ = std::max(pending_frames_, 3);
+        }
+        {
+            std::deque<PickResult> picks;
+            {
+                std::lock_guard<std::mutex> lock(picks_mutex_);
+                picks.swap(picks_);
+            }
+            for (const auto& p : picks) apply_choice(p);
+            if (!picks.empty()) pending_frames_ = std::max(pending_frames_, 2);
+        }
+        mouse_frame();
+        frame();
+        for (auto& t : terminal_windows_) t->frame(now);
+        // The machine runs for at least as long again as making the picture
+        // took, and four times as long while it is behind real time: a host
+        // slow to draw shows fewer frames a second, rather than leaving the
+        // machine behind.
+        if (picture_ns_) {
+            const Ultra5_10* m = session_.machine();
+            const u64 share = m && m->pacer().lag() > 0.05 ? 4 : 1;
+            next_frame_ns = std::max(next_frame_ns, SDL_GetTicksNS() + share * picture_ns_);
+        }
+        picture_ns_ = 0;
+    }
+
+    if (!options_.screenshot.empty() && session_.on() && !session_.save_screenshot(options_.screenshot))
+        std::fprintf(stderr, "screenshot: no video signal\n");
+    power_off();
+    if (!options_.power_on && options_.settings_file.empty()) save_settings_to(settings_path_);
+    for (auto& t : terminal_windows_) t.reset();
+    if (texture_) SDL_DestroyTexture(texture_);
+    ImGui_ImplSDLRenderer3_Shutdown();
+    ImGui_ImplSDL3_Shutdown();
+    ImGui::DestroyContext(ctx_);
+    SDL_DestroyRenderer(renderer_);
+    SDL_DestroyWindow(window_);
+    SDL_Quit();
+    return 0;
+}
+
+// --- Machine ---------------------------------------------------------------
+
+void Gui::power_on() {
+    if (session_.on()) return;
+    std::string error;
+    if (!session_.power_on(error)) {
+        message("The Ultra 5/10 cannot be powered on:\n\n" + error);
+        return;
+    }
+    for (auto& t : terminals_) t.reset();
+    picture_stale_ = true;
+    meter_time_ns_ = 0;
+    // With the console on ttya, its terminal is the screen.
+    if (session_.settings().console == "ttya") terminal_windows_[0]->open();
+    update_title();
+    pending_frames_ = 3;
+}
+
+void Gui::power_off() {
+    if (!session_.on()) return;
+    set_captured(false);
+    release_keys();
+    session_.power_off();
+    picture_ = false;
+    picture_stale_ = true;
+    update_title();
+    pending_frames_ = 3;
+}
+
+void Gui::reset() {
+    if (auto* m = session_.machine()) {
+        release_keys();
+        m->reset();
+        status("Reset: the machine restarts from OpenBoot");
+    }
+}
+
+// Stop-A: the abort sequence (to OpenBoot's ok prompt).
+void Gui::stop_a() {
+    auto* m = session_.machine();
+    if (!m) return;
+    if (!m->keyboard()) {
+        status("No keyboard (the console is ttya): send a break on Serial Port A instead");
+        return;
+    }
+    m->post_key(kSunStop, true);
+    m->post_key(kSunA, true);
+    m->post_key(kSunA, false);
+    m->post_key(kSunStop, false);
+}
+
+void Gui::eject() {
+    if (session_.disc_in_drive() < 0) {
+        status("The CD-ROM drive is empty");
+        return;
+    }
+    session_.eject();
+    status("Disc ejected");
+}
+
+// --- Input -------------------------------------------------------------------
+
+void Gui::update_title() {
+    std::string title = kAppName;
+    if (!session_.on()) title += " - powered off";
+    else if (captured_) title += std::string(" - Ctrl+") + kAlt + "+G releases the mouse";
+    else if (picture_) title += " - click the screen to capture the mouse";
+    SDL_SetWindowTitle(window_, title.c_str());
+}
+
+void Gui::set_captured(bool on) {
+    if (on == captured_) return;
+    captured_ = on;
+    SDL_SetWindowRelativeMouseMode(window_, on);
+    if (!on && buttons_ && session_.on()) session_.machine()->post_mouse(0, 0, 0);
+    buttons_ = 0;
+    dx_ = dy_ = 0;
+    std::fill(std::begin(push_), std::end(push_), 0);
+    have_cursor_ = syncing_ = false;
+    if (!on) capture_armed_ = false;
+    update_title();
+}
+
+// Captures the mouse and brings the guest's pointer to (x, y) in the window.
+void Gui::capture_at(float x, float y) {
+    set_captured(true);
+    syncing_ = dest_.w > 0 && dest_.h > 0;
+    sync_frames_ = 0;
+    sync_x_ = (x - dest_.x) * static_cast<float>(tex_w_) / dest_.w;
+    sync_y_ = (y - dest_.y) * static_cast<float>(tex_h_) / dest_.h;
+    sent_x_ = sent_y_ = 0;
+    gain_x_ = gain_y_ = 1.0f;
+}
+
+// The pointer moved to (x, y) while the mouse was free: moving onto the screen
+// captures it, where the setting allows and the guest shows the Rage Pro's
+// hardware cursor (which can then be steered to the host pointer, and
+// released at the screen's edges again). Not while the window is in the
+// background, a button is held (a drag from outside) or a menu or dialog is
+// open.
+bool Gui::auto_capture(float x, float y) {
+    const bool on_screen = picture_ && x >= dest_.x && x < dest_.x + dest_.w && y >= dest_.y && y < dest_.y + dest_.h;
+    if (!on_screen) {
+        capture_armed_ = true;
+        return false;
+    }
+    auto* m = session_.machine();
+    int cx = 0, cy = 0;
+    if (!capture_armed_ || !session_.settings().mouse_auto_capture || !m || !m->keyboard() ||
+        !m->graphics().cursor_position(cx, cy) || !(SDL_GetWindowFlags(window_) & SDL_WINDOW_INPUT_FOCUS) ||
+        SDL_GetMouseState(nullptr, nullptr) || ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
+        return false;
+    capture_at(x, y);
+    return true;
+}
+
+// Once a frame while the mouse is captured: the motion gathered goes to the
+// Sun mouse. Where the system shows the Rage Pro's hardware cursor, the
+// window also follows the guest's pointer: after a capture it steers the
+// pointer to where the click was, and pushing against an edge of the screen
+// where the pointer has stopped releases the mouse there, the host pointer
+// carrying on from the same place.
+void Gui::mouse_frame() {
+    auto* m = session_.machine();
+    if (!captured_ || !m) return;
+    int x = static_cast<int>(dx_), y = static_cast<int>(dy_);
+    dx_ -= static_cast<float>(x);
+    dy_ -= static_cast<float>(y);
+    int cx = 0, cy = 0;
+    const bool cursor = m->graphics().cursor_position(cx, cy) && tex_w_ && tex_h_;
+    if (syncing_) {
+        if (!cursor || ++sync_frames_ > 120) {
+            syncing_ = false;
+        } else {
+            // Moves made meanwhile move the target. The guest accelerates
+            // larger steps: how much is learnt from what the last step did,
+            // and most of the rest of the way is sent each frame, so the
+            // pointer gets there in a few frames without overshooting much.
+            sync_x_ += static_cast<float>(x);
+            sync_y_ += static_cast<float>(y);
+            const int rest_x = static_cast<int>(std::lround(sync_x_)) - (cx + hot_x_);
+            const int rest_y = static_cast<int>(std::lround(sync_y_)) - (cy + hot_y_);
+            auto steer = [](int rest, int& sent, int moved, float& gain) {
+                if (std::abs(sent) >= 4 && moved * sent > 0)
+                    gain = std::clamp(static_cast<float>(moved) / static_cast<float>(sent), 1.0f, 8.0f);
+                sent = std::abs(rest) <= 2 ? rest : static_cast<int>(std::lround(static_cast<float>(rest) * 0.75f / gain));
+                sent = std::clamp(sent, -112, 127);
+                return sent;
+            };
+            if (std::abs(rest_x) <= 1 && std::abs(rest_y) <= 1) {
+                syncing_ = false;
+                x = y = 0;
+            } else {
+                x = steer(rest_x, sent_x_, cx - last_cx_, gain_x_);
+                y = steer(rest_y, sent_y_, cy - last_cy_, gain_y_);
+            }
+        }
+    }
+    if (x || y) m->post_mouse(x, y, buttons_);
+    if (!cursor || !have_cursor_ || syncing_) {
+        have_cursor_ = cursor;
+        last_cx_ = cx;
+        last_cy_ = cy;
+        return;
+    }
+    // Pushing against an edge, with the cursor there and not moving: the
+    // image is 64 pixels, the pointer somewhere inside it.
+    const int w = static_cast<int>(tex_w_), h = static_cast<int>(tex_h_);
+    auto push = [](int& acc, int amount, bool stuck) { acc = stuck ? acc + amount : 0; };
+    if (x < 0) push(push_[0], -x, cx >= last_cx_ && cx <= 0);
+    if (x > 0) push(push_[1], x, cx <= last_cx_ && cx >= w - 65);
+    if (y < 0) push(push_[2], -y, cy >= last_cy_ && cy <= 0);
+    if (y > 0) push(push_[3], y, cy <= last_cy_ && cy >= h - 65);
+    last_cx_ = cx;
+    last_cy_ = cy;
+    constexpr int kPushToLeave = 48;  // guest pixels pushed against the edge
+    for (int edge = 0; edge < 4; ++edge) {
+        if (push_[edge] < kPushToLeave) continue;
+        // At an edge the pointer's position there is known: learn where it
+        // sits in the image.
+        if (edge == 0) hot_x_ = -cx;
+        if (edge == 1) hot_x_ = (w - 1) - cx;
+        if (edge == 2) hot_y_ = -cy;
+        if (edge == 3) hot_y_ = (h - 1) - cy;
+        const float px = static_cast<float>(std::clamp(cx + hot_x_, 0, w - 1)) + 0.5f;
+        const float py = static_cast<float>(std::clamp(cy + hot_y_, 0, h - 1)) + 0.5f;
+        float wx = dest_.x + px * dest_.w / static_cast<float>(w), wy = dest_.y + py * dest_.h / static_cast<float>(h);
+        if (edge == 0) wx = dest_.x;
+        if (edge == 1) wx = dest_.x + dest_.w - 1;
+        if (edge == 2) wy = dest_.y;
+        if (edge == 3) wy = dest_.y + dest_.h - 1;
+        set_captured(false);
+        SDL_WarpMouseInWindow(window_, wx, wy);
+        return;
+    }
+}
+
+// A host key to the Sun keyboard, by its position.
+void Gui::key(SDL_Scancode sc, bool down) {
+    auto* m = session_.machine();
+    if (!m || static_cast<std::size_t>(sc) >= keys_down_.size() || keys_down_[sc] == down) return;
+    keys_down_[sc] = down;
+    const u8 sun = SunKeyboard::from_usb(sc);
+    if (!sun) return;
+    if (down) {
+        if (sun_held_[sun]++ == 0) m->post_key(sun, true);
+    } else if (sun_held_[sun] && --sun_held_[sun] == 0) {
+        m->post_key(sun, false);
+    }
+}
+
+void Gui::tap_key(u8 sun) {
+    if (auto* m = session_.machine()) m->post_key(sun, true), m->post_key(sun, false);
+}
+
+void Gui::release_keys() {
+    keys_down_.fill(false);
+    sun_held_.fill(0);
+    if (auto* m = session_.machine()) m->post_release_keys();
+}
+
+// Ctrl+Alt combinations the window keeps for itself; true if consumed.
+bool Gui::hotkey(const SDL_KeyboardEvent& k) {
+    if (!(k.mod & SDL_KMOD_CTRL) || !(k.mod & SDL_KMOD_ALT)) return false;
+    const bool down = k.down && !k.repeat;
+    switch (k.scancode) {
+        case SDL_SCANCODE_G:
+            if (down) set_captured(false);
+            return true;
+        case SDL_SCANCODE_A:
+            if (down) stop_a();
+            return true;
+        case SDL_SCANCODE_E:
+            if (down) session_.next_disc();
+            return true;
+        case SDL_SCANCODE_F:
+            if (down) toggle_fullscreen();
+            return true;
+        case SDL_SCANCODE_P:
+            if (down && !session_.on()) power_on();
+            return true;
+        default: return false;
+    }
+}
+
+void Gui::handle_event(const SDL_Event& ev) {
+    for (auto& t : terminal_windows_)
+        if (t->handle(ev)) return;
+    if (SDL_Window* w = SDL_GetWindowFromEvent(&ev); w && w != window_) return;
+    // ImGui takes a press and its release in separate frames, then acts.
+    pending_frames_ = std::max(pending_frames_, 6);
+    ImGuiIO& io = ImGui::GetIO();
+    auto* machine = session_.machine();
+
+    switch (ev.type) {
+        case SDL_EVENT_QUIT:
+        case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+            if (session_.on()) open_quit_ = true;
+            else quit_ = true;
+            return;
+        case SDL_EVENT_WINDOW_FOCUS_LOST:
+            set_captured(false);
+            release_keys();
+            break;
+        case SDL_EVENT_KEY_DOWN:
+        case SDL_EVENT_KEY_UP: {
+            if (hotkey(ev.key)) return;
+            // The Sun keyboard sends each key once; the guest repeats keys
+            // itself.
+            if (ev.key.repeat) {
+                if (captured_) return;
+                break;
+            }
+            const bool to_guest = machine && (captured_ || !io.WantCaptureKeyboard);
+            if (!ev.key.down || to_guest) key(ev.key.scancode, ev.key.down);
+            if (captured_) return;
+            break;
+        }
+        case SDL_EVENT_WINDOW_MOUSE_LEAVE:
+            capture_armed_ = true;
+            break;
+        case SDL_EVENT_MOUSE_MOTION:
+            if (!captured_ && machine && auto_capture(ev.motion.x, ev.motion.y)) return;
+            if (captured_) {
+                // Motion in guest pixels, whatever the window's scale.
+                const float k = dest_.w > 0 ? static_cast<float>(tex_w_) / dest_.w : 1.0f;
+                dx_ += ev.motion.xrel * k;
+                dy_ += ev.motion.yrel * k;
+                return;
+            }
+            break;
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        case SDL_EVENT_MOUSE_BUTTON_UP:
+            if (captured_) {
+                const unsigned bit = ev.button.button == SDL_BUTTON_LEFT     ? 1u
+                                     : ev.button.button == SDL_BUTTON_MIDDLE ? 2u
+                                     : ev.button.button == SDL_BUTTON_RIGHT  ? 4u
+                                                                             : 0u;
+                if (bit && machine) {
+                    buttons_ = ev.button.down ? (buttons_ | bit) : (buttons_ & ~bit);
+                    machine->post_mouse(0, 0, buttons_);
+                }
+                return;
+            }
+            // (Not while a dialog is open: a click arriving with the move
+            // onto it, before a frame has shown ImGui where the pointer is,
+            // is the dialog's.)
+            if (ev.button.down && ev.button.button == SDL_BUTTON_LEFT && machine && machine->keyboard() && picture_ &&
+                !io.WantCaptureMouse && !settings_open_ && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) &&
+                ev.button.x >= dest_.x && ev.button.x < dest_.x + dest_.w && ev.button.y >= dest_.y &&
+                ev.button.y < dest_.y + dest_.h) {
+                capture_at(ev.button.x, ev.button.y);  // the guest's pointer to where the click was
+                return;
+            }
+            break;
+        case SDL_EVENT_MOUSE_WHEEL:
+            if (captured_) {
+                // The Sun mouse has no wheel: whole steps (a trackpad's
+                // fractions add up) as keys, if the setting asks.
+                wheel_ += ev.wheel.y;
+                const int steps = static_cast<int>(wheel_);
+                wheel_ -= static_cast<float>(steps);
+                if (const std::string& keys = session_.settings().wheel_keys; steps && keys != "off") {
+                    const bool pages = keys == "pages";
+                    const u8 code = steps > 0 ? (pages ? kSunPageUp : kSunUp) : (pages ? kSunPageDown : kSunDown);
+                    for (int i = 0; i < std::abs(steps); ++i) tap_key(code);
+                }
+                return;
+            }
+            break;
+        default: break;
+    }
+    ImGui_ImplSDL3_ProcessEvent(&ev);
+}
+
+// --- Drawing -------------------------------------------------------------------
+
+void Gui::update_picture() {
+    auto* machine = session_.machine();
+    if (!machine) {
+        picture_ = false;
+        return;
+    }
+    Mach64& gfx = machine->graphics();
+    if (!picture_stale_ && gfx.display_version() == shown_version_) return;
+    picture_stale_ = false;
+    shown_version_ = gfx.display_version();
+    unsigned w = 0, h = 0;
+    const bool had = picture_;
+    const u64 start = SDL_GetTicksNS();
+    picture_ = gfx.render(pixels_, w, h);
+    picture_ns_ = SDL_GetTicksNS() - start;
+    if (picture_ != had) update_title();
+    if (!picture_) return;
+    if (!texture_ || w != tex_w_ || h != tex_h_) {
+        if (texture_) SDL_DestroyTexture(texture_);
+        texture_ = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_XRGB8888, SDL_TEXTUREACCESS_STREAMING,
+                                     static_cast<int>(w), static_cast<int>(h));
+        tex_w_ = w;
+        tex_h_ = h;
+    }
+    SDL_UpdateTexture(texture_, nullptr, pixels_.data(), static_cast<int>(w * sizeof(u32)));
+    pending_frames_ = std::max(pending_frames_, 1);
+}
+
+void Gui::update_meters(u64 now) {
+    auto* m = session_.machine();
+    if (!m) return;
+    const Ultra5_10::Activity a = m->activity();
+    disk_light_.update(a.disk, now);
+    cd_light_.update(a.cdrom, now);
+    net_light_.update(a.net, now);
+    const u64 instructions = m->cpu().instructions();
+    if (meter_time_ns_ == 0) {
+        meter_time_ns_ = now;
+        last_instructions_ = instructions;
+        return;
+    }
+    const double dt = static_cast<double>(now - meter_time_ns_) * 1e-9;
+    if (dt < 0.5) return;
+    mips_ = static_cast<double>(instructions - last_instructions_) / dt / 1e6;
+    meter_time_ns_ = now;
+    last_instructions_ = instructions;
+}
+
+void Gui::frame() {
+    const u64 now = SDL_GetTicksNS();
+    update_picture();
+    if (auto* m = session_.machine()) {
+        update_meters(now);
+        // The status bar is looked at ten times a second, and redrawn only
+        // when what it shows has changed: an idle machine costs no frames.
+        if (now >= next_status_ns_) {
+            next_status_ns_ = now + 100000000ull;
+            char sig[96];
+            std::snprintf(sig, sizeof sig, "%d%d%d %d %4.1f %.0f %d", disk_light_.lit(now), cd_light_.lit(now),
+                          net_light_.lit(now), session_.disc_in_drive(), m->pacer().cpu_speed(),
+                          std::floor(m->pacer().lag()), session_.turbo());
+            if (status_shown_ != sig) {
+                status_shown_ = sig;
+                pending_frames_ = std::max(pending_frames_, 1);
+            }
+        }
+    }
+    if (status_until_ns_ && now >= status_until_ns_) {
+        status_until_ns_ = 0;
+        status_text_.clear();
+        pending_frames_ = std::max(pending_frames_, 1);
+    }
+    if (pending_frames_ <= 0) return;
+    --pending_frames_;
+
+    ImGui_ImplSDLRenderer3_NewFrame();
+    ImGui_ImplSDL3_NewFrame();
+    ImGui::NewFrame();
+    ImGuiIO& io = ImGui::GetIO();
+    float top = 0, bottom = io.DisplaySize.y;
+    if (!fullscreen_) {
+        if (!native_menus_) {
+            draw_menu();
+            top = ImGui::GetFrameHeight();
+        }
+        if (show_status_) {
+            bottom -= ImGui::GetFrameHeight();
+            draw_status_bar();
+        }
+    }
+    // The picture, as large as fits with its shape kept.
+    const float area_w = io.DisplaySize.x, area_h = std::max(1.0f, bottom - top);
+    if (picture_ && tex_w_ && tex_h_) {
+        const float k = std::min(area_w / static_cast<float>(tex_w_), area_h / static_cast<float>(tex_h_));
+        dest_.w = static_cast<float>(tex_w_) * k;
+        dest_.h = static_cast<float>(tex_h_) * k;
+        dest_.x = std::floor((area_w - dest_.w) / 2);
+        dest_.y = top + std::floor((area_h - dest_.h) / 2);
+    } else {
+        dest_ = {0, top, area_w, area_h};
+        const char* text = !session_.on() ? "Powered off - Machine > Power On"
+                           : session_.settings().console == "ttya"
+                               ? "The console is on ttya: View > Serial Port A"
+                               : "No video signal yet";
+        const ImVec2 size = ImGui::CalcTextSize(text);
+        ImGui::GetBackgroundDrawList()->AddText(
+            ImVec2(std::floor((area_w - size.x) / 2), std::floor(top + (area_h - size.y) / 2)),
+            IM_COL32(140, 140, 140, 255), text);
+    }
+    draw_settings();
+    draw_popups();
+    ImGui::Render();
+
+    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
+    SDL_RenderClear(renderer_);
+    if (picture_ && texture_) {
+        const ImVec2 fb = io.DisplayFramebufferScale;
+        const SDL_FRect px{dest_.x * fb.x, dest_.y * fb.y, dest_.w * fb.x, dest_.h * fb.y};
+        // Whole-number scaling (1152x900 doubled on Retina) stays sharp.
+        const float k = px.w / static_cast<float>(tex_w_);
+        SDL_SetTextureScaleMode(texture_, std::fabs(k - std::round(k)) < 0.01f ? SDL_SCALEMODE_NEAREST : SDL_SCALEMODE_LINEAR);
+        SDL_RenderTexture(renderer_, texture_, nullptr, &px);
+    }
+    // ImGui draws in window coordinates and clips in pixels: SDL's render
+    // scale turns the one into the other (2 on a high-density screen).
+    SDL_SetRenderScale(renderer_, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
+    ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer_);
+    SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
+    SDL_RenderPresent(renderer_);
+}
+
+// The menus. Actions look the machine up when they run: on macOS they run
+// from the main loop after the menu closes, and may outlive the state the
+// menu was built from.
+std::vector<MenuEntry> Gui::menus() {
+    using E = MenuEntry;
+    auto* m = session_.machine();
+    std::vector<E> machine;
+    if (!m) {
+        machine.push_back(E::item("Power On", [this] { power_on(); }).key('P'));
+    } else {
+        machine.push_back(E::item("Power Off Now", [this] { power_off(); })
+                              .tip("Cuts the power at once, without shutting down (the NVRAM is kept)"));
+        machine.push_back(E::item("Reset", [this] { reset(); }).tip("Restarts the machine from OpenBoot at once"));
+        machine.push_back(E::separator());
+        machine.push_back(E::item("Send Stop-A", [this] { stop_a(); }, m->keyboard() != nullptr)
+                              .key('A')
+                              .tip("The abort keys: OpenBoot's ok prompt (go resumes the system)"));
+    }
+    machine.push_back(E::separator());
+    machine.push_back(E::item("Settings...", [this] { open_settings(); }).as(E::Role::Settings));
+    machine.push_back(E::item("Open Settings File...", [this] { choose(Pick::OpenSettings, settings_path_); }));
+    machine.push_back(E::item("Save Settings As...", [this] { choose(Pick::SaveSettings, settings_path_); }));
+    machine.push_back(E::separator());
+    machine.push_back(E::item("Quit", [this] {
+                          if (session_.on()) open_quit_ = true;
+                          else quit_ = true;
+                      }).as(E::Role::Quit));
+
+    std::vector<E> media;
+    const bool loaded = session_.disc_in_drive() >= 0;
+    media.push_back(E::heading("CD-ROM (secondary IDE master)"));
+    media.push_back(E::item("Eject", [this] { eject(); }, loaded));
+    media.push_back(E::item("Insert Disc...", [this] { choose(Pick::InsertDisc, {}); }, m != nullptr));
+    media.push_back(E::item("Next Disc in Set", [this] { session_.next_disc(); }, m && !session_.discs().empty())
+                        .key('E'));
+    const std::vector<std::string>& discs = session_.discs();
+    if (!discs.empty()) media.push_back(E::separator());
+    for (std::size_t i = 0; i < discs.size(); ++i) {
+        const bool in = session_.disc_in_drive() == static_cast<int>(i);
+        media.push_back(E::item(file_name(discs[i]), [this, i] {
+                            if (!session_.select_disc(static_cast<int>(i))) status("The disc could not be opened");
+                        }, m != nullptr, in).tip(discs[i]));
+    }
+    media.push_back(E::separator());
+    media.push_back(E::heading("Hard disk (primary IDE master)"));
+    const std::string& disk = session_.settings().disk;
+    media.push_back(E::item(disk.empty() ? "(none)" : file_name(disk), nullptr, false));
+    media.push_back(E::item("Change Disk...", [this] { open_settings(); }, !m).tip(m ? "Power off first" : ""));
+
+    std::vector<E> view;
+    for (unsigned port = 0; port < 2; ++port) {
+        auto* w = terminal_windows_[port].get();
+        view.push_back(E::item(port == 0 ? "Serial Port A (ttya)" : "Serial Port B (ttyb)", [this, port] {
+                           auto* t = terminal_windows_[port].get();
+                           if (!t) return;
+                           if (t->is_open()) t->close();
+                           else t->open();
+                       }, w != nullptr, w && w->is_open()));
+    }
+    view.push_back(E::separator());
+    view.push_back(E::item("Status Bar", [this] { show_status_ = !show_status_; }, true, show_status_));
+    view.push_back(E::item("Full Screen", [this] { toggle_fullscreen(); }, true, fullscreen_).key('F'));
+    view.push_back(E::item("Release the Mouse", [this] { set_captured(false); }, captured_).key('G'));
+    view.push_back(E::item("Capture Mouse on Entry", [this] {
+                       Settings s = session_.settings();
+                       s.mouse_auto_capture = !s.mouse_auto_capture;
+                       session_.set_settings(s);
+                       save_settings_to(settings_path_);
+                   }, true, session_.settings().mouse_auto_capture)
+                       .tip("Capture the mouse when the pointer moves onto the screen (once the system shows its pointer)"));
+
+    std::vector<E> help;
+    help.push_back(E::item("Keyboard and Mouse", [this] { keys_open_ = true; }));
+    help.push_back(E::item(std::string("About ") + kAppName, [this] { about_open_ = true; }).as(E::Role::About));
+
+    return {E::submenu("Machine", std::move(machine)), E::submenu("Media", std::move(media)),
+            E::submenu("View", std::move(view)), E::submenu("Help", std::move(help))};
+}
+
+void Gui::draw_entries(const std::vector<MenuEntry>& entries) {
+    const std::string ctrl_alt = std::string("Ctrl+") + kAlt + "+";
+    int id = 0;
+    for (const MenuEntry& e : entries) {
+        ImGui::PushID(id++);
+        switch (e.kind) {
+            case MenuEntry::Kind::Separator: ImGui::Separator(); break;
+            case MenuEntry::Kind::Heading: ImGui::TextDisabled("%s", e.label.c_str()); break;
+            case MenuEntry::Kind::Submenu:
+                if (ImGui::BeginMenu(e.label.c_str(), e.enabled)) {
+                    draw_entries(e.children);
+                    ImGui::EndMenu();
+                }
+                break;
+            case MenuEntry::Kind::Item: {
+                const std::string keys = e.hotkey ? ctrl_alt + e.hotkey : std::string();
+                if (ImGui::MenuItem(e.label.c_str(), keys.empty() ? nullptr : keys.c_str(), e.checked, e.enabled) && e.action)
+                    e.action();
+                if (!e.tooltip.empty()) ImGui::SetItemTooltip("%s", e.tooltip.c_str());
+                break;
+            }
+        }
+        ImGui::PopID();
+    }
+}
+
+void Gui::draw_menu() {
+    if (!ImGui::BeginMainMenuBar()) return;
+    draw_entries(menus());
+    ImGui::EndMainMenuBar();
+}
+
+void Gui::toggle_fullscreen() {
+    fullscreen_ = !fullscreen_;
+    SDL_SetWindowFullscreen(window_, fullscreen_);
+}
+
+void Gui::draw_status_bar() {
+    const u64 now = SDL_GetTicksNS();
+    ImGuiIO& io = ImGui::GetIO();
+    const float h = ImGui::GetFrameHeight();
+    ImGui::SetNextWindowPos(ImVec2(0, io.DisplaySize.y - h));
+    ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, h));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8 * scale_, ImGui::GetStyle().FramePadding.y));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
+    ImGui::Begin("##status", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBringToFrontOnFocus);
+    auto* m = session_.machine();
+    auto light = [&](const char* label, bool lit, ImU32 colour, const char* tip) {
+        const float r = ImGui::GetTextLineHeight() * 0.32f;
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const ImVec2 c(p.x + r, p.y + ImGui::GetTextLineHeight() * 0.5f);
+        ImGui::GetWindowDrawList()->AddCircleFilled(c, r, lit ? colour : IM_COL32(60, 60, 60, 255));
+        ImGui::Dummy(ImVec2(r * 2, ImGui::GetTextLineHeight()));
+        ImGui::SameLine(0, 4 * scale_);
+        ImGui::TextUnformatted(label);
+        if (tip) ImGui::SetItemTooltip("%s", tip);
+        ImGui::SameLine(0, 14 * scale_);
+    };
+    light("Power", m != nullptr, IM_COL32(60, 220, 60, 255), nullptr);
+    light("Disk", m && disk_light_.lit(now), IM_COL32(255, 170, 0, 255), "Hard disk activity");
+    std::string cd = "CD";
+    if (m) {
+        const int d = session_.disc_in_drive();
+        cd += ": " + (d >= 0 ? file_name(session_.discs()[static_cast<std::size_t>(d)]) : std::string("empty"));
+        if (cd.size() > 34) cd = cd.substr(0, 31) + "...";
+    }
+    light(cd.c_str(), m && cd_light_.lit(now), IM_COL32(255, 170, 0, 255), "CD-ROM activity");
+    light("Net", m && net_light_.lit(now), IM_COL32(60, 200, 255, 255), "Ethernet frames sent or received");
+    if (m) {
+        const Pacer& pacer = m->pacer();
+        const double cpu_speed = pacer.cpu_speed();
+        if (cpu_speed > 0) ImGui::Text("Speed %4.1fx", cpu_speed);
+        else ImGui::Text("Speed  -  ");
+        ImGui::SetItemTooltip("How many times as fast as a real %.0f MHz UltraSPARC-IIi it runs when busy, by the\n"
+                              "host's measured speed. Now: %.0f million instructions a second.",
+                              session_.settings().cpu_mhz, mips_);
+        ImGui::SameLine(0, 14 * scale_);
+        // Turbo: Maximum timing until pressed again (or the configured
+        // timing is already Maximum or Free: shown lit, not pressable).
+        {
+            const bool available = session_.turbo_available();
+            const bool on = available ? session_.turbo() : session_.settings().timing != Pacer::Mode::Cycle;
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * scale_, 0));
+            if (on) {
+                ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(200, 60, 40, 255));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(225, 80, 55, 255));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(170, 45, 30, 255));
+            }
+            ImGui::BeginDisabled(!available);
+            if (ImGui::SmallButton("Turbo")) {
+                session_.set_turbo(!session_.turbo());
+                status(session_.turbo() ? "Turbo on: maximum speed" : "Turbo off: back to the set timing");
+                pending_frames_ = std::max(pending_frames_, 2);
+            }
+            ImGui::EndDisabled();
+            if (on) ImGui::PopStyleColor(3);
+            ImGui::PopStyleVar();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("%s", available ? "Run flat out (Maximum timing: no speed limit) until pressed again;\n"
+                                                    "guest clocks still follow the host's"
+                                                  : "Timing is set to Maximum or Free in Settings: already flat out");
+            ImGui::SameLine(0, 14 * scale_);
+        }
+        // Guest time behind the wall clock: the host cannot keep up.
+        if (const double lag = pacer.lag(); lag >= 1.0) {
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "Behind %.0f s", lag);
+            ImGui::SetItemTooltip("The host cannot run the machine fast enough to keep its clocks to real time");
+            ImGui::SameLine(0, 14 * scale_);
+        }
+        if (SunKeyboard* k = m->keyboard(); k && (k->leds() & 0x0F)) {
+            // The keyboard's lights, as the system sets them.
+            std::string leds;
+            if (k->leds() & 0x08) leds += "Caps ";
+            if (k->leds() & 0x01) leds += "Num ";
+            if (k->leds() & 0x04) leds += "Scroll ";
+            if (k->leds() & 0x02) leds += "Compose ";
+            leds.pop_back();
+            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%s", leds.c_str());
+            ImGui::SetItemTooltip("The keyboard's lights");
+            ImGui::SameLine(0, 14 * scale_);
+        }
+    }
+    if (!status_text_.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f), "%s", status_text_.c_str());
+        ImGui::SameLine();
+    }
+    const Settings& s = session_.settings();
+    char right[96];
+    std::snprintf(right, sizeof right, "Ultra 5/10, %.0f MHz, %u MiB", s.cpu_mhz, s.ram_mb);
+    const float tw = ImGui::CalcTextSize(right).x;
+    const float x = ImGui::GetWindowWidth() - tw - 8 * scale_;
+    if (x > ImGui::GetCursorPosX()) {
+        ImGui::SetCursorPosX(x);
+        ImGui::TextDisabled("%s", right);
+    } else {
+        ImGui::NewLine();
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+}
+
+// --- Settings ------------------------------------------------------------------
+
+void Gui::open_settings() {
+    edit_ = session_.settings();
+    net_mode_ = edit_.net == "none" ? 2 : edit_.net.rfind("tap:", 0) == 0 ? 1 : 0;
+    tap_name_ = net_mode_ == 1 ? edit_.net.substr(4) : std::string();
+    // A connection this build or host lacks (a file from another machine) shows as none.
+    if ((net_mode_ == 0 && !net::slirp_available()) || (net_mode_ == 1 && !net::tap_available())) net_mode_ = 2;
+    mac_text_ = edit_.mac ? mac_text(*edit_.mac) : std::string();
+    forward_texts_.clear();
+    for (const auto& f : edit_.forwards) forward_texts_.push_back(forward_text(f));
+    settings_error_.clear();
+    disc_selected_ = -1;
+    settings_open_ = true;
+}
+
+bool Gui::accept_settings() {
+    Settings s = edit_;
+    s.net = net_mode_ == 2 ? "none" : net_mode_ == 1 ? "tap:" + tap_name_ : "user";
+    if (net_mode_ == 1 && tap_name_.empty()) {
+        settings_error_ = "Network: enter the TAP interface's name";
+        return false;
+    }
+    if (mac_text_.empty()) {
+        s.mac.reset();
+    } else {
+        std::array<u8, 6> mac{};
+        if (!parse_mac(mac_text_, mac)) {
+            settings_error_ = "Network: the Ethernet address should look like 08:00:20:55:56:01";
+            return false;
+        }
+        s.mac = mac;
+    }
+    s.forwards.clear();
+    for (const auto& t : forward_texts_) {
+        if (t.empty()) continue;
+        net::PortForward f;
+        if (!parse_forward(t, f)) {
+            settings_error_ = "Network: port forward \"" + t + "\" should look like tcp:2222:22";
+            return false;
+        }
+        s.forwards.push_back(f);
+    }
+    if (session_.on()) s.cdroms = session_.discs();  // the drive's set is kept by the drive
+    session_.set_settings(s);
+    save_settings_to(settings_path_);
+    settings_error_.clear();
+    if (session_.on()) status("Settings saved; most take effect at the next power-on");
+    return true;
+}
+
+void Gui::save_settings_to(const std::string& path) {
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+    std::string error;
+    if (!save_settings(path, session_.settings(), error)) message("The settings could not be saved:\n\n" + error);
+}
+
+void Gui::draw_settings() {
+    if (!settings_open_) return;
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowSize(ImVec2(620 * scale_, 470 * scale_), ImGuiCond_Appearing);
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x / 2, io.DisplaySize.y / 2), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (!ImGui::Begin("Settings", &settings_open_, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::End();
+        return;
+    }
+    const bool running = session_.on();
+    if (running)
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f), "The machine is on: changes take effect at the next power-on.");
+    const float label_w = 150 * scale_;
+    auto label = [&](const char* text) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(text);
+        ImGui::SameLine(label_w);
+    };
+    auto path_row = [&](const char* text, const char* id, std::string& path, Pick browse, std::optional<Pick> create,
+                        const char* hint = nullptr) {
+        ImGui::PushID(id);
+        label(text);
+        const float buttons = (create ? 140.0f : 70.0f) * scale_;
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - buttons);
+        if (hint) ImGui::InputTextWithHint("##path", hint, &path);
+        else ImGui::InputText("##path", &path);
+        ImGui::SameLine();
+        if (ImGui::Button("Browse...")) choose(browse, path);
+        if (create) {
+            ImGui::SameLine();
+            if (ImGui::Button("New...")) choose(*create, path);
+        }
+        ImGui::PopID();
+    };
+
+    const float footer = ImGui::GetFrameHeightWithSpacing() * (settings_error_.empty() ? 1.5f : 2.5f);
+    ImGui::BeginChild("##tabs", ImVec2(0, -footer));
+    if (ImGui::BeginTabBar("##settings")) {
+        if (ImGui::BeginTabItem("Machine")) {
+            label("Processor clock");
+            ImGui::SetNextItemWidth(160 * scale_);
+            char clock[32];
+            std::snprintf(clock, sizeof clock, "%.0f MHz", edit_.cpu_mhz);
+            if (ImGui::BeginCombo("##mhz", clock)) {
+                for (double mhz : cpu_clocks()) {
+                    std::snprintf(clock, sizeof clock, "%.0f MHz", mhz);
+                    if (ImGui::Selectable(clock, edit_.cpu_mhz == mhz)) edit_.cpu_mhz = mhz;
+                }
+                ImGui::EndCombo();
+            }
+            label("E-cache");
+            ImGui::SetNextItemWidth(160 * scale_);
+            auto kib = [](unsigned k) { return k >= 1024 ? std::to_string(k / 1024) + " MiB" : std::to_string(k) + " KiB"; };
+            if (ImGui::BeginCombo("##ecache", kib(edit_.ecache_kb).c_str())) {
+                for (unsigned k : ecache_sizes())
+                    if (ImGui::Selectable(kib(k).c_str(), edit_.ecache_kb == k)) edit_.ecache_kb = k;
+                ImGui::EndCombo();
+            }
+            label("Memory");
+            ImGui::SetNextItemWidth(160 * scale_);
+            const std::string ram = std::to_string(edit_.ram_mb) + " MiB";
+            if (ImGui::BeginCombo("##ram", ram.c_str())) {
+                for (unsigned mb : ram_sizes())
+                    if (ImGui::Selectable((std::to_string(mb) + " MiB").c_str(), edit_.ram_mb == mb)) edit_.ram_mb = mb;
+                ImGui::EndCombo();
+            }
+            label("Console");
+            ImGui::SetNextItemWidth(-1);
+            int con = edit_.console == "ttya" ? 1 : 0;
+            if (ImGui::Combo("##console", &con, "Screen, with a Sun keyboard and mouse\0Serial port A (ttya), no keyboard\0"))
+                edit_.console = con == 1 ? "ttya" : "screen";
+            ImGui::SetItemTooltip("OpenBoot takes the screen and keyboard as its console when a keyboard answers,\n"
+                                  "and ttya when none does (as NVRAM's input-device and output-device allow)");
+            if (edit_.console == "screen") {
+                label("Keyboard layout");
+                ImGui::SetNextItemWidth(-1);
+                int layout = edit_.keyboard == "uk" ? 1 : edit_.keyboard == "us" ? 0 : 2;
+                if (ImGui::Combo("##layout", &layout, "Type 5, US\0Type 5, UK\0Other (as the settings file has it)\0"))
+                    if (layout < 2) edit_.keyboard = layout == 1 ? "uk" : "us";
+            }
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::PushTextWrapPos(0.0f);
+            {
+                const PromChoice& pc = prom_choice(edit_);
+                ImGui::Bullet();
+                if (pc.ok) ImGui::TextDisabled("%s", pc.text.c_str());
+                else ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s", pc.text.c_str());
+            }
+            ImGui::Bullet();
+            ImGui::TextDisabled("Solaris 8 2/04 boots from its DVD to the installer. On-board: ATI Rage Pro graphics "
+                                "(PGX24, 4 MB), Happy Meal Ethernet, CMD646 IDE.");
+            ImGui::PopTextWrapPos();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Storage")) {
+            // Left empty, the usual folder (shown in the box) is searched.
+            const std::string default_folder = prom_folder(Settings{});
+            path_row("PROM folder", "promdir", edit_.prom_dir, Pick::PromDir, std::nullopt, default_folder.c_str());
+            {
+                const PromChoice& pc = prom_choice(edit_);
+                ImGui::SetCursorPosX(label_w);
+                ImGui::PushTextWrapPos(0.0f);
+                if (pc.ok) ImGui::TextUnformatted(pc.text.c_str());
+                else ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s", pc.text.c_str());
+                ImGui::PopTextWrapPos();
+            }
+            path_row("NVRAM", "nvram", edit_.nvram, Pick::Nvram, Pick::NewNvram);
+            ImGui::SetCursorPosX(label_w);
+            ImGui::TextDisabled("Saved whenever the system changes it; a new one starts blank");
+            ImGui::Spacing();
+            path_row("Hard disk", "disk", edit_.disk, Pick::Disk, Pick::NewDisk);
+            ImGui::SetCursorPosX(label_w);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled("Size of a new disk:");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(100 * scale_);
+            auto size_text = [](u64 mib) {
+                return mib >= 1024 ? std::to_string(mib / 1024) + " GB" : std::to_string(mib) + " MB";
+            };
+            if (ImGui::BeginCombo("##newsize", size_text(kDiskSizesMiB[static_cast<std::size_t>(new_disk_size_)]).c_str())) {
+                for (std::size_t i = 0; i < kDiskSizesMiB.size(); ++i)
+                    if (ImGui::Selectable(size_text(kDiskSizesMiB[i]).c_str(), new_disk_size_ == static_cast<int>(i)))
+                        new_disk_size_ = static_cast<int>(i);
+                ImGui::EndCombo();
+            }
+            ImGui::Spacing();
+            label("CD-ROM discs");
+            ImGui::BeginGroup();
+            ImGui::BeginDisabled(running);
+            if (ImGui::BeginListBox("##discs", ImVec2(-1, 6 * ImGui::GetTextLineHeightWithSpacing()))) {
+                for (std::size_t i = 0; i < edit_.cdroms.size(); ++i) {
+                    ImGui::PushID(static_cast<int>(i));
+                    if (ImGui::Selectable(edit_.cdroms[i].c_str(), disc_selected_ == static_cast<int>(i)))
+                        disc_selected_ = static_cast<int>(i);
+                    ImGui::PopID();
+                }
+                ImGui::EndListBox();
+            }
+            if (ImGui::Button("Add...")) choose(Pick::AddDisc, edit_.cdroms.empty() ? std::string() : edit_.cdroms.back());
+            const bool sel = disc_selected_ >= 0 && disc_selected_ < static_cast<int>(edit_.cdroms.size());
+            const auto at = static_cast<std::size_t>(std::max(disc_selected_, 0));
+            ImGui::SameLine();
+            if (ImGui::Button("Remove") && sel) {
+                edit_.cdroms.erase(edit_.cdroms.begin() + static_cast<std::ptrdiff_t>(at));
+                disc_selected_ = -1;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Up") && sel && at > 0) {
+                std::swap(edit_.cdroms[at], edit_.cdroms[at - 1]);
+                --disc_selected_;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Down") && sel && at + 1 < edit_.cdroms.size()) {
+                std::swap(edit_.cdroms[at], edit_.cdroms[at + 1]);
+                ++disc_selected_;
+            }
+            ImGui::EndDisabled();
+            ImGui::PushTextWrapPos(0);
+            ImGui::TextDisabled(running ? "While running, change discs from the Media menu."
+                                        : "The first disc is in the drive at power-on; Media > Next Disc moves on.");
+            ImGui::PopTextWrapPos();
+            ImGui::EndGroup();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Network")) {
+            label("Connection");
+            ImGui::SetNextItemWidth(-1);
+            // Only the connections this build and host can make.
+            std::vector<std::pair<int, const char*>> modes;
+            if (net::slirp_available()) modes.emplace_back(0, "User-mode NAT through the host");
+            if (net::tap_available()) modes.emplace_back(1, "TAP interface");
+            modes.emplace_back(2, "Not connected");
+            const char* current = "Not connected";
+            for (const auto& [mode, text] : modes)
+                if (mode == net_mode_) current = text;
+            if (ImGui::BeginCombo("##net", current)) {
+                for (const auto& [mode, text] : modes)
+                    if (ImGui::Selectable(text, mode == net_mode_)) net_mode_ = mode;
+                ImGui::EndCombo();
+            }
+            if (net_mode_ == 0) {
+                ImGui::SetCursorPosX(label_w);
+                ImGui::TextDisabled("Guest 10.0.2.15, gateway (the host) 10.0.2.2, DNS 10.0.2.3");
+            }
+            if (net_mode_ == 1) {
+                label("TAP interface");
+                ImGui::SetNextItemWidth(200 * scale_);
+                ImGui::InputText("##tap", &tap_name_);
+            }
+            label("Ethernet address");
+            ImGui::SetNextItemWidth(200 * scale_);
+            ImGui::InputTextWithHint("##mac", "kept in NVRAM", &mac_text_);
+            if (net_mode_ == 0) {
+                label("Port forwards");
+                ImGui::BeginGroup();
+                for (std::size_t i = 0; i < forward_texts_.size(); ++i) {
+                    ImGui::PushID(static_cast<int>(i));
+                    ImGui::SetNextItemWidth(200 * scale_);
+                    ImGui::InputTextWithHint("##fw", "tcp:HOSTPORT:GUESTPORT", &forward_texts_[i]);
+                    ImGui::SameLine();
+                    if (ImGui::Button("Remove")) {
+                        forward_texts_.erase(forward_texts_.begin() + static_cast<std::ptrdiff_t>(i));
+                        ImGui::PopID();
+                        break;
+                    }
+                    ImGui::PopID();
+                }
+                if (ImGui::Button("Add")) forward_texts_.emplace_back("tcp:2222:22");
+                ImGui::TextDisabled("A port on the host's loopback interface, passed to the guest");
+                ImGui::EndGroup();
+                ImGui::Spacing();
+                if (ImGui::CollapsingHeader("Setting up the guest")) {
+                    const auto heading = [](const char* text) {
+                        ImGui::Spacing();
+                        ImGui::TextUnformatted(text);
+                    };
+                    const auto lines = [](const char* text) { ImGui::TextDisabled("%s", text); };
+                    heading("Solaris, as root (lasts until the next restart):");
+                    lines("  ifconfig hme0 plumb\n"
+                          "  ifconfig hme0 10.0.2.15 netmask 255.255.255.0 up\n"
+                          "  route add default 10.0.2.2\n"
+                          "  echo nameserver 10.0.2.3 > /etc/resolv.conf");
+                    heading("Keeping it (Solaris):");
+                    lines("  10.0.2.15 in /etc/hostname.hme0 (or the host's name, with it\n"
+                          "  in /etc/hosts), 10.0.2.2 in /etc/defaultrouter, and\n"
+                          "  hosts: files dns in /etc/nsswitch.conf");
+                    heading("OpenBoot:");
+                    lines("  boot net:dhcp gets its address from the host by DHCP");
+                    heading("Checks, in order:");
+                    lines("  netstat -rn         a default route to 10.0.2.2\n"
+                          "  ping 10.0.2.2       the gateway\n"
+                          "  ping 1.1.1.1        the way out (slirp answers pings it can)\n"
+                          "  nslookup sun.com    the name server");
+                    heading("If names fail:");
+                    lines("  the host needs an IPv4 name server, or give the\n"
+                          "  guest a public one (nameserver 1.1.1.1). On macOS 15\n"
+                          "  and later, allow UltraViolet (or the terminal that\n"
+                          "  started it) in System Settings > Privacy & Security >\n"
+                          "  Local Network.");
+                }
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Performance")) {
+            label("Timing");
+            ImGui::SetNextItemWidth(-1);
+            int timing = edit_.timing == Pacer::Mode::Realtime ? 0 : edit_.timing == Pacer::Mode::Cycle ? 1 : 2;
+            if (ImGui::Combo("##timing", &timing,
+                             "Real time: guest clocks follow the host's\0Cycle: one cycle per instruction, reproducible\0"
+                             "Maximum: no speed limit, guest clocks follow the host's\0"))
+                edit_.timing = timing == 0 ? Pacer::Mode::Realtime : timing == 1 ? Pacer::Mode::Cycle : Pacer::Mode::Max;
+            ImGui::Spacing();
+            ImGui::Checkbox("JIT (translate guest code to host code)", &edit_.jit);
+            ImGui::Checkbox("Block cache (decode guest code once)", &edit_.block_cache);
+            ImGui::Spacing();
+            label("Log level");
+            ImGui::SetNextItemWidth(120 * scale_);
+            static const char* const kLevels[] = {"error", "warn", "info", "debug", "trace"};
+            if (ImGui::BeginCombo("##log", edit_.log.c_str())) {
+                for (const char* l : kLevels)
+                    if (ImGui::Selectable(l, edit_.log == l)) edit_.log = l;
+                ImGui::EndCombo();
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Mouse")) {
+            label("Capture");
+            ImGui::SetNextItemWidth(-1);
+            int capture = edit_.mouse_auto_capture ? 0 : 1;
+            ImGui::Combo("##capture", &capture, "When the pointer moves onto the screen\0When the screen is clicked\0");
+            edit_.mouse_auto_capture = capture == 0;
+            ImGui::TextDisabled("Moving onto the screen captures the mouse once the system shows its pointer");
+            ImGui::TextDisabled("(the desktop); a click always captures it. Ctrl+%s+G releases it.", kAlt);
+            ImGui::Spacing();
+            label("Scroll wheel");
+            ImGui::SetNextItemWidth(-1);
+            static const char* const kWheelKeys[] = {"off", "arrows", "pages"};
+            int wheel = edit_.wheel_keys == "arrows" ? 1 : edit_.wheel_keys == "pages" ? 2 : 0;
+            if (ImGui::Combo("##wheel", &wheel, "Not used\0As the Up and Down arrow keys\0As Page Up and Page Down\0"))
+                edit_.wheel_keys = kWheelKeys[wheel];
+            ImGui::TextDisabled("The Sun mouse has no wheel: it can be sent as keys instead.");
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+    ImGui::EndChild();
+    if (!settings_error_.empty()) ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", settings_error_.c_str());
+    ImGui::Separator();
+    if (ImGui::Button("OK", ImVec2(90 * scale_, 0)) && accept_settings()) settings_open_ = false;
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(90 * scale_, 0))) settings_open_ = false;
+    if (!running) {
+        ImGui::SameLine();
+        if (ImGui::Button("OK and Power On", ImVec2(130 * scale_, 0)) && accept_settings()) {
+            settings_open_ = false;
+            power_on();
+        }
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("Saved to %s", file_name(settings_path_).c_str());
+    ImGui::SetItemTooltip("%s", settings_path_.c_str());
+    ImGui::End();
+}
+
+void Gui::draw_popups() {
+    ImGuiIO& io = ImGui::GetIO();
+    const ImVec2 centre(io.DisplaySize.x / 2, io.DisplaySize.y / 2);
+    if (open_message_) {
+        ImGui::OpenPopup((std::string(kAppName) + "##message").c_str());
+        open_message_ = false;
+    }
+    if (open_quit_) {
+        ImGui::OpenPopup("Quit?##quit");
+        open_quit_ = false;
+    }
+    if (about_open_) {
+        ImGui::OpenPopup("About##about");
+        about_open_ = false;
+    }
+    if (keys_open_) {
+        ImGui::OpenPopup("Keyboard and Mouse");
+        keys_open_ = false;
+    }
+    const auto flags = ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings;
+    ImGui::SetNextWindowPos(centre, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal((std::string(kAppName) + "##message").c_str(), nullptr, flags)) {
+        ImGui::PushTextWrapPos(480 * scale_);
+        ImGui::TextUnformatted(message_.c_str());
+        ImGui::PopTextWrapPos();
+        if (ImGui::Button("OK", ImVec2(90 * scale_, 0))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+    ImGui::SetNextWindowPos(centre, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("Quit?##quit", nullptr, flags)) {
+        ImGui::TextUnformatted("The Ultra 5/10 is still on.");
+        ImGui::TextUnformatted("Shut the system down first (init 5 in Solaris) to keep its disk tidy.");
+        ImGui::Spacing();
+        if (ImGui::Button("Quit Now")) {
+            quit_ = true;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+    ImGui::SetNextWindowPos(centre, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("About##about", nullptr, flags)) {
+        ImGui::Text("%s %s: a Sun Ultra 5/10 emulator", kAppName, UV_VERSION);
+        ImGui::TextUnformatted("Copyright (C) 2026 Andy Taylor");
+        ImGui::TextUnformatted("GNU General Public License, version 2 or later");
+        ImGui::Spacing();
+        ImGui::TextDisabled("Menus and dialogs: Dear ImGui (MIT licence)");
+        if (!options_.log_file.empty()) ImGui::TextDisabled("Messages: %s", options_.log_file.c_str());
+        ImGui::TextDisabled("Sun, Ultra, Solaris and OpenBoot are trademarks of Oracle and/or its affiliates.");
+        if (ImGui::Button("OK", ImVec2(90 * scale_, 0))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+    ImGui::SetNextWindowPos(centre, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("Keyboard and Mouse", nullptr, flags)) {
+        const std::string ca = std::string("Ctrl+") + kAlt + "+";
+        ImGui::TextUnformatted("Click the screen to capture the mouse for the Ultra 5/10. Once the system shows its");
+        ImGui::TextUnformatted("pointer (the desktop), moving onto the screen captures it (View > Capture Mouse");
+        ImGui::TextUnformatted("on Entry) and pushing past an edge of the screen releases it.");
+        ImGui::Spacing();
+        if (ImGui::BeginTable("##keys", 2, ImGuiTableFlags_SizingFixedFit)) {
+            const std::pair<std::string, const char*> rows[] = {
+                {ca + "G", "Release the mouse"},
+                {ca + "A", "Stop-A: to OpenBoot's ok prompt (go resumes)"},
+                {ca + "P", "Power on (when off)"},
+                {ca + "E", "Next CD-ROM disc in the set"},
+                {ca + "F", "Full screen on/off"},
+            };
+            for (const auto& [keys, what] : rows) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(keys.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(what);
+            }
+            ImGui::EndTable();
+        }
+        ImGui::Spacing();
+        ImGui::TextDisabled("Keys are sent by position, as a Sun Type 5 keyboard sends them; Alt is Alt,");
+        ImGui::TextDisabled("Alt Gr (right Alt) is Alt Graph, the Windows or Command keys are Meta (diamond),");
+        ImGui::TextDisabled("Menu is Compose. In a serial terminal window, Ctrl+Shift+C/V copy and paste");
+        ImGui::TextDisabled("(Cmd+C/V on a Mac).");
+        if (ImGui::Button("OK", ImVec2(90 * scale_, 0))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+}
+
+// --- Files -------------------------------------------------------------------
+
+void Gui::choose(Pick what, const std::string& current) {
+    // With nothing chosen yet, start in the matching folder of the user's
+    // UltraViolet folder.
+    std::string start = folder_of(current);
+    if (start.empty() && !user_data_folder().empty()) {
+        const char* sub = what == Pick::PromDir                                    ? "roms"
+                          : what == Pick::Nvram || what == Pick::NewNvram          ? "nvram"
+                          : what == Pick::OpenSettings || what == Pick::SaveSettings ? ""
+                                                                                     : "diskImages";
+        const auto dir = std::filesystem::path(user_data_folder()) / sub;
+        std::error_code ec;
+        if (std::filesystem::is_directory(dir, ec)) start = dir.string() + "/";
+    }
+    auto* req = new PickRequest{this, what, start};
+    const char* location = req->location.empty() ? nullptr : req->location.c_str();
+    switch (what) {
+        case Pick::PromDir: SDL_ShowOpenFolderDialog(on_chosen, req, window_, location, false); break;
+        case Pick::Nvram: SDL_ShowOpenFileDialog(on_chosen, req, window_, kNvramFilters, 2, location, false); break;
+        case Pick::NewNvram: SDL_ShowSaveFileDialog(on_chosen, req, window_, kNvramFilters, 2, location); break;
+        case Pick::Disk: SDL_ShowOpenFileDialog(on_chosen, req, window_, kDiskFilters, 2, location, false); break;
+        case Pick::NewDisk: SDL_ShowSaveFileDialog(on_chosen, req, window_, kDiskFilters, 2, location); break;
+        case Pick::AddDisc: SDL_ShowOpenFileDialog(on_chosen, req, window_, kDiscFilters, 2, location, true); break;
+        case Pick::InsertDisc: SDL_ShowOpenFileDialog(on_chosen, req, window_, kDiscFilters, 2, location, false); break;
+        case Pick::OpenSettings:
+            SDL_ShowOpenFileDialog(on_chosen, req, window_, kSettingsFilters, 2, location, false);
+            break;
+        case Pick::SaveSettings: SDL_ShowSaveFileDialog(on_chosen, req, window_, kSettingsFilters, 2, location); break;
+    }
+}
+
+// May be called on another thread: the choice is queued for the main loop.
+void Gui::on_chosen(void* userdata, const char* const* files, int) {
+    std::unique_ptr<PickRequest> req(static_cast<PickRequest*>(userdata));
+    if (!files) {
+        UV_LOG(Warn, "display", "file chooser: %s", SDL_GetError());
+        return;
+    }
+    std::lock_guard<std::mutex> lock(req->gui->picks_mutex_);
+    for (; *files; ++files) req->gui->picks_.push_back({req->what, *files});
+}
+
+void Gui::apply_choice(const PickResult& r) {
+    std::string error;
+    switch (r.what) {
+        case Pick::PromDir: edit_.prom_dir = r.path; break;
+        case Pick::Nvram: edit_.nvram = r.path; break;
+        case Pick::NewNvram:
+            if (create_blank_image(r.path, kNvramBytes, error)) edit_.nvram = r.path;
+            else message("No new NVRAM was made:\n\n" + error + "\n\nUse Browse... to choose an existing one.");
+            break;
+        case Pick::Disk: edit_.disk = r.path; break;
+        case Pick::NewDisk:
+            if (create_blank_image(r.path, kDiskSizesMiB[static_cast<std::size_t>(new_disk_size_)] << 20, error))
+                edit_.disk = r.path;
+            else message("No new disk was made:\n\n" + error + "\n\nUse Browse... to choose an existing one.");
+            break;
+        case Pick::AddDisc: edit_.cdroms.push_back(r.path); break;
+        case Pick::InsertDisc:
+            if (!session_.insert_disc(r.path)) message("The disc could not be opened:\n\n" + r.path);
+            break;
+        case Pick::OpenSettings: {
+            Settings s;
+            if (!load_settings(r.path, s, error)) {
+                message(error);
+                break;
+            }
+            settings_path_ = r.path;
+            session_.set_settings(s);
+            if (settings_open_) open_settings();
+            status(session_.on() ? "Settings loaded; they take effect at the next power-on" : "Settings loaded");
+            break;
+        }
+        case Pick::SaveSettings:
+            settings_path_ = r.path;
+            save_settings_to(r.path);
+            status("Settings saved to " + file_name(r.path));
+            break;
+    }
+}
+
+}  // namespace
+
+#if !defined(__APPLE__)
+bool install_native_menus(std::function<std::vector<MenuEntry>()>, std::function<void(std::function<void()>)>) {
+    return false;
+}
+#endif
+
+int run_gui(Settings settings, const GuiOptions& options, volatile std::sig_atomic_t& stop,
+            volatile std::sig_atomic_t& next_disc) {
+    Gui gui(std::move(settings), options, stop, next_disc);
+    return gui.run();
+}
+
+}  // namespace uv::app

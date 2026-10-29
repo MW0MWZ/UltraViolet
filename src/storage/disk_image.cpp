@@ -52,6 +52,7 @@ void DiskImage::close() {
 
 bool DiskImage::read(u64 offset, u8* data, std::size_t length) {
     if (!f_.is_open()) return false;
+    ++accesses_;
     const u64 avail = offset < size_ ? std::min<u64>(length, size_ - offset) : 0;
     if (avail) {
         f_.clear();
@@ -68,6 +69,7 @@ bool DiskImage::read(u64 offset, u8* data, std::size_t length) {
 
 bool DiskImage::write(u64 offset, const u8* data, std::size_t length) {
     if (!f_.is_open() || read_only_) return false;
+    ++accesses_;
     f_.clear();
     f_.seekp(static_cast<std::streamoff>(offset));
     f_.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(length));

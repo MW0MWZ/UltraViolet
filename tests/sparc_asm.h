@@ -33,6 +33,8 @@ UV_ALU(OR, 0x02)
 UV_ALU(XOR, 0x03)
 UV_ALU(SUB, 0x04)
 UV_ALU(ANDN, 0x05)
+UV_ALU(ORN, 0x06)
+UV_ALU(XNOR, 0x07)
 UV_ALU(ADDC, 0x08)
 UV_ALU(MULX, 0x09)
 UV_ALU(UMUL, 0x0A)
@@ -44,18 +46,27 @@ UV_ALU(SDIV, 0x0F)
 UV_ALU(ADDcc, 0x10)
 UV_ALU(ANDcc, 0x11)
 UV_ALU(ORcc, 0x12)
+UV_ALU(XORcc, 0x13)
 UV_ALU(SUBcc, 0x14)
+UV_ALU(ANDNcc, 0x15)
+UV_ALU(ORNcc, 0x16)
+UV_ALU(XNORcc, 0x17)
 UV_ALU(ADDCcc, 0x18)
+UV_ALU(UMULcc, 0x1A)
+UV_ALU(SMULcc, 0x1B)
 UV_ALU(SUBCcc, 0x1C)
 UV_ALU(UDIVcc, 0x1E)
 UV_ALU(SDIVcc, 0x1F)
 UV_ALU(TADDcc, 0x20)
+UV_ALU(TSUBcc, 0x21)
 UV_ALU(TADDccTV, 0x22)
+UV_ALU(TSUBccTV, 0x23)
 UV_ALU(MULScc, 0x24)
 UV_ALU(SDIVX, 0x2D)
 UV_ALU(JMPL, 0x38)
 UV_ALU(RETURN, 0x39)
 UV_ALU(SAVE, 0x3C)
+UV_ALU(FLUSH, 0x3B)
 UV_ALU(RESTORE, 0x3D)
 #undef UV_ALU
 
@@ -65,6 +76,14 @@ constexpr u32 SRAi(unsigned rd, unsigned rs1, unsigned n) { return f3i(2, 0x27, 
 constexpr u32 SLLXi(unsigned rd, unsigned rs1, unsigned n) { return f3i(2, 0x25, rd, rs1, static_cast<int>((n & 63) | 0x1000)); }
 constexpr u32 SRLXi(unsigned rd, unsigned rs1, unsigned n) { return f3i(2, 0x26, rd, rs1, static_cast<int>((n & 63) | 0x1000)); }
 constexpr u32 SRAXi(unsigned rd, unsigned rs1, unsigned n) { return f3i(2, 0x27, rd, rs1, static_cast<int>((n & 63) | 0x1000)); }
+
+// Shifts by a register: the count is rs2's low 5 (or, X forms, 6) bits.
+constexpr u32 SLL(unsigned rd, unsigned rs1, unsigned rs2) { return f3r(2, 0x25, rd, rs1, rs2); }
+constexpr u32 SRL(unsigned rd, unsigned rs1, unsigned rs2) { return f3r(2, 0x26, rd, rs1, rs2); }
+constexpr u32 SRA(unsigned rd, unsigned rs1, unsigned rs2) { return f3r(2, 0x27, rd, rs1, rs2); }
+constexpr u32 SLLX(unsigned rd, unsigned rs1, unsigned rs2) { return f3r(2, 0x25, rd, rs1, rs2) | 0x1000; }
+constexpr u32 SRLX(unsigned rd, unsigned rs1, unsigned rs2) { return f3r(2, 0x26, rd, rs1, rs2) | 0x1000; }
+constexpr u32 SRAX(unsigned rd, unsigned rs1, unsigned rs2) { return f3r(2, 0x27, rd, rs1, rs2) | 0x1000; }
 
 constexpr u32 SETHI(unsigned rd, u32 value) { return (rd << 25) | (4u << 22) | ((value >> 10) & 0x3FFFFF); }
 constexpr u32 NOP = SETHI(0, 0);
@@ -78,6 +97,14 @@ constexpr u32 Bicc(unsigned cond, int disp, bool annul = false) {
 }
 constexpr u32 BPcc(unsigned cond, unsigned cc, int disp, bool annul = false) {
     return (annul ? 1u << 29 : 0) | (cond << 25) | (1u << 22) | (cc << 20) | (1u << 19) | (static_cast<u32>(disp) & 0x7FFFF);
+}
+// fcc conditions for FBfcc/FBPfcc/FMOVcc: 0 N, 1 NE, 2 LG, 3 UL, 4 L, 5 UG, 6 G,
+// 7 U, 8 A, 9 E, 10 UE, 11 GE, 12 UGE, 13 LE, 14 ULE, 15 O
+constexpr u32 FBfcc(unsigned cond, int disp, bool annul = false) {
+    return (annul ? 1u << 29 : 0) | (cond << 25) | (6u << 22) | (static_cast<u32>(disp) & 0x3FFFFF);
+}
+constexpr u32 FBPfcc(unsigned cond, unsigned fcc, int disp, bool annul = false) {
+    return (annul ? 1u << 29 : 0) | (cond << 25) | (5u << 22) | (fcc << 20) | (1u << 19) | (static_cast<u32>(disp) & 0x7FFFF);
 }
 // rcond: 1 Z, 2 LEZ, 3 LZ, 5 NZ, 6 GZ, 7 GEZ
 constexpr u32 BPr(unsigned rcond, unsigned rs1, int disp, bool annul = false) {
@@ -140,6 +167,8 @@ UV_MEM(STDF, 0x27)
     }
 UV_MEMA(LDUWA, 0x10)
 UV_MEMA(LDUBA, 0x11)
+UV_MEMA(LDUHA, 0x12)
+UV_MEMA(LDSWA, 0x18)
 UV_MEMA(LDXA, 0x1B)
 UV_MEMA(STWA, 0x14)
 UV_MEMA(STXA, 0x1E)

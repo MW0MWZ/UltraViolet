@@ -30,6 +30,7 @@ public:
     u32 config_read(u8 reg, unsigned size) override;
     void config_write(u8 reg, unsigned size, u32 value) override;
     bool io_read(u32 addr, unsigned size, u32& value) override;
+    Claim claim(u32 addr, bool io, Decoded& d) const override;
     bool io_write(u32 addr, unsigned size, u32 value) override;
 
 protected:

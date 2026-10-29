@@ -10,12 +10,15 @@
 // as master of the secondary. Bus B carries the slots.
 #pragma once
 
+#include <atomic>
 #include <ctime>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "core/host_memory.h"
+#include "core/pacer.h"
 #include "core/scheduler.h"
 #include "cpu/ultrasparc/ultrasparc.h"
 #include "devices/atapi_cdrom.h"
@@ -23,6 +26,9 @@
 #include "devices/ebus_dma.h"
 #include "devices/ebus_misc.h"
 #include "devices/fdc82077.h"
+#include "devices/hme.h"
+#include "devices/mach64.h"
+#include "devices/sun_keyboard.h"
 #include "devices/m48t59.h"
 #include "devices/ns16550.h"
 #include "devices/rio_ebus.h"
@@ -31,6 +37,7 @@
 #include "devices/serial.h"
 #include "devices/simba.h"
 #include "mem/bus.h"
+#include "net/net_backend.h"
 #include "storage/disk_image.h"
 
 namespace uv {
@@ -59,6 +66,18 @@ public:
         // clock at start). The clock then advances with the processor's
         // cycles, so it agrees with TICK and the other timers.
         std::time_t start_time = 0;
+        // How guest time relates to the host's clock (core/pacer.h): Free
+        // charges one cycle per instruction and never waits (reproducible
+        // runs); Realtime keeps guest time to the wall clock, the processor
+        // as fast as the host allows.
+        Pacer::Mode timing = Pacer::Mode::Free;
+        // The host side of the on-board Ethernet (HME); none: no cable.
+        std::shared_ptr<net::NetBackend> network;
+        // A Sun Type 5 keyboard and mouse on the keyboard port. Without
+        // them OpenBoot takes ttya for input and output; with them, and a
+        // display, the screen is the console.
+        bool keyboard = false;
+        u8 keyboard_layout = SunKeyboard::kLayoutUs;
     };
 
     // On-board interrupt numbers (INO) of the EBus devices.
@@ -97,6 +116,26 @@ public:
     // Call after delivering bytes to any of the lines.
     void poll_serial();
 
+    // Keyboard and mouse input (any thread; taken at the next run slice):
+    // a Sun key number going down or up, every key up, mouse movement (x
+    // right, y down) and buttons (left 1, middle 2, right 4).
+    void post_key(u8 code, bool down);
+    void post_release_keys();
+    void post_mouse(int dx, int dy, unsigned buttons);
+    SunKeyboard* keyboard() { return keyboard_.get(); }
+
+    // For the window: how busy the disk, CD-ROM and network have been, the
+    // pacer (speed, lag), changing the timing while running (turbo), and
+    // the disc in the CD-ROM drive.
+    struct Activity {
+        u64 disk = 0, cdrom = 0, net = 0;
+    };
+    Activity activity() const { return {disk_image_.accesses(), cd_image_.accesses(), hme_.frames()}; }
+    const Pacer& pacer() const { return pacer_; }
+    void set_timing(Pacer::Mode mode);
+    std::string disc() const { return cd_image_.is_open() ? cd_image_.path() : std::string(); }
+    Mach64& graphics() { return mach64_; }
+
 private:
     // Maps the flash image straight onto the processor's bus while reads of
     // it return the array and the path to it (Simba A, the EBus BAR0) is
@@ -105,6 +144,12 @@ private:
     u64 prom_pa_ = 0, prom_map_size_ = 0;
 
     Options opt_;
+    Pacer pacer_;
+    u64 paced_at_ = 0;  // guest time of the last pacer update
+    u64 pci_ticks_fx_ = 0;  // PCI clocks per CPU cycle, as a 0.64 fraction
+    u64 pci_ticks() const;
+    u64 hz_ = 0, per_second_fx_ = 0;  // the CPU clock, and 2^64 / it
+    u64 guest_seconds() const;
     Bus bus_;
     Scheduler sched_;
     HostMemory ram_;
@@ -123,6 +168,22 @@ private:
     // EBus DMA channels: parallel port, audio playback and capture, floppy.
     EbusDma ecpp_dma_{"ecpp-dma"}, audio_play_dma_{"audio-play-dma"}, audio_rec_dma_{"audio-rec-dma"}, fd_dma_{"fd-dma"};
     Cmd646 ide_;
+    Hme hme_;
+    Mach64 mach64_;
+    std::unique_ptr<SunKeyboard> keyboard_;
+    std::unique_ptr<SunMouse> mouse_;
+    // Input from the host, waiting for the emulation thread.
+    struct InputEvent {
+        enum Kind : u8 { Key, ReleaseKeys, Mouse } kind;
+        u8 code;
+        bool down;
+        int dx, dy;
+        unsigned buttons;
+    };
+    void take_input();
+    std::mutex input_mutex_;
+    std::vector<InputEvent> input_;
+    std::atomic<bool> input_waiting_{false};
     DiskImage disk_image_, cd_image_;
     std::unique_ptr<AtaDisk> disk_;
     AtapiCdrom cdrom_;

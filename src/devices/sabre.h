@@ -70,10 +70,12 @@ private:
     bool regs_write(u64 offset, unsigned size, u64 value);
     bool config_read(u64 offset, unsigned size, u64& value);
     bool config_write(u64 offset, unsigned size, u64 value);
+    u64 config_stable(u64 offset, unsigned size);
     bool io_read(u64 offset, unsigned size, u64& value);
     bool io_write(u64 offset, unsigned size, u64 value);
     bool mem_read(u64 offset, unsigned size, u64& value);
     bool mem_write(u64 offset, unsigned size, u64 value);
+    u64 mem_stable(u64 offset, unsigned size);
     void pio_error(u64 bit);
 
     u64& imap(unsigned ino);

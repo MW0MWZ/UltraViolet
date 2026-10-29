@@ -4,6 +4,7 @@
 
 #include <algorithm>
 
+#include "core/int128.h"
 #include "core/log.h"
 
 namespace uv {
@@ -34,22 +35,32 @@ constexpr u8 kMachineType = 0x80;      // IDPROM machine type: sun4u
 
 Ultra5_10::Ultra5_10(const Options& options)
     : opt_(options),
+      pacer_(options.timing, options.cpu_hz),
       ram_(static_cast<std::size_t>(options.ram_mb) << 20),
       cpu_(bus_, cpu_options(options)),
       sabre_(bus_, sched_, options.cpu_hz, [this](u64 inr) { return cpu_.deliver_interrupt_vector(inr, 0, 0); }),
-      simba_b_(false, [this] { return static_cast<u64>(static_cast<double>(cpu_.cycles()) * kPciHz / opt_.cpu_hz); }),
-      simba_a_(true, [this] { return static_cast<u64>(static_cast<double>(cpu_.cycles()) * kPciHz / opt_.cpu_hz); }),
+      simba_b_(false, [this] { return pci_ticks(); }),
+      simba_a_(true, [this] { return pci_ticks(); }),
       flash_(options.prom, 0x01, 0xD5, 0x10000),
       start_time_(options.start_time ? options.start_time : std::time(nullptr)),
-      nvram_([this] { return start_time_ + static_cast<std::time_t>(static_cast<double>(cpu_.cycles()) / opt_.cpu_hz); }),
+      nvram_([this] { return start_time_ + static_cast<std::time_t>(guest_seconds()); }),
       superio_(kSuperIoSid),
       su_kbd_(sched_, kbd_line_, kSuperIoUartHz, options.cpu_hz),
       su_mouse_(sched_, mouse_line_, kSuperIoUartHz, options.cpu_hz),
       se_(sched_, ttya_, ttyb_, options.cpu_hz),
       fdc_(sched_),
       ide_(sched_, options.cpu_hz),
+      hme_(sched_, options.cpu_hz),
+      mach64_(sched_, options.cpu_hz),
       cdrom_(sched_, options.cpu_hz) {
     sched_.set_clock([this] { return cpu_.cycles(); });
+    pci_ticks_fx_ = static_cast<u64>(kPciHz / opt_.cpu_hz * 18446744073709551616.0);  // (the PCI clock is the slower)
+    hz_ = static_cast<u64>(opt_.cpu_hz + 0.5);
+    per_second_fx_ = ~u64{0} / hz_;
+    nvram_.set_next_second([this] { return (guest_seconds() + 1) * hz_; });
+    // Delay loops the CPU runs at once cost at least the real CPU's time
+    // (see Pacer::delay_cycles_per_instruction).
+    cpu_.set_delay_cycles_per_step(pacer_.delay_cycles_per_instruction());
 
     bus_.add_host_region(ram_.get(), ram_.size());
     u64 placed = 0;
@@ -74,6 +85,8 @@ Ultra5_10::Ultra5_10(const Options& options)
     sabre_.root().attach(1, 0, &simba_b_);
     sabre_.root().attach(1, 1, &simba_a_);
     simba_a_.secondary().attach(1, 0, &ebus_);
+    simba_a_.secondary().attach(1, 1, &hme_);  // the RIO's Ethernet
+    simba_a_.secondary().attach(2, 0, &mach64_);  // the on-board graphics
     simba_a_.secondary().attach(3, 0, &ide_);
 
     // EBus devices
@@ -113,6 +126,19 @@ Ultra5_10::Ultra5_10(const Options& options)
     for (EbusDma* d : {&ecpp_dma_, &audio_play_dma_, &audio_rec_dma_, &fd_dma_})
         d->set_dma_port([this](u32 a, u8* p, std::size_t n) { return sabre_.dma_read(a, p, n); },
                         [this](u32 a, const u8* p, std::size_t n) { return sabre_.dma_write(a, p, n); });
+
+    // The on-board graphics' interrupt.
+    mach64_.set_interrupt_sink([this](bool a) { sabre_.set_interrupt(kInoGraphics, a); });
+    // The on-board Ethernet: its interrupt, DMA and the host's side.
+    hme_.set_interrupt_sink([this](bool a) { sabre_.set_interrupt(kInoRio, a); });
+    hme_.set_dma_port([this](u32 a, u8* d, std::size_t n) { return sabre_.dma_read(a, d, n); },
+                      [this](u32 a, const u8* d, std::size_t n) { return sabre_.dma_write(a, d, n); });
+    hme_.set_network(opt_.network);
+    if (opt_.keyboard) {
+        keyboard_ = std::make_unique<SunKeyboard>(sched_, kbd_line_, opt_.cpu_hz);
+        keyboard_->set_layout(opt_.keyboard_layout);
+        mouse_ = std::make_unique<SunMouse>(mouse_line_);
+    }
 
     // IDE: the disk (if any) on the primary channel, the CD-ROM drive as
     // master of the secondary.
@@ -162,10 +188,17 @@ void Ultra5_10::reset() {
     superio_.reset();
     su_kbd_.reset();
     su_mouse_.reset();
+    if (keyboard_) keyboard_->reset(), mouse_->reset();
     se_.reset();
     fdc_.reset();
     for (EbusDma* d : {&ecpp_dma_, &audio_play_dma_, &audio_rec_dma_, &fd_dma_}) d->reset();
     cpu_.reset();
+}
+
+void Ultra5_10::set_timing(Pacer::Mode mode) {
+    opt_.timing = mode;
+    pacer_.set_mode(mode);
+    cpu_.set_delay_cycles_per_step(pacer_.delay_cycles_per_instruction());
 }
 
 bool Ultra5_10::insert_cdrom(const std::string& path) {
@@ -192,21 +225,94 @@ void Ultra5_10::update_prom_mapping() {
     bus_.map_ram(prom_pa_, prom_map_size_, image.data(), false);
 }
 
+void Ultra5_10::post_key(u8 code, bool down) {
+    std::lock_guard<std::mutex> lock(input_mutex_);
+    input_.push_back({InputEvent::Key, code, down, 0, 0, 0});
+    input_waiting_.store(true, std::memory_order_release);
+}
+
+void Ultra5_10::post_release_keys() {
+    std::lock_guard<std::mutex> lock(input_mutex_);
+    input_.push_back({InputEvent::ReleaseKeys, 0, false, 0, 0, 0});
+    input_waiting_.store(true, std::memory_order_release);
+}
+
+void Ultra5_10::post_mouse(int dx, int dy, unsigned buttons) {
+    std::lock_guard<std::mutex> lock(input_mutex_);
+    input_.push_back({InputEvent::Mouse, 0, false, dx, dy, buttons});
+    input_waiting_.store(true, std::memory_order_release);
+}
+
+void Ultra5_10::take_input() {
+    std::vector<InputEvent> events;
+    {
+        std::lock_guard<std::mutex> lock(input_mutex_);
+        events.swap(input_);
+        input_waiting_.store(false, std::memory_order_relaxed);
+    }
+    if (!keyboard_) return;
+    for (const InputEvent& e : events) {
+        switch (e.kind) {
+            case InputEvent::Key: keyboard_->key(e.code, e.down); break;
+            case InputEvent::ReleaseKeys: keyboard_->release_all(); break;
+            case InputEvent::Mouse:
+                mouse_->move(e.dx, e.dy);
+                mouse_->set_buttons(e.buttons);
+                break;
+        }
+    }
+}
+
 void Ultra5_10::poll_serial() {
     su_kbd_.poll_line();
     su_mouse_.poll_line();
     se_.poll_lines();
 }
 
+// Guest time in PCI clocks (what the APB's tick register counts): polled
+// often, so a multiply by a fixed-point ratio.
+u64 Ultra5_10::pci_ticks() const {
+    u64 hi, lo;
+    mul_u64(cpu_.cycles(), pci_ticks_fx_, hi, lo);
+    return hi;
+}
+
+// Whole seconds of guest time (for the TOD clock, which Solaris polls):
+// by the reciprocal, then put right.
+u64 Ultra5_10::guest_seconds() const {
+    const u64 c = cpu_.cycles();
+    u64 q, lo;
+    mul_u64(c, per_second_fx_, q, lo);
+    while (c - q * hz_ >= hz_) ++q;
+    return q;
+}
+
 void Ultra5_10::run(u64 instructions) {
     const u64 end = cpu_.instructions() + instructions;
+    const u64 pace_every = static_cast<u64>(opt_.cpu_hz / 1000);  // a millisecond of guest time
     while (cpu_.instructions() < end && !cpu_.halted()) {
-        const u64 now = cpu_.cycles();
         const u64 next = sched_.next_event();
-        u64 n = next > now ? next - now : 1;
+        u64 n = cpu_.steps_until(next);
         n = std::min<u64>({n, end - cpu_.instructions(), 4096});
         cpu_.run(n);
-        sched_.run_due(cpu_.cycles());
+        const u64 now = cpu_.cycles();
+        sched_.run_due(now);
+        hme_.poll();  // frames from the host
+        if (input_waiting_.load(std::memory_order_acquire)) take_input();
+        if (mouse_) {
+            mouse_->poll();
+            su_kbd_.poll_line();
+            su_mouse_.poll_line();
+        }
+        // Guest time to the wall clock: the pacer waits while the guest is
+        // ahead, and sets the time each step is charged from what the host
+        // manages. Delay loops run at once take next to no host time for
+        // the guest time they are charged: to the pacer, that time is idle.
+        if (opt_.timing != Pacer::Mode::Free && now - paced_at_ >= pace_every) {
+            paced_at_ = now;
+            cpu_.set_cycles_per_step(
+                pacer_.update(now, cpu_.instructions() - cpu_.delay_steps(), false, cpu_.delay_cycles()));
+        }
     }
 }
 

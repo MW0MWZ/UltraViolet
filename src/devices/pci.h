@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "core/types.h"
+#include "mem/bus.h"
 
 namespace uv::pci {
 
@@ -31,6 +32,11 @@ constexpr u16 kCmdIo = 1u << 0, kCmdMemory = 1u << 1, kCmdMaster = 1u << 2;
 
 class Bus;
 
+// Advanced by every configuration write and reset: decodes cached before
+// it may no longer hold (BARs, command bits, bridge windows).
+u32 decode_generation();
+void decode_changed();
+
 // One function of a PCI device.
 class Function {
 public:
@@ -45,6 +51,11 @@ public:
 
     // Configuration space; `reg` is aligned to `size` (1, 2 or 4).
     virtual u32 config_read(u8 reg, unsigned size);
+    // As Device::stable_until, for a configuration read.
+    virtual u64 config_stable(u8 reg, unsigned size) const {
+        (void)reg, (void)size;
+        return 0;
+    }
     virtual void config_write(u8 reg, unsigned size, u32 value);
 
     // Memory and I/O cycles addressed to this function. Return false if it
@@ -75,6 +86,18 @@ public:
     std::function<void()> on_config_write;
     u32 bar_address(unsigned bar) const;
 
+    // Where a memory or I/O cycle at `addr` goes in this function, for a
+    // bus's decode cache: Plain (a BAR: `bar`, its base and size), None (not
+    // claimed), or Special (claimed some other way: not to be cached). A
+    // Special claim covers every address of its 4-byte granule.
+    // Functions that claim cycles outside their BARs override it.
+    enum class Claim { None, Plain, Special };
+    struct Decoded {
+        unsigned bar = 0;
+        u32 base = 0, size = 0;
+    };
+    virtual Claim claim(u32 addr, bool io, Decoded& d) const;
+
 protected:
     // Declares BAR `bar` (0-5): `size` a power of two, I/O or memory.
     // `reset_address` is its value at power-on (normally 0).
@@ -82,6 +105,11 @@ protected:
     // Accesses that fall in an enabled BAR, at `offset` into it.
     virtual bool bar_read(unsigned bar, u32 offset, unsigned size, u64& value);
     virtual bool bar_write(unsigned bar, u32 offset, unsigned size, u64 value);
+    // As Device::stable_until, for a read at `offset` into a BAR.
+    virtual u64 bar_stable(unsigned bar, u32 offset, unsigned size) const {
+        (void)bar, (void)offset, (void)size;
+        return 0;
+    }
     // Bus-master cycles: refused (false) unless bus master enable is set.
     bool master_read(u32 addr, u8* data, std::size_t length) const {
         return (command() & kCmdMaster) && dma_read_ && dma_read_(addr, data, length);
@@ -106,6 +134,7 @@ protected:
     std::array<u8, 256> cfg_{}, wmask_{}, w1c_{};
 
 private:
+    friend class Bus;
     struct Bar {
         u32 size = 0;  // 0: not implemented
         bool io = false;
@@ -131,9 +160,13 @@ public:
     // through a bridge whose secondary..subordinate range holds `bus`).
     // Reads with no device answer all ones.
     u32 config_read(unsigned bus, unsigned device, unsigned function, u8 reg, unsigned size);
+    u64 config_stable(unsigned bus, unsigned device, unsigned function, u8 reg, unsigned size) const;
     void config_write(unsigned bus, unsigned device, unsigned function, u8 reg, unsigned size, u32 value);
     // Memory and I/O cycles: false if no function claims them (master abort).
     bool mem_read(u32 addr, unsigned size, u64& value);
+    // As Device::stable_until, for a memory read at `addr` (through the
+    // decode cache: a function's BAR, here or behind a bridge).
+    u64 mem_stable(u32 addr, unsigned size);
     bool mem_write(u32 addr, unsigned size, u64 value);
     bool io_read(u32 addr, unsigned size, u32& value);
     bool io_write(u32 addr, unsigned size, u32 value);
@@ -142,6 +175,23 @@ public:
 
 private:
     friend class Bridge;
+    // Decode cache: the function and BAR a cycle reaches through this bus and
+    // any bridges below it, by granule. A granule is the smallest BAR (16
+    // bytes of memory, 4 of I/O), so no decode boundary falls inside one and
+    // every address in it decodes alike.
+    struct CacheEntry {
+        u32 granule = ~0u, gen = 0;
+        Function* f = nullptr;
+        Function::Decoded d;
+    };
+    static constexpr unsigned kCacheEntries = 256;
+    // The function and BAR for `addr` (cached), or null to decode the slow way.
+    const CacheEntry* decoded(u32 addr, bool io);
+    // Walks the bus (and bridges) as mem/io cycles do: the claiming function
+    // and Claim::Plain, or None/Special.
+    Function::Claim resolve(u32 addr, bool io, Function*& f, Function::Decoded& d) const;
+    std::array<CacheEntry, kCacheEntries> mem_cache_{}, io_cache_{};
+
     std::array<std::array<Function*, 8>, 32> slots_{};
     std::vector<Function*> functions_;
     std::vector<class Bridge*> bridges_;
@@ -168,6 +218,7 @@ public:
     }
 
 protected:
+    friend class Bus;
     virtual bool forwards_mem(u32 addr) const;
     virtual bool forwards_io(u32 addr) const;
 

@@ -276,6 +276,22 @@ void Sab82532::update_irq() {
     if (irq_) irq_(pending);
 }
 
+// Reads change nothing but those of a receive FIFO with bytes in it and of
+// the interrupt status registers with bits to show (and clear); the rest
+// change only by writes, scheduled events (transmit and receive timing)
+// and input.
+u64 Sab82532::stable_until(u64 offset, unsigned) const {
+    const unsigned reg = static_cast<unsigned>(offset & 0x3F);
+    const Channel& c = *ch_[(offset >> 6) & 1];
+    if (reg < 0x20) return c.rx.empty() ? kForever : 0;
+    switch (reg) {
+        case kIsr0: return visible(c.isr0, c.imr0) ? 0 : kForever;
+        case kIsr1: return visible(c.isr1, c.imr1) ? 0 : kForever;
+        case kPis: return visible(pis_, pim_) ? 0 : kForever;
+        default: return kForever;
+    }
+}
+
 bool Sab82532::read(u64 offset, unsigned, u64& value) {
     const unsigned reg = static_cast<unsigned>(offset & 0x3F);
     Channel& c = *ch_[(offset >> 6) & 1];

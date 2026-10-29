@@ -10,6 +10,7 @@
 #include "devices/fdc82077.h"
 #include "devices/m48t59.h"
 #include "devices/ns16550.h"
+#include "devices/pci.h"
 #include "devices/sab82532.h"
 #include "machine/ultra5_10/ultra5_10.h"
 #include "test.h"
@@ -44,6 +45,57 @@ u32 cfg_read32(Ultra5_10& m, u64 pa) {
 
 void cfg_write32(Ultra5_10& m, u64 pa, u32 v) { m.bus().write(pa, byteswap(v)); }
 
+// A function whose BARs answer with who was reached: id, BAR and offset.
+// Function 1 refuses reads at offset 0xFC (so the bus tries the others); if
+// `special` is set, also answers I/O cycles there outside its BARs.
+struct ProbeFunction : pci::Function {
+    ProbeFunction(u8 id_, std::initializer_list<std::pair<u32, bool>> bars) : Function(0x1234, id_, 0, 0xFF0000), id(id_) {
+        unsigned i = 0;
+        for (auto [size, io] : bars) define_bar(i++, size, io);
+    }
+    const char* name() const override { return "probe"; }
+    bool bar_read(unsigned bar, u32 offset, unsigned, u64& value) override {
+        if (id == 1 && offset == 0xFC) return false;
+        value = (u32{id} << 24) | (bar << 16) | offset;
+        return true;
+    }
+    bool bar_write(unsigned bar, u32 offset, unsigned, u64 value) override {
+        last_write = (u64{bar} << 32) | (offset << 8) | (value & 0xFF);
+        return true;
+    }
+    Claim claim(u32 addr, bool io, Decoded& d) const override {
+        if (io && special && (addr & ~3u) == special) return Claim::Special;
+        return Function::claim(addr, io, d);
+    }
+    bool io_read(u32 addr, unsigned size, u32& value) override {
+        if (special && addr == special) {
+            value = 0x5EC1A1;
+            return true;
+        }
+        return Function::io_read(addr, size, value);
+    }
+    void set_bar(unsigned bar, u32 base) { config_write(static_cast<u8>(pci::kBar0 + 4 * bar), 4, base); }
+    void enable(u16 cmd) { config_write(pci::kCommand, 2, cmd); }
+    u8 id;
+    u32 special = 0;
+    u64 last_write = 0;
+};
+
+struct ProbeBridge : pci::Bridge {
+    ProbeBridge() : Bridge(0x1234, 0x99, 0) {}
+    const char* name() const override { return "probe-bridge"; }
+};
+
+u64 bus_read(pci::Bus& b, u32 addr) {
+    u64 v = 0;
+    return b.mem_read(addr, 4, v) ? v : ~0ull;
+}
+
+u32 bus_in(pci::Bus& b, u32 addr) {
+    u32 v = 0;
+    return b.io_read(addr, 4, v) ? v : ~0u;
+}
+
 }  // namespace
 
 TEST(machine_pci_topology_answers_configuration_cycles) {
@@ -56,6 +108,82 @@ TEST(machine_pci_topology_answers_configuration_cycles) {
     cfg_write32(m, cfg(0, 1, 1, 0x18), 0x00010100);           // primary 0, secondary 1, subordinate 1
     CHECK_EQ(cfg_read32(m, cfg(1, 1, 0, 0)), 0x1000108Eu);
     CHECK_EQ(cfg_read32(m, cfg(1, 1, 0, 0x14)), 0xF1000000u); // BAR1 at its power-on address
+}
+
+// Memory and I/O cycles reach the same function and offset however often
+// they repeat, as configuration moves BARs, turns decoding off and on and
+// moves bridge windows.
+TEST(pci_decoding_follows_every_configuration_change) {
+    pci::Bus root;
+    ProbeFunction a(1, {{0x100, false}, {0x10, true}, {4, true}});
+    ProbeFunction c(3, {{4, true}});
+    ProbeBridge bridge;
+    ProbeFunction b(2, {{0x1000, false}});
+    root.attach(1, 0, &a);
+    root.attach(2, 0, &bridge);
+    root.attach(3, 0, &c);
+    bridge.secondary().attach(0, 0, &b);
+    a.set_bar(0, 0x80001000);
+    a.set_bar(1, 0x400);
+    a.set_bar(2, 0x414);
+    c.set_bar(0, 0x410);  // the 4-byte I/O BARs of two functions share 16 bytes
+    b.set_bar(0, 0x90000000);
+    a.enable(pci::kCmdMemory | pci::kCmdIo);
+    c.enable(pci::kCmdIo);
+    b.enable(pci::kCmdMemory);
+    for (int pass = 0; pass < 2; ++pass) {  // the second pass is served from the cache
+        CHECK(bus_read(root, 0x80001010) == 0x01000010);
+        CHECK(bus_read(root, 0x80001100) == ~0ull);
+        CHECK(bus_in(root, 0x408) == 0x01010008);
+        CHECK(bus_in(root, 0x410) == 0x03000000);
+        CHECK(bus_in(root, 0x414) == 0x01020000);
+        CHECK(bus_read(root, 0x90000010) == ~0ull);  // the bridge forwards nothing yet
+    }
+    // A BAR moved: the old address stops answering, the new one starts.
+    a.set_bar(0, 0x80002000);
+    CHECK(bus_read(root, 0x80001010) == ~0ull);
+    CHECK(bus_read(root, 0x80002010) == 0x01000010);
+    // Memory decoding off, then on again.
+    a.enable(pci::kCmdIo);
+    CHECK(bus_read(root, 0x80002010) == ~0ull);
+    CHECK(bus_in(root, 0x408) == 0x01010008);
+    a.enable(pci::kCmdMemory | pci::kCmdIo);
+    CHECK(bus_read(root, 0x80002010) == 0x01000010);
+    // A bridge window opened over the secondary BAR, then closed.
+    bridge.config_write(pci::kMemBase, 4, 0x90009000);
+    bridge.config_write(pci::kCommand, 2, pci::kCmdMemory);
+    CHECK(bus_read(root, 0x90000010) == 0x02000010);
+    CHECK(bus_read(root, 0x90000010) == 0x02000010);
+    bridge.config_write(pci::kMemBase, 4, 0x90109010);
+    CHECK(bus_read(root, 0x90000010) == ~0ull);
+    bridge.config_write(pci::kMemBase, 4, 0x90009000);
+    b.set_bar(0, 0x90004000);
+    CHECK(bus_read(root, 0x90000010) == ~0ull);
+    CHECK(bus_read(root, 0x90004010) == 0x02000010);
+    // Writes reach the function the reads do.
+    CHECK(root.mem_write(0x80002020, 1, 0x5A) && a.last_write == 0x205A);
+    CHECK(root.io_write(0x410, 1, 0x77) && c.last_write == 0x77);
+    // A refused cycle goes on to an overlapping function behind it.
+    bridge.config_write(pci::kMemBase, 4, 0x80008000);
+    b.set_bar(0, 0x80002000);
+    for (int pass = 0; pass < 2; ++pass) {
+        CHECK(bus_read(root, 0x80002010) == 0x01000010);
+        CHECK(bus_read(root, 0x800020FC) == 0x020000FC);
+    }
+    // An address claimed outside the BARs is never served from the cache: a
+    // BAR of c's covers it, but a answers first.
+    c.set_bar(0, 0x500);
+    CHECK(bus_in(root, 0x500) == 0x03000000);
+    a.special = 0x500;
+    a.enable(pci::kCmdMemory | pci::kCmdIo);  // a configuration write, as when it would be set up
+    for (int pass = 0; pass < 2; ++pass) {
+        CHECK(bus_in(root, 0x500) == 0x5EC1A1);
+        CHECK(bus_in(root, 0x502) == 0x03000002);  // within its granule, a does not answer
+    }
+    // Reset restores power-on decoding.
+    CHECK(bus_read(root, 0x80002010) == 0x01000010);
+    root.reset();
+    CHECK(bus_read(root, 0x80002010) == ~0ull);
 }
 
 TEST(machine_boot_prom_and_nvram_are_reachable_at_power_on) {
@@ -378,4 +506,57 @@ TEST(fdc82077_reset_reports_four_drives_and_version) {
     CHECK(!irq);
     f.write(5, 1, 0x10);  // version
     CHECK_EQ(rd(5), 0x90u);
+}
+
+// Through Sabre, the PCI bus and the EBus, devices say how long a read
+// holds still: NVRAM always, the TOD clock until its next second, the
+// keyboard UART's line status always (no error waiting), its receive
+// buffer never (a read takes a byte); RAM always; the APB tick counts.
+TEST(machine_devices_say_how_long_a_read_holds) {
+    Ultra5_10 m(small_options());
+    const u64 hz = 440000000;
+    CHECK_EQ(m.bus().stable_until(0x1FFF1000010ull, 1), Device::kForever);
+    CHECK_EQ(m.bus().stable_until(0x1FFF1001FF9ull, 1), (m.cpu().cycles() / hz + 1) * hz);
+    CHECK_EQ(m.bus().stable_until(0x1FFF13083FDull, 1), Device::kForever);
+    CHECK_EQ(m.bus().stable_until(0x1FFF13083F8ull, 1), 0u);
+    CHECK_EQ(m.bus().stable_until(0x1000, 8), Device::kForever);
+    // The APB's tick register: a clock, counting up as read little-endian
+    // (configuration space is), whole or by halves.
+    CHECK_EQ(m.bus().stable_until(cfg(0, 1, 0, 0xB0), 8), Device::kClockLittle);
+    CHECK_EQ(m.bus().stable_until(cfg(0, 1, 0, 0xB0), 4), Device::kClockLittle);
+    CHECK_EQ(m.bus().stable_until(cfg(0, 1, 0, 0x00), 4), 0u);  // (the rest promises nothing)
+}
+
+// The M48T59 clock registers hold until the next second, unless stopped or
+// held for reading; the flags hold while no bit a read clears is set.
+TEST(m48t59_says_how_long_a_read_holds) {
+    M48t59 rtc([] { return std::time_t{1000000}; });
+    CHECK_EQ(rtc.stable_until(0x1FF9, 1), 0u);  // (no next second known)
+    rtc.set_next_second([] { return u64{1234}; });
+    CHECK_EQ(rtc.stable_until(0x1FF9, 1), 1234u);
+    CHECK_EQ(rtc.stable_until(0x0100, 8), Device::kForever);
+    rtc.write(0x1FF8, 1, 0x40);  // hold for reading
+    CHECK_EQ(rtc.stable_until(0x1FF9, 1), Device::kForever);
+    rtc.write(0x1FF8, 1, 0x00);
+    rtc.data()[0x1FF0] = 0x80;  // a watchdog flag, cleared by reading
+    CHECK_EQ(rtc.stable_until(0x1FF0, 1), 0u);
+    CHECK_EQ(rtc.stable_until(0x1FF1, 1), Device::kForever);
+}
+
+// The SAB82532 says how long a read holds: the status register always; an
+// interrupt status register not while it has bits a read would clear.
+TEST(sab82532_says_how_long_a_read_holds) {
+    Scheduler s;
+    u64 now = 0;
+    s.set_clock([&] { return now; });
+    SerialLine a, b;
+    Sab82532 se(s, a, b, Sab82532::kClockHz / 16.0);
+    CHECK_EQ(se.stable_until(0x3B, 1), Device::kForever);  // the reset XPR/ALLS, masked: a read clears nothing
+    se.write(0x3B, 1, 0xFE);                               // IMR1: XPR shown
+    CHECK_EQ(se.stable_until(0x3B, 1), 0u);
+    u64 v = 0;
+    se.read(0x3B, 1, v);
+    CHECK_EQ(se.stable_until(0x3B, 1), Device::kForever);
+    CHECK_EQ(se.stable_until(0x20, 1), Device::kForever);  // STAR
+    CHECK_EQ(se.stable_until(0x00, 1), Device::kForever);  // RFIFO, empty
 }
