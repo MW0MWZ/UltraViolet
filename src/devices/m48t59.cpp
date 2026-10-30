@@ -13,6 +13,9 @@ constexpr unsigned kFlags = 0x1FF0, kAlarmSec = 0x1FF2, kInterrupts = 0x1FF6, kW
                    kControl = 0x1FF8, kSeconds = 0x1FF9, kMinutes = 0x1FFA, kHours = 0x1FFB, kDay = 0x1FFC,
                    kDate = 0x1FFD, kMonth = 0x1FFE, kYear = 0x1FFF;
 constexpr u8 kCtlWrite = 0x80, kCtlRead = 0x40, kSecStop = 0x80;
+constexpr u8 kFlagWdf = 0x80, kFlagAf = 0x40;   // flags: watchdog and alarm (BL, bit 4, never set: a good battery)
+constexpr u8 kAfe = 0x80, kAbe = 0x20;         // interrupts: alarm flag enable, alarm in battery back-up
+constexpr u8 kWds = 0x80, kFt = 0x40;          // watchdog steering; frequency test (in the day register)
 constexpr unsigned kIdprom = 0x1FD8;
 
 u8 to_bcd(int v) { return static_cast<u8>(((v / 10) << 4) | (v % 10)); }
@@ -47,6 +50,86 @@ std::tm time_to_utc(std::time_t t) {
 
 M48t59::M48t59(std::function<std::time_t()> host_clock) : host_clock_(std::move(host_clock)) {}
 
+M48t59::~M48t59() = default;
+
+void M48t59::attach(Scheduler& scheduler, double cpu_hz) {
+    cpu_hz_ = cpu_hz;
+    alarm_timer_ = std::make_unique<Timer>(scheduler, [this] { alarm(); });
+    watchdog_timer_ = std::make_unique<Timer>(scheduler, [this] { watchdog(); });
+    schedule_alarm();
+}
+
+void M48t59::set_irq(bool on) {
+    if (on == irq_) return;
+    irq_ = on;
+    if (on_irq) on_irq(on);
+}
+
+// The next second the alarm registers match, as their repeat bits (RPT4-1,
+// bit 7 of the date, hours, minutes and seconds registers) select: every
+// second (1111, and any combination not listed), once a minute (1110: the
+// seconds match), an hour (1100), a day (1000) or a month (0000: the date
+// too).
+void M48t59::schedule_alarm() {
+    if (!alarm_timer_) return;
+    alarm_timer_->cancel();
+    if (stopped_ || !next_second_) return;
+    const unsigned rpt = (mem_[0x1FF5] >> 7) << 3 | (mem_[0x1FF4] >> 7) << 2 | (mem_[0x1FF3] >> 7) << 1 | (mem_[0x1FF2] >> 7);
+    const int sec = from_bcd(mem_[0x1FF2] & 0x7F), min = from_bcd(mem_[0x1FF3] & 0x7F),
+              hour = from_bcd(mem_[0x1FF4] & 0x3F), date = from_bcd(mem_[0x1FF5] & 0x3F);
+    const std::time_t t = now();
+    std::time_t at = 0;
+    auto next_mod = [&](long long period, long long offset) {
+        long long n = t + 1, r = ((n - offset) % period + period) % period;
+        return static_cast<std::time_t>(r ? n + period - r : n);
+    };
+    switch (rpt) {
+        case 0xE: at = sec < 60 ? next_mod(60, sec) : 0; break;
+        case 0xC: at = sec < 60 && min < 60 ? next_mod(3600, min * 60 + sec) : 0; break;
+        case 0x8: at = sec < 60 && min < 60 && hour < 24 ? next_mod(86400, hour * 3600 + min * 60 + sec) : 0; break;
+        case 0x0:
+            if (sec < 60 && min < 60 && hour < 24 && date >= 1 && date <= 31) {
+                const std::time_t midnight = t - ((t % 86400) + 86400) % 86400;
+                for (int d = 0; d < 62 && !at; ++d) {
+                    const std::time_t c = midnight + d * 86400LL + hour * 3600 + min * 60 + sec;
+                    if (c > t && time_to_utc(c).tm_mday == date) at = c;
+                }
+            }
+            break;
+        default: at = t + 1; break;
+    }
+    if (!at) return;  // no time matches
+    alarm_timer_->schedule_at(next_second_() + static_cast<u64>((at - t - 1) * cpu_hz_));
+}
+
+void M48t59::alarm() {
+    mem_[kFlags] |= kFlagAf;
+    if (mem_[kInterrupts] & kAfe) set_irq(true);
+    schedule_alarm();
+}
+
+// Writing the watchdog register starts its count again; zero stops it.
+void M48t59::restart_watchdog() {
+    if (!watchdog_timer_) return;
+    watchdog_timer_->cancel();
+    static constexpr double kResolution[4] = {1.0 / 16, 1.0 / 4, 1.0, 4.0};
+    const u8 w = mem_[kWatchdog];
+    const unsigned multiplier = (w >> 2) & 31;
+    if (multiplier) watchdog_timer_->schedule_in(static_cast<u64>(multiplier * kResolution[w & 3] * cpu_hz_) + 1);
+}
+
+void M48t59::watchdog() {
+    mem_[kFlags] |= kFlagWdf;
+    if (mem_[kWatchdog] & kWds) {
+        mem_[kWatchdog] = 0;
+        mem_[kDay] &= static_cast<u8>(~kFt);
+        mem_[kInterrupts] &= static_cast<u8>(~(kAfe | kAbe));
+        if (on_watchdog_reset) on_watchdog_reset();
+    } else {
+        set_irq(true);
+    }
+}
+
 std::time_t M48t59::now() const {
     if (stopped_) return stopped_at_;
     return (host_clock_ ? host_clock_() : std::time(nullptr)) + offset_;
@@ -74,7 +157,12 @@ void M48t59::latch_clock() {
 u8 M48t59::read_byte(unsigned addr) {
     if (addr >= kSeconds && !(mem_[kControl] & (kCtlRead | kCtlWrite))) latch_clock();
     const u8 v = mem_[addr];
-    if (addr == kFlags) mem_[kFlags] &= 0x3F;  // the watchdog and alarm flags clear on read
+    if (addr == kFlags) {
+        // The watchdog and alarm flags, and the IRQ output, clear on a read
+        // (which still sees them set).
+        mem_[kFlags] &= static_cast<u8>(~(kFlagWdf | kFlagAf));
+        set_irq(false);
+    }
     return v;
 }
 
@@ -107,6 +195,7 @@ void M48t59::write_byte(unsigned addr, u8 v) {
                 if (stop && !stopped_) stopped_at_ = utc_to_time(tm);
                 stopped_ = stop;
                 dirty_ = true;
+                schedule_alarm();
             }
             break;
         }
@@ -123,6 +212,7 @@ void M48t59::write_byte(unsigned addr, u8 v) {
                     offset_ = static_cast<long long>(stopped_at_) - host;
                     stopped_ = false;
                 }
+                schedule_alarm();
             }
             break;
         case kDay:
@@ -137,12 +227,25 @@ void M48t59::write_byte(unsigned addr, u8 v) {
             if (mem_[kControl] & kCtlWrite) mem_[addr] = v;
             break;
         case kFlags: break;  // read-only
-        default:             // alarm, interrupt enables, watchdog
+        case kWatchdog:
             mem_[addr] = v;
-            (void)kAlarmSec;
-            (void)kInterrupts;
-            (void)kWatchdog;
+            restart_watchdog();
             break;
+        case kInterrupts:
+            mem_[addr] = v;
+            if (!(v & kAfe) && !(mem_[kFlags] & kFlagWdf)) set_irq(false);
+            break;
+        case kAlarmSec:
+        case kAlarmSec + 1:
+        case kAlarmSec + 2:
+        case kAlarmSec + 3:  // the alarm
+            mem_[addr] = v;
+            schedule_alarm();
+            break;
+        case kFlags + 1:  // unused
+            mem_[addr] = v;
+            break;
+        default: break;
     }
 }
 

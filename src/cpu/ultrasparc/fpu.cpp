@@ -25,7 +25,7 @@ namespace {
 // FSR fields
 constexpr u64 kFsrCexcMask = 0x1F, kFsrAexcShift = 5, kFsrTemShift = 23, kFsrNs = u64{1} << 22,
               kFsrFttShift = 14, kFsrFttMask = u64{7} << 14;
-constexpr unsigned kFttIeee = 1, kFttUnimplemented = 3;
+constexpr unsigned kFttIeee = 1, kFttUnfinished = 2, kFttUnimplemented = 3;
 // cexc/aexc/TEM bits
 constexpr unsigned kNv = 0x10, kOf = 0x08, kUf = 0x04, kDz = 0x02, kNx = 0x01;
 
@@ -99,10 +99,18 @@ inline T opaque(T v) {
     return v;
 }
 
-// Nonstandard mode (FSR.NS): subnormal operands are read as zero and
-// subnormal results flushed to zero.
-inline u32 ns_in32(u32 v, bool ns) { return ns && is_sub32(v) ? (v & 0x80000000) : v; }
-inline u64 ns_in64(u64 v, bool ns) { return ns && is_sub64(v) ? (v & 0x8000000000000000ull) : v; }
+// Nonstandard mode (FSR.NS): subnormal operands are read as zero (and
+// signal inexact) and subnormal results flushed to zero.
+inline u32 ns_in32(u32 v, bool ns, unsigned& exc) {
+    if (!ns || !is_sub32(v)) return v;
+    exc |= kNx;
+    return v & 0x80000000;
+}
+inline u64 ns_in64(u64 v, bool ns, unsigned& exc) {
+    if (!ns || !is_sub64(v)) return v;
+    exc |= kNx;
+    return v & 0x8000000000000000ull;
+}
 inline u32 ns_out32(u32 v, bool ns, unsigned& exc) {
     if (ns && is_sub32(v)) {
         exc |= kUf | kNx;
@@ -116,6 +124,35 @@ inline u64 ns_out64(u64 v, bool ns, unsigned& exc) {
         return v & 0x8000000000000000ull;
     }
     return v;
+}
+
+// The IIi's subnormal cases (UltraSPARC IIi User's Manual, 14.3): with
+// FSR.NS clear, the hardware leaves these to the operating system with
+// fp_exception_other (unfinished_FPop). ER is a result's biased exponent
+// before rounding, as each operation works it out.
+struct Format {
+    int bias, max_exp, deep;  // the exponent bias, the biased exponent of infinity, the ER at or below which a tiny result is the hardware's
+};
+constexpr Format kSingle{127, 255, -25}, kDouble{1023, 2047, -54};
+
+int field32(u32 v) { return static_cast<int>(v >> 23) & 0xFF; }
+int field64(u64 v) { return static_cast<int>(v >> 52) & 0x7FF; }
+bool ordinary32(u32 v) { return field32(v) != 0 && field32(v) != 0xFF; }  // normal: not zero, subnormal, infinite or NaN
+bool ordinary64(u64 v) { return field64(v) != 0 && field64(v) != 0x7FF; }
+
+enum class Arith { Add, Mul, Div };
+
+// FMUL or FDIV with one subnormal operand: the exact result's ER (from
+// the operands' true exponents and significands), and whether it
+// overflows.
+template <typename F>
+int exact_er(F a, F b, Arith op, const Format& f) {
+    int xa, xb;
+    const F ma = std::frexp(a, &xa), mb = std::frexp(b, &xb);  // [0.5, 1) * 2^x, subnormals too
+    const F pa = std::fabs(ma) * 2, pb = std::fabs(mb) * 2;    // [1, 2)
+    const int l = op == Arith::Mul ? (xa - 1) + (xb - 1) + (pa * pb >= 2 ? 1 : 0)
+                                   : (xa - 1) - (xb - 1) - (pa < pb ? 1 : 0);
+    return l + f.bias;
 }
 
 // Conversions to integers round toward zero. NaN and out-of-range values
@@ -153,6 +190,11 @@ unsigned compare(F a, F b) {
 
 void UltraSparc::fp_unimplemented() {
     fsr_ = (fsr_ & ~kFsrFttMask) | (u64{kFttUnimplemented} << kFsrFttShift);
+    take_trap(tt::kFpExceptionOther);
+}
+
+void UltraSparc::fp_unfinished() {
+    fsr_ = (fsr_ & ~kFsrFttMask) | (u64{kFttUnfinished} << kFsrFttShift);
     take_trap(tt::kFpExceptionOther);
 }
 
@@ -199,9 +241,51 @@ void UltraSparc::fpop1(u32 insn) {
         default: break;
     }
 
-    // Two-operand single and double arithmetic.
-    auto arith32 = [&](auto op) {
-        const u32 a = ns_in32(f_[rs1], ns), b = ns_in32(f_[rs2], ns);
+    // Two-operand single and double arithmetic. With NS clear, the cases
+    // the IIi does not finish itself (subnormal operands; results whose ER
+    // lies between the format's deep-underflow bound and 1; inexact divides
+    // that it predicts pessimistically when that trap is enabled) take
+    // unfinished_FPop.
+    const unsigned tem = static_cast<unsigned>(fsr_ >> kFsrTemShift) & 0x1F;
+    auto unfinished_operands = [&](bool sa, bool sb, Arith op, auto fa, auto fb, const Format& f) {
+        if (!sa && !sb) return false;
+        if (op == Arith::Add || (sa && sb)) return true;
+        // FMUL, FDIV with one: unless the result overflows or is deep below the subnormals.
+        if (fa == 0 || fb == 0 || std::isinf(fa) || std::isinf(fb)) return false;
+        const int er = exact_er(fa, fb, op, f);
+        return er < f.max_exp && er > f.deep;
+    };
+    // ER as the hardware forms it for ordinary operands: an add's exact
+    // result; the sum of the exponents plus one; their difference.
+    auto unfinished_result = [&](int ea, int eb, Arith op, long double exact_add, const Format& f) {
+        int er;
+        if (op == Arith::Add) {
+            if (exact_add == 0) return false;
+            er = std::ilogb(exact_add) + f.bias;
+        } else if (op == Arith::Mul) {
+            er = ea + eb - f.bias + 1;
+        } else {
+            er = ea - eb + f.bias;
+            // (an overflow it cannot tell from the exponents, when that trap is enabled)
+            if ((tem & kOf) && er == f.max_exp) return true;
+            return er > f.deep && er <= 1;
+        }
+        return er > f.deep && er < 1;
+    };
+    auto arith32 = [&](Arith kind, auto op) {
+        u32 a = f_[rs1], b = f_[rs2];
+        if (!ns && !is_nan32(a) && !is_nan32(b)) {
+            const bool sa = is_sub32(a), sb = is_sub32(b);
+            if (unfinished_operands(sa, sb, kind, f32(a), f32(b), kSingle)) return fp_unfinished();
+            if (ordinary32(a) && ordinary32(b)) {
+                if (kind == Arith::Div && (tem & kNx)) return fp_unfinished();  // inexact predicted
+                const long double exact = kind == Arith::Add ? static_cast<long double>(op(static_cast<double>(f32(a)),
+                                                                                         static_cast<double>(f32(b))))
+                                                             : 0;
+                if (unfinished_result(field32(a), field32(b), kind, exact, kSingle)) return fp_unfinished();
+            }
+        }
+        a = ns_in32(a, ns, exc), b = ns_in32(b, ns, exc);
         u32 r;
         if (is_nan32(a) || is_nan32(b)) {
             r = nan_result32(a, b, exc);
@@ -213,8 +297,19 @@ void UltraSparc::fpop1(u32 insn) {
         }
         if (fp_finish(exc)) set_f32(rd, r);
     };
-    auto arith64 = [&](auto op) {
-        const u64 a = ns_in64(freg64(rs1), ns), b = ns_in64(freg64(rs2), ns);
+    auto arith64 = [&](Arith kind, auto op) {
+        u64 a = freg64(rs1), b = freg64(rs2);
+        if (!ns && !is_nan64(a) && !is_nan64(b)) {
+            const bool sa = is_sub64(a), sb = is_sub64(b);
+            if (unfinished_operands(sa, sb, kind, f64(a), f64(b), kDouble)) return fp_unfinished();
+            if (ordinary64(a) && ordinary64(b)) {
+                if (kind == Arith::Div && (tem & kNx)) return fp_unfinished();
+                const long double exact =
+                    kind == Arith::Add ? op(static_cast<long double>(f64(a)), static_cast<long double>(f64(b))) : 0;
+                if (unfinished_result(field64(a), field64(b), kind, exact, kDouble)) return fp_unfinished();
+            }
+        }
+        a = ns_in64(a, ns, exc), b = ns_in64(b, ns, exc);
         u64 r;
         if (is_nan64(a) || is_nan64(b)) {
             r = nan_result64(a, b, exc);
@@ -226,18 +321,22 @@ void UltraSparc::fpop1(u32 insn) {
         }
         if (fp_finish(exc)) set_f64(rd, r);
     };
+    // One operand: a subnormal one is unfinished (NS clear) or zero (NS set).
+    auto sub_operand32 = [&](u32 v) { return !ns && is_sub32(v); };
+    auto sub_operand64 = [&](u64 v) { return !ns && is_sub64(v); };
 
     switch (opf) {
-        case 0x041: return arith32([](float a, float b) { return a + b; });
-        case 0x042: return arith64([](double a, double b) { return a + b; });
-        case 0x045: return arith32([](float a, float b) { return a - b; });
-        case 0x046: return arith64([](double a, double b) { return a - b; });
-        case 0x049: return arith32([](float a, float b) { return a * b; });
-        case 0x04A: return arith64([](double a, double b) { return a * b; });
-        case 0x04D: return arith32([](float a, float b) { return a / b; });
-        case 0x04E: return arith64([](double a, double b) { return a / b; });
+        case 0x041: return arith32(Arith::Add, [](auto a, auto b) { return a + b; });
+        case 0x042: return arith64(Arith::Add, [](auto a, auto b) { return a + b; });
+        case 0x045: return arith32(Arith::Add, [](auto a, auto b) { return a - b; });
+        case 0x046: return arith64(Arith::Add, [](auto a, auto b) { return a - b; });
+        case 0x049: return arith32(Arith::Mul, [](auto a, auto b) { return a * b; });
+        case 0x04A: return arith64(Arith::Mul, [](auto a, auto b) { return a * b; });
+        case 0x04D: return arith32(Arith::Div, [](auto a, auto b) { return a / b; });
+        case 0x04E: return arith64(Arith::Div, [](auto a, auto b) { return a / b; });
         case 0x069: {  // FsMULd: the exact product of two singles
-            const u32 a = ns_in32(f_[rs1], ns), b = ns_in32(f_[rs2], ns);
+            if (sub_operand32(f_[rs1]) || sub_operand32(f_[rs2])) return fp_unfinished();
+            const u32 a = ns_in32(f_[rs1], ns, exc), b = ns_in32(f_[rs2], ns, exc);
             u64 r;
             if (is_nan32(a) || is_nan32(b)) {
                 const u32 n = nan_result32(a, b, exc);
@@ -251,8 +350,10 @@ void UltraSparc::fpop1(u32 insn) {
             if (fp_finish(exc)) set_f64(rd, r);
             return;
         }
-        case 0x029: {  // FSQRTs
-            const u32 b = ns_in32(f_[rs2], ns);
+        case 0x029: {  // FSQRTs (inexact predicted pessimistically, as a divide's)
+            if (sub_operand32(f_[rs2])) return fp_unfinished();
+            if (!ns && (tem & kNx) && ordinary32(f_[rs2])) return fp_unfinished();
+            const u32 b = ns_in32(f_[rs2], ns, exc);
             u32 r;
             if (is_nan32(b)) {
                 r = nan_result32(b, b, exc);
@@ -269,7 +370,9 @@ void UltraSparc::fpop1(u32 insn) {
             return;
         }
         case 0x02A: {  // FSQRTd
-            const u64 b = ns_in64(freg64(rs2), ns);
+            if (sub_operand64(freg64(rs2))) return fp_unfinished();
+            if (!ns && (tem & kNx) && ordinary64(freg64(rs2))) return fp_unfinished();
+            const u64 b = ns_in64(freg64(rs2), ns, exc);
             u64 r;
             if (is_nan64(b)) {
                 r = nan_result64(b, b, exc);
@@ -286,22 +389,26 @@ void UltraSparc::fpop1(u32 insn) {
             return;
         }
         case 0x081: {  // FsTOx
-            const s64 v = to_int<s64>(f32(ns_in32(f_[rs2], ns)), exc);
+            if (sub_operand32(f_[rs2])) return fp_unfinished();
+            const s64 v = to_int<s64>(f32(ns_in32(f_[rs2], ns, exc)), exc);
             if (fp_finish(exc)) set_f64(rd, static_cast<u64>(v));
             return;
         }
         case 0x082: {  // FdTOx
-            const s64 v = to_int<s64>(f64(ns_in64(freg64(rs2), ns)), exc);
+            if (sub_operand64(freg64(rs2))) return fp_unfinished();
+            const s64 v = to_int<s64>(f64(ns_in64(freg64(rs2), ns, exc)), exc);
             if (fp_finish(exc)) set_f64(rd, static_cast<u64>(v));
             return;
         }
         case 0x0D1: {  // FsTOi
-            const s32 v = to_int<s32>(f32(ns_in32(f_[rs2], ns)), exc);
+            if (sub_operand32(f_[rs2])) return fp_unfinished();
+            const s32 v = to_int<s32>(f32(ns_in32(f_[rs2], ns, exc)), exc);
             if (fp_finish(exc)) set_f32(rd, static_cast<u32>(v));
             return;
         }
         case 0x0D2: {  // FdTOi
-            const s32 v = to_int<s32>(f64(ns_in64(freg64(rs2), ns)), exc);
+            if (sub_operand64(freg64(rs2))) return fp_unfinished();
+            const s32 v = to_int<s32>(f64(ns_in64(freg64(rs2), ns, exc)), exc);
             if (fp_finish(exc)) set_f32(rd, static_cast<u32>(v));
             return;
         }
@@ -330,7 +437,8 @@ void UltraSparc::fpop1(u32 insn) {
             if (fp_finish(0)) set_f64(rd, bits(static_cast<double>(static_cast<s32>(f_[rs2]))));
             return;
         case 0x0C9: {  // FsTOd
-            const u32 b = ns_in32(f_[rs2], ns);
+            if (sub_operand32(f_[rs2])) return fp_unfinished();
+            const u32 b = ns_in32(f_[rs2], ns, exc);
             u64 r;
             if (is_nan32(b)) {
                 if (is_snan32(b)) exc |= kNv;
@@ -341,8 +449,13 @@ void UltraSparc::fpop1(u32 insn) {
             if (fp_finish(exc)) set_f64(rd, r);
             return;
         }
-        case 0x0C6: {  // FdTOs
-            const u64 b = ns_in64(freg64(rs2), ns);
+        case 0x0C6: {  // FdTOs: unfinished for a subnormal operand, or a result in the subnormal window
+            if (sub_operand64(freg64(rs2))) return fp_unfinished();
+            if (!ns && ordinary64(freg64(rs2))) {
+                const int er = std::ilogb(f64(freg64(rs2))) + kSingle.bias;
+                if (er > kSingle.deep && er < 1) return fp_unfinished();
+            }
+            const u64 b = ns_in64(freg64(rs2), ns, exc);
             u32 r;
             if (is_nan64(b)) {
                 if (is_snan64(b)) exc |= kNv;

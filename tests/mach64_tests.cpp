@@ -193,6 +193,29 @@ TEST(mach64_vertical_blank_follows_the_mode) {
     CHECK(!r.irq);
 }
 
+// The chosen line's interrupt comes as the scan finishes that line: asked
+// for at the last line shown (as Solaris's driver does, to load the palette
+// in the blank), it finds vertical blank begun.
+TEST(mach64_line_interrupt_comes_at_the_end_of_the_line) {
+    Rig r;
+    r.mode_1152x900();
+    r.wr(kRegs + 0x90, (0x05u << 10) | (3u << 16) | (1u << 9));
+    r.wr(kRegs + 0x90, (0x07u << 10) | (200u << 16) | (1u << 9));
+    r.wr(kRegs + 0x90, 0);
+    const double line_s = 1528 / (2 * 14.31818e6 * 200 / 36), frame_s = line_s * 937;
+    r.now = static_cast<u64>((frame_s * 3 + line_s * 898.5) * 100e6);
+    r.wr(kRegs + 0x10, 899);   // CRTC_VLINE
+    r.wr(kRegs + 0x18, 8);     // its interrupt enabled
+    r.run(static_cast<u64>(line_s * 100e6));  // to the middle of line 899
+    CHECK(!r.irq);
+    CHECK_EQ(r.rd(kRegs + 0x18) & 0x10, 0u);
+    r.run(static_cast<u64>(line_s * 0.6 * 100e6));  // just past its end
+    CHECK(r.irq);
+    CHECK_EQ(r.rd(kRegs + 0x18) & 0x11, 0x11u);  // latched, and in the blank
+    r.wr(kRegs + 0x18, 8 | 0x10);
+    CHECK(!r.irq);
+}
+
 // Scan-out at 8 bpp through the palette and DAC mask, blank when the
 // display is off, and the cursor's colours, transparency and inversion.
 TEST(mach64_scans_out_the_frame_buffer_and_cursor) {

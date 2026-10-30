@@ -141,3 +141,22 @@ four modes: Cycle (one cycle per instruction, reproducible), Realtime (guest
 time follows the wall clock; the CPU runs as fast as the host allows),
 Max (Realtime, with disk and network I/O at the host's speed) and Free (no
 pacing, for fixed-length runs).
+
+Devices act through events on the scheduler (`src/core/scheduler.h`). The
+machine runs the CPU in slices up to the next event; an event a device
+schedules during a slice (work the CPU just gave it) that falls before the
+slice's end stops the CPU after that instruction, so every event comes when
+it is due, however the run is sliced.
+
+Idle loops are gone round at once. When a block is about to start at a
+place the CPU was at before, with every register as it was then, and nothing
+has been written since (no store, device access, internal register write or
+DMA, and no read of TICK or the performance counters), each later time
+round does the same until an interrupt, an event or DMA changes something.
+The CPU then stops there, and the machine advances it by whole times round
+the loop to just before the next event (or TICK_COMPARE), leaving it exactly
+as running them would have. The pacer counts that time as idle, so the host
+sleeps until the wall clock catches up. Solaris's idle loop is a load, a
+test and a call to an empty function, across two code pages; translated
+code may come back to the place watched only every so many times round,
+and the loop's length is the greatest common divisor of the periods found.

@@ -510,6 +510,52 @@ TEST(jit_floating_point_arithmetic_and_conversions_match_the_interpreter) {
     }, pstate::PRIV | pstate::PEF, 6000);
 }
 
+TEST(jit_unfinished_fp_cases_match_the_interpreter) {
+    // The cases the IIi leaves to the operating system (fp_exception_other,
+    // unfinished_FPop; the handler counts them in %i5 and skips them): a
+    // subnormal operand, a result in the subnormal window, a divide or
+    // square root with the inexact trap enabled. Passes run with FSR clear,
+    // NS set, NXM set and UFM set in turn, so the same instructions finish,
+    // flush or trap once translated.
+    auto ldxfsr = [](int off) { return f3i(3, 0x21, 1, o5, off); };
+    auto stxfsr = [](int off) { return f3i(3, 0x25, 1, o5, off); };
+    auto single = [](unsigned f, u32 bits) {
+        return std::vector<u32>{SETHI(g4, bits & ~0x3FFu), ORi(g4, g4, static_cast<int>(bits & 0x3FF)), STW(g4, o5, 8),
+                                LDF(f, o5, 8)};
+    };
+    std::vector<u32> body = {
+        ANDi(g2, g1, 3), MOVi(g3, 0),
+        SUBcci(g0, g2, 1), SETHI(g4, 1u << 22), MOVcc(cE, kIcc, g4, g3),  // NS
+        SUBcci(g0, g2, 2), SETHI(g4, 1u << 23), MOVcc(cE, kIcc, g4, g3),  // NXM
+        SUBcci(g0, g2, 3), SETHI(g4, 1u << 25), MOVcc(cE, kIcc, g4, g3),  // UFM
+        STX(g3, o5, 0), ldxfsr(0)};
+    for (auto v : {single(1, 0x00000003), single(2, 0x3F800000), single(3, 0x00C00000), single(4, 0x00800000),
+                   single(5, 0x1F800000), single(6, 0x40800000), single(7, 0x3F000000)})
+        body.insert(body.end(), v.begin(), v.end());
+    const std::vector<u32> ops = {
+        FPOP1(10, 1, 2, 0x041),   // subnormal + 1
+        FPOP1(11, 3, 4, 0x045),   // 1.5 * 2^-126 - 2^-126: a subnormal result
+        FPOP1(12, 5, 5, 0x049),   // 2^-64 * 2^-64
+        FPOP1(13, 4, 6, 0x04D),   // 2^-126 / 4
+        FPOP1(14, 2, 7, 0x04D),   // 1 / 0.5 (inexact predicted with NXM)
+        FPOP1(15, 2, 7, 0x049),   // 1 * 0.5
+        FPOP1(dreg(16), 0, 1, 0x0C9),  // fstod of a subnormal
+        FPOP1(18, 0, 1, 0x0D1),        // fstoi of a subnormal
+        FPOP1(19, 0, 6, 0x029),        // fsqrts 4
+        SETHI(g4, 0x37D00000), SLLXi(g4, g4, 32), STX(g4, o5, 16), LDDF(dreg(20), o5, 16),  // 2^-130
+        FPOP1(22, 0, dreg(20), 0x0C6),  // fdtos into the subnormals
+        MOVi(g4, 1), STX(g4, o5, 16), LDDF(dreg(24), o5, 16),  // the least double subnormal
+        FPOP1(dreg(26), dreg(24), dreg(24), 0x042),
+        stxfsr(24), STF(10, o5, 32), STF(11, o5, 36), STF(12, o5, 40), STF(13, o5, 44), STF(14, o5, 48),
+        STF(15, o5, 52), STDF(dreg(16), o5, 56), STF(18, o5, 64), STF(19, o5, 68), STF(22, o5, 72),
+        STDF(dreg(26), o5, 80), ADDi(o5, o5, 88)};
+    body.insert(body.end(), ops.begin(), ops.end());
+    check_against_interpreter(body, 64, [](Rig& r) {
+        r.put(Rig::kTba + (tt::kFpExceptionOther << 5), {ADDi(i5, i5, 1), DONE});
+        r.put(Rig::kTba + (tt::kFpExceptionIeee754 << 5), {ADDi(i4, i4, 1), DONE});
+    }, pstate::PRIV | pstate::PEF, 10000);
+}
+
 TEST(jit_vis_block_transfers_and_alignment_match_the_interpreter) {
     // Each pass fills a 64-byte block, block-loads it big- and little-
     // endian, block-stores it back both ways (one through the commit ASI),
@@ -1046,6 +1092,43 @@ TEST(jit_delay_loops_take_the_real_cpu_time_and_keep_tick_compare) {
     }
 }
 
+// Wherever TICK_CMPR falls in a delay loop run at once on a fast host (a
+// charge a step below the loop's), its interrupt comes: guest time that
+// moves onto or past it in one go raises TICK_INT. The loop is OpenBoot's
+// ms (a countdown in a branch's delay slot, inside a count of
+// milliseconds), translated after its first runs, run as the machine runs
+// it, 4096 steps at a go; OpenBoot's 100 Hz clock on TICK_CMPR stopped for
+// good when a translated delay ended exactly on it (as it did at these
+// charges and compares).
+TEST(jit_delay_loops_never_skip_tick_compare) {
+    for (bool jit : {true, false})
+    for (double cpi : {0.2925, 0.4075})
+    for (u64 cmpr = 30000; cmpr < 30040; ++cmpr) {
+        const std::vector<u32> code = {
+            MOVi(l0, 100), MOVi(g4, 2000),
+            ORcc(l1, l0, g0),             // +8: a millisecond's count
+            BPcc(cG, kXcc, 0), SUBcci(l1, l1, 1),
+            SUBcci(g4, g4, 1),
+            BPcc(cG, kXcc, -3), ORcc(l1, l0, g0),
+            Bicc(cA, 0), ADDi(l7, l7, 1)};
+        Rig t;
+        if (!jit) t.cpu.set_jit(false);
+        t.cpu.set_cycles_per_step(cpi);
+        t.cpu.set_delay_cycles_per_step(1.0);
+        t.cpu.set_pstate(pstate::PRIV);
+        t.exec({WRPR(prTICK, g0, g0), SETHI(g1, cmpr), ORi(g1, g1, static_cast<int>(cmpr & 0x3FF)), WRASR(23, g1, g0)});
+        t.put(Rig::kTba + (0x4E << 5), {RDPR(l5, prTICK), ADDi(l6, l6, 1), WRASRi(21, g0, 1), RETRY});
+        for (std::size_t i = 0; i < code.size(); ++i) t.bus.write(Rig::kCode + 4 * i, code[i]);
+        t.cpu.set_pstate(pstate::PRIV | pstate::IE);
+        t.cpu.set_pc(Rig::kCode);
+        const u64 i0 = t.cpu.instructions();
+        while (t.cpu.instructions() - i0 < 200000 && t.cpu.reg(l6) == 0) t.cpu.run(4096);
+        CHECK_EQ(t.cpu.reg(l6), 1u);
+        const u64 at = t.cpu.reg(l5) & ~(u64{1} << 63);
+        CHECK(at >= cmpr && at <= cmpr + 4);
+    }
+}
+
 // A delay loop run at once leaves the condition codes as its last iteration
 // would, including the overflow of a count crossing the most negative value
 // (of 32 or 64 bits) and an add's carry: a run ending right after one (a
@@ -1339,5 +1422,97 @@ TEST(jit_polling_loops_over_blocks_with_a_device_clock_match_the_interpreter) {
                                               LDXA(l3, l4, g0, asi::PHYS_BYPASS_EC_E), CMP(l3, o3), BPcc(cL, kXcc, -2), NOP,
                                               ADD(l1, l1, l3), Bicc(cA, 0), ADDi(l6, l6, 1)};
         CHECK_EQ(check_poll_against_interpreter(wrong_order, 40000, jit, 0, true, 1.0, kFlagPa + 16), 0u);
+    }
+}
+
+namespace {
+
+// An idle loop as Solaris's: a load and a test of what it loaded, and a
+// call to a function on another page that only returns. `slot` is the
+// delay slot of the test's branch and `call_slot` the call's (for loops
+// that must not count as idle). The level 14 handler (TICK_CMPR) reads
+// TICK, sets the word loaded and clears the interrupt; the loop then
+// leaves for a spin that counts in %l7. TICK_CMPR is `compare`.
+void put_idle_loop(Rig& r, u32 slot, u32 call_slot, u32 compare = 204800) {
+    constexpr u64 kFar = 0x3000;
+    r.exec({WRPR(prTICK, g0, g0), SETHI(g1, compare), WRASR(23, g1, g0), SETHI(o5, kData), MOVi(g1, 0)});
+    r.cpu.set_idle_skip(true);  // (a place the setup came to is no place the loop comes to)
+    r.put(Rig::kCode, {LDUW(g2, o5, 0), CMPi(g2, 0), Bicc(cNE, 6), slot,
+                       CALL(static_cast<int>((kFar - (Rig::kCode + 16)) / 4)), call_slot, Bicc(cA, -6), NOP,
+                       Bicc(cA, 0), ADDi(l7, l7, 1)});
+    r.put(kFar, {JMPLi(g0, o7, 8), NOP});
+    r.put(Rig::kTba + (0x4E << 5), {RDPR(l5, prTICK), MOVi(l4, 1), STW(l4, o5, 0), WRASRi(21, g0, 1), RETRY});
+    r.cpu.set_pstate(pstate::PRIV | pstate::PEF | pstate::IE);
+    r.cpu.set_pc(Rig::kCode);
+}
+
+// Runs as the machine does: slices of up to 4096, and an idle loop gone
+// round at once (to guest time `until` steps on, ~0: no limit), within
+// `n` instructions in all. Returns the instructions skipped.
+u64 run_skipping(Rig& r, u64 n, u64 until) {
+    const u64 end = r.cpu.instructions() + n;
+    while (r.cpu.instructions() < end && !r.cpu.halted()) {
+        r.cpu.run(std::min<u64>(end - r.cpu.instructions(), 4096));
+        if (r.cpu.idle_period())
+            r.cpu.skip_idle(until == ~u64{0} ? until : r.cpu.cycles() + until, end - std::min(end, r.cpu.instructions()));
+    }
+    return r.cpu.idle_instructions();
+}
+
+}  // namespace
+
+// An idle loop gone round at once ends exactly where stepping it does: the
+// interrupt that ends it taken at the same step (the handler reads TICK),
+// at every charge per step, through translated code and decoded blocks.
+TEST(idle_loops_run_at_once_match_the_interpreter) {
+    for (double cpi : {1.0, 0.25, 3.0})
+    for (bool jit : {true, false})
+    for (u64 until : {~u64{0}, u64{5000}}) {
+        constexpr u64 kRun = 600000, kIdle = 300000;  // (steps idle before the interrupt)
+        Rig r, ref;
+        ref.cpu.set_block_cache(false);
+        if (!jit) r.cpu.set_jit(false);
+        for (Rig* x : {&r, &ref}) {
+            x->cpu.set_cycles_per_step(cpi);
+            put_idle_loop(*x, NOP, NOP, static_cast<u32>(kIdle * cpi) & ~0x3FFu);
+        }
+        const u64 skipped = run_skipping(r, kRun, until);
+        run_skipping(ref, kRun, until);
+        if (until == ~u64{0}) CHECK(skipped > kIdle / 2);
+        else CHECK(skipped > 0);
+        CHECK(r.cpu.idle_cycles() > 0);
+        CHECK_EQ(r.cpu.instructions(), ref.cpu.instructions());
+        CHECK_EQ(r.cpu.steps(), ref.cpu.steps());
+        CHECK_EQ(r.cpu.cycles(), ref.cpu.cycles());
+        CHECK(r.cpu.reg(l5) == ref.cpu.reg(l5) && r.cpu.reg(l5) != 0);  // (TICK as the interrupt was taken)
+        CHECK(r.cpu.reg(l7) > 0);
+        check_same(state_of(r), state_of(ref));
+    }
+}
+
+// Loops that store, or read TICK, are not idle however the registers come
+// round: none of them is gone round at once. Nor is any loop with idle
+// skipping off.
+TEST(idle_loops_that_store_or_read_tick_are_not_skipped) {
+    struct Loop {
+        u32 slot, call_slot;
+        bool skip_on;
+    };
+    const Loop loops[] = {{STW(g0, o5, 8), NOP, true},          // the same value each time round
+                          {RDPR(g3, prTICK), MOVi(g3, 0), true},  // TICK read, then dropped
+                          {RDASR(g3, 4), MOVi(g3, 0), true},
+                          {NOP, NOP, false}};
+    for (const Loop& l : loops)
+    for (bool jit : {true, false}) {
+        constexpr u64 kRun = 200000;
+        Rig r, ref;
+        ref.cpu.set_block_cache(false);
+        if (!jit) r.cpu.set_jit(false);
+        for (Rig* x : {&r, &ref}) put_idle_loop(*x, l.slot, l.call_slot);
+        r.cpu.set_idle_skip(l.skip_on);
+        CHECK_EQ(run_skipping(r, kRun, ~u64{0}), 0u);
+        run_skipping(ref, kRun, ~u64{0});
+        CHECK_EQ(r.cpu.cycles(), ref.cpu.cycles());
+        check_same(state_of(r), state_of(ref));
     }
 }

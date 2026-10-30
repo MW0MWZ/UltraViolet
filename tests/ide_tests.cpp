@@ -353,3 +353,34 @@ TEST(ata_absent_device_reads_zero_in_every_register) {
     CHECK_EQ(r.reg(6), 0xA0u);
     CHECK_EQ(r.ch.read_control(2) & 0xC0, 0x40u);  // ready, not busy
 }
+
+// Fast: a 64 KiB READ DMA completes in about 70 us instead of the
+// controller's 16.6 MB/s (about 4 ms), and the command is acted on within
+// 2 us instead of 20; the same data, status and interrupt, in the same
+// order.
+TEST(ata_fast_disk_shortens_the_delays_not_the_sequence) {
+    DiskImage img;
+    CHECK(img.open(make_image("uv-ata-fast.img", 256, 512), false));
+    auto read_time = [&](bool fast) {
+        Rig r;  // (1 MHz: a cycle a microsecond)
+        AtaDisk disk(r.sched, 1e6, img);
+        r.ch.attach(0, &disk);
+        disk.set_fast(fast);
+        r.ch.set_fast(fast);
+        r.prd(0x10000, 0x10000);
+        r.lba28(0, 128);
+        r.reg(7, 0xC8);
+        CHECK(r.ch.read_control(2) & ata::kBsy);  // busy straight after the command either way
+        r.ch.bm_write(0, 0x09);
+        u64 t = 0;
+        while (!r.irq && t < 100000) r.run(1), ++t;
+        CHECK(r.irq);
+        CHECK_EQ(r.ch.bm_read(2) & 0x07, 0x04u);
+        CHECK_EQ(r.mem[0x10003], 0u);  // sector 0's own number (make_image's fill)
+        CHECK_EQ(r.mem[0x10000 + 127 * 512 + 3], 127u);
+        return t;
+    };
+    const u64 slow = read_time(false), fast = read_time(true);
+    CHECK(slow > 3900);  // 65536 bytes at 16.6 MB/s, and 20 us
+    CHECK(fast < 100);
+}

@@ -26,8 +26,10 @@ void Timer::cancel() {
 void Scheduler::insert(Timer* t) {
     auto it = std::upper_bound(queue_.begin(), queue_.end(), t,
                                [](const Timer* a, const Timer* b) { return a->when_ < b->when_; });
+    const u64 before = next_;
     queue_.insert(it, t);
     update_next();
+    if (next_ < before && on_earlier_) on_earlier_();
 }
 
 void Scheduler::remove(Timer* t) {

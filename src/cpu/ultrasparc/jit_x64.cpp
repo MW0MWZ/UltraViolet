@@ -1189,6 +1189,7 @@ bool UltraSparc::jit_compile(Block& b) {
         e.test8_imm(Mem{rdx, table + 24}, perm);
         slow.push_back(e.jcc(Cond::E));
         if (writes) {
+            e.alu_imm(Alu::Add, at(effects_), 1);  // (see idle_visit)
             e.mov(rcx, Mem{rdx, table + 16});
             e.movzx16(r8, Mem{rcx, 0});  // both halves' code flags
             e.test32(r8, r8);
@@ -1624,7 +1625,11 @@ bool UltraSparc::jit_compile(Block& b) {
     // exceptions they raise accrued in FSR (an invalid result is SPARC's
     // default NaN). An exception whose trap is enabled, an invalid
     // conversion to an integer, a NaN operand, and nonstandard mode (FSR.NS)
-    // go to execute(). False if not done here.
+    // go to execute(); so do the cases the IIi leaves unfinished to the
+    // operating system or may: a subnormal operand, a result whose
+    // exponent field is 0 or 1 or that underflowed, and a divide or square
+    // root while the inexact (or for a divide, overflow) trap is enabled.
+    // False if not done here.
     auto fp_arith = [&](unsigned i, u32 insn) -> bool {
         const unsigned op3 = (insn >> 19) & 0x3F, rd = (insn >> 25) & 31, rs1 = (insn >> 14) & 31, rs2 = insn & 31;
         const unsigned opf = (insn >> 5) & 0x1FF;
@@ -1656,6 +1661,35 @@ bool UltraSparc::jit_compile(Block& b) {
         fp_check(slow);
         e.test8_imm(fsr_byte2, 0x40);
         slow.push_back(e.jcc(Cond::Ne));
+        const bool divide = opf == 0x04D || opf == 0x04E, root = opf == 0x029 || opf == 0x02A;
+        if (divide || root) {
+            e.test8_imm(fsr_byte2, 0x80);  // TEM.NX (bit 23)
+            slow.push_back(e.jcc(Cond::Ne));
+            if (divide) {
+                e.test8_imm(Mem{kCpu, at(fsr_).disp + 3}, 0x04);  // TEM.OF (bit 26)
+                slow.push_back(e.jcc(Cond::Ne));
+            }
+        }
+        // A subnormal operand: the exponent field 0 and the fraction not.
+        auto subnormal = [&](unsigned r) {
+            if (src == T::F32) {
+                e.mov(rcx, freg(r), false);
+                e.alu_imm(Alu::And, rcx, 0x7FFFFFFF, false);
+                e.alu_imm(Alu::Sub, rcx, 1, false);
+                e.alu_imm(Alu::Cmp, rcx, 0x007FFFFF, false);
+            } else {
+                load_double(rcx, r);
+                e.shift_imm(Shift::Shl, rcx, 1, true);
+                e.alu_imm(Alu::Sub, rcx, 1);
+                e.mov_imm64(rdx, 0x001FFFFFFFFFFFFFull);
+                e.alu(Alu::Cmp, rcx, rdx);
+            }
+            slow.push_back(e.jcc(Cond::B));
+        };
+        if (src == T::F32 || src == T::F64) {
+            subnormal(rs2);
+            if (two) subnormal(rs1);
+        }
         auto load = [&](unsigned x, unsigned r) {
             if (src == T::F32) e.movd_load(x, freg(r));
             else load_double(rax, r), e.movq_to_xmm(x, rax);
@@ -1707,6 +1741,25 @@ bool UltraSparc::jit_compile(Block& b) {
         if (to_int) {  // (an invalid conversion's result is not the host's)
             e.test_imm(rcx, 1);
             slow.push_back(e.jcc(Cond::Ne));
+        }
+        // A result that may be in the subnormal window: underflowed, or an
+        // exponent field of 0 or 1 but not zero.
+        const bool tiny = (opf >= 0x041 && opf <= 0x04E) || opf == 0x0C6;
+        if (tiny) {
+            e.test_imm(rcx, 0x10);  // UE
+            slow.push_back(e.jcc(Cond::Ne));
+            e.movq_from_xmm(r8, 0);
+            if (dst == T::F32) {
+                e.alu_imm(Alu::And, r8, 0x7FFFFFFF, false);
+                e.alu_imm(Alu::Sub, r8, 1, false);
+                e.alu_imm(Alu::Cmp, r8, 0x00FFFFFF, false);
+            } else {
+                e.shift_imm(Shift::Shl, r8, 1, true);
+                e.alu_imm(Alu::Sub, r8, 1);
+                e.mov_imm64(r10, 0x003FFFFFFFFFFFFFull);
+                e.alu(Alu::Cmp, r8, r10);
+            }
+            slow.push_back(e.jcc(Cond::B));
         }
         // r9 = the exceptions as cexc bits; to execute() if any traps.
         e.alu_imm(Alu::And, rcx, 0x3F, false);
@@ -1798,6 +1851,7 @@ bool UltraSparc::jit_compile(Block& b) {
         if ((op3 == 0x2A || op3 == 0x28) && rs1 == 4 && (fmode == 1 || fmode == 2)) {  // RDPR, RD %tick
             self = false;  // (TICK follows cycles_, which the check mode does not)
             if (rd == 0) return true;
+            e.alu_imm(Alu::Add, at(effects_), 1);
             tick_time(i);
             e.alu(Alu::Add, rax, at(tick_offset_));
             e.shift_imm(Shift::Shl, rax, 1, true);  // bits 62:0
@@ -1844,6 +1898,7 @@ bool UltraSparc::jit_compile(Block& b) {
             e.cmp8_imm(at(tick_npt_), 0);
             const std::size_t npt = e.jcc(Cond::Ne);
             if (rd) {
+                e.alu_imm(Alu::Add, at(effects_), 1);
                 tick_time(i);
                 e.alu(Alu::Add, rax, at(tick_offset_));
                 e.shift_imm(Shift::Shl, rax, 1, true);  // bits 62:0 (NPT clear)
@@ -1888,13 +1943,12 @@ bool UltraSparc::jit_compile(Block& b) {
                     mask(rax);
                     break;
                 case 6: e.movzx8(rax, at(fprs_)); break;
-                case 16:  // PCR, PIC, DCR, SOFTINT, TICK_CMPR: privileged here
-                case 17:
+                case 16:  // PCR, DCR, SOFTINT, TICK_CMPR: privileged here (PIC, which counts, through execute())
                 case 18:
                 case 22:
                 case 23: {
                     if (!priv) return false;
-                    const u64& r = rs1 == 16 ? pcr_ : rs1 == 17 ? pic_ : rs1 == 18 ? dcr_ : rs1 == 22 ? softint_ : tick_cmpr_;
+                    const u64& r = rs1 == 16 ? pcr_ : rs1 == 18 ? dcr_ : rs1 == 22 ? softint_ : tick_cmpr_;
                     e.mov(rax, at(r));
                     break;
                 }
@@ -1903,8 +1957,9 @@ bool UltraSparc::jit_compile(Block& b) {
             store_reg(rd, rax);
             return true;
         }
-        // WR %y, %ccr, %asi, %fprs, and in privileged code %pcr, %pic, %dcr: rs1 xor operand 2
-        if (op3 == 0x30 && (rd == 0 || rd == 2 || rd == 3 || rd == 6 || (priv && rd >= 16 && rd <= 18))) {
+        // WR %y, %ccr, %asi, %fprs: rs1 xor operand 2 (%pcr, %pic and %dcr,
+        // which count or keep only their fields, through execute())
+        if (op3 == 0x30 && (rd == 0 || rd == 2 || rd == 3 || rd == 6)) {
             load_reg(rax, rs1);
             load_op2(rcx, insn);
             e.alu(Alu::Xor, rax, rcx);
@@ -1914,8 +1969,6 @@ bool UltraSparc::jit_compile(Block& b) {
             } else if (rd == 6) {
                 e.alu_imm(Alu::And, rax, 7, false);
                 e.mov8(at(fprs_), rax);
-            } else if (rd >= 16) {
-                e.mov(at(rd == 16 ? pcr_ : rd == 17 ? pic_ : dcr_), rax);
             } else {
                 e.mov8(rd == 2 ? m_ccr : at(asi_), rax);
             }

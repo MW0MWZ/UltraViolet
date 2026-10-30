@@ -52,6 +52,11 @@ public:
     // signature in the task file.
     void hard_reset();
 
+    // Fast: the device acts on commands and packets within a couple of
+    // microseconds instead of a real drive's delays (an emulator's choice,
+    // not a real device's).
+    void set_fast(bool fast) { fast_ = fast; }
+
 protected:
     friend class AtaChannel;
 
@@ -105,6 +110,7 @@ protected:
 
     Scheduler& sched_;
     double cpu_hz_;
+    bool fast_ = false;
     AtaChannel* channel_ = nullptr;
     unsigned unit_ = 0;
 
@@ -174,8 +180,10 @@ public:
         dma_read_ = std::move(read);
         dma_write_ = std::move(write);
     }
-    // Bus-master transfer rate (bytes per second), for timing.
+    // Bus-master transfer rate (bytes per second), for timing; fast: about
+    // a gigabyte a second whatever the mode (an emulator's choice).
     void set_dma_rate(double bytes_per_second) { dma_rate_ = bytes_per_second; }
+    void set_fast(bool fast) { fast_ = fast; }
 
 private:
     friend class AtaDevice;
@@ -187,6 +195,7 @@ private:
     void execute_diagnostic();
 
     double cpu_hz_;
+    bool fast_ = false;
     std::array<AtaDevice*, 2> dev_{};
     unsigned select_ = 0;
     u8 control_ = 0;

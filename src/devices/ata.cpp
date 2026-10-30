@@ -18,6 +18,10 @@ constexpr double kCommandUs = 20.0;  // from the command write to the device act
 constexpr double kBlockUs = 5.0;     // between PIO blocks
 constexpr double kResetUs = 50.0;    // a software reset or diagnostic, as far as the guest sees
 constexpr unsigned kMaxMultiple = 16;
+// Fast devices: commands, packets and resets acted on within this, and DMA
+// at this rate.
+constexpr double kFastUs = 2.0;
+constexpr double kFastDmaRate = 1e9;
 
 void put16(u8* b, unsigned word, u16 v) {
     b[2 * word] = static_cast<u8>(v);
@@ -123,6 +127,7 @@ void AtaDevice::after(double us, std::function<void()> fn) {
     phase_ = Phase::Busy;
     status_ = kBsy;
     next_ = std::move(fn);
+    if (fast_) us = std::min(us, kFastUs);
     timer_.schedule_in(static_cast<u64>(us * cpu_hz_ / 1e6) + 1);
 }
 
@@ -432,7 +437,7 @@ void AtaChannel::bm_write(unsigned reg, u8 value) {
 void AtaChannel::dma_request() {
     const AtaDevice* d = selected();
     if (!(bm_status_ & 1) || !d || !d->dma_pending() || bm_timer_.active()) return;
-    const double cycles = static_cast<double>(d->dma_remaining()) * cpu_hz_ / dma_rate_;
+    const double cycles = static_cast<double>(d->dma_remaining()) * cpu_hz_ / (fast_ ? kFastDmaRate : dma_rate_);
     bm_timer_.schedule_in(static_cast<u64>(cycles) + 1);
 }
 

@@ -3,7 +3,8 @@
 // UltraViolet front end. Started with no arguments it opens the window with
 // the machine powered off and the saved settings; with arguments it powers
 // on at once. With --headless (or without SDL3) the first serial port
-// (ttya) is this terminal and the console; Ctrl-] then q quits.
+// (ttya) is this terminal and the console; Ctrl-] then q quits, and ~# at
+// the start of a line sends a BREAK.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -34,6 +35,8 @@
 #include <poll.h>
 #include <termios.h>
 #include <unistd.h>
+#else
+#include <windows.h>
 #endif
 
 #ifndef UV_VERSION
@@ -75,7 +78,7 @@ void usage() {
         "                   window; the default) or ttya (no keyboard: OpenBoot and Solaris\n"
         "                   take the first serial port; the default with --headless)\n"
         "  --keyboard ID    the keyboard's layout: us (default), uk or a number\n"
-        "  --mac ADDR       Ethernet address for a new NVRAM (default 08:00:20:55:56:01)\n",
+        "  --mac ADDR       Ethernet address for a new NVRAM (default: a random Sun address)\n",
         UV_VERSION);
     // Only the network connections this build and host can make.
     const bool user = net::slirp_available(), tap = net::tap_available();
@@ -99,6 +102,10 @@ void usage() {
                "                   cycle an instruction, no waiting)\n"
                "  --no-jit         run decoded blocks without translating them to host code\n"
                "  --no-block-cache interpret every instruction individually (for comparison)\n"
+               "  --no-idle-skip   run the guest's idle loops instruction by instruction\n"
+               "                   (default: at once, to the next event, the host asleep)\n"
+               "  --no-fast-disk   the IDE drives with a real drive's delays and DMA at the\n"
+               "                   controller's rate (default: at once, at host speed)\n"
                "  --headless       no window: ttya is this terminal\n"
                "  --foreground     keep the window's messages on this terminal (the window otherwise\n"
                "                   runs in the background, writing them to ultraviolet.log)\n"
@@ -106,7 +113,7 @@ void usage() {
                "  --max N          stop after N instructions; implies --headless\n"
                "  --trace          disassemble every instruction to stderr; implies --headless\n"
                "  --log LEVEL      trace, debug, info, warn, error or off (default warn)\n"
-               "At the terminal console, Ctrl-] then q quits.\n",
+               "At the terminal console, Ctrl-] then q quits; ~# at the start of a line sends a BREAK.\n",
                stdout);
 }
 
@@ -126,11 +133,32 @@ void raw_terminal() {
     g_raw = true;
     std::atexit(restore_terminal);
 }
+#else
+// The Windows console: keys as they are typed (VT sequences for the arrow
+// and other keys), and VT sequences understood on output.
+DWORD g_saved_in_mode = 0, g_saved_out_mode = 0;
+bool g_console_in = false, g_console_out = false;
+void restore_terminal() {
+    if (g_console_in) SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), g_saved_in_mode);
+    if (g_console_out) SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), g_saved_out_mode);
+    g_console_in = g_console_out = false;
+}
+void raw_terminal() {
+    const HANDLE in = GetStdHandle(STD_INPUT_HANDLE), out = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (GetConsoleMode(in, &g_saved_in_mode)) {
+        g_console_in = SetConsoleMode(in, ENABLE_VIRTUAL_TERMINAL_INPUT);
+    }
+    if (GetConsoleMode(out, &g_saved_out_mode)) {
+        g_console_out = SetConsoleMode(out, g_saved_out_mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    }
+    std::atexit(restore_terminal);
+}
 #endif
 
 // ttya on this terminal: what the machine sends is printed; what is typed
 // goes to it (read on a thread of its own, handed over between slices).
-// Ctrl-] then q quits.
+// Ctrl-] then q quits; ~# at the start of a line sends a BREAK (as Sun's
+// tip does; ~~ sends a ~).
 int run_headless(app::Session& session, u64 max, bool trace) {
     Ultra5_10& m = *session.machine();
     session.set_serial_output([](unsigned port, u8 b) {
@@ -147,35 +175,75 @@ int run_headless(app::Session& session, u64 max, bool trace) {
         };
     }
     std::mutex in_mutex;
-    std::string input;
+    std::vector<int> input;  // bytes, and kBreak
+    constexpr int kBreak = -1;
     std::atomic<bool> quit{false};
-#if !defined(_WIN32)
+    // A byte typed: Ctrl-] then q quits (false); ~# at the start of a line
+    // is a BREAK.
+    bool escape = false, line_start = true, tilde = false;
+    auto take = [&](u8 b) {
+        if (escape) {
+            escape = false;
+            if (b == 'q' || b == 'Q') {
+                quit = true;
+                return false;
+            }
+        } else if (b == 0x1D) {  // Ctrl-]
+            escape = true;
+            return true;
+        }
+        std::lock_guard<std::mutex> lock(in_mutex);
+        if (tilde) {
+            tilde = false;
+            if (b == '#') {
+                input.push_back(kBreak);
+                return true;
+            }
+            if (b != '~') input.push_back('~');
+        } else if (line_start && b == '~') {
+            tilde = true;
+            return true;
+        }
+        line_start = b == '\r' || b == '\n';
+        input.push_back(b);
+        return true;
+    };
     raw_terminal();
+#if !defined(_WIN32)
     std::thread reader([&] {
-        bool escape = false;
         while (!quit) {
             pollfd p{STDIN_FILENO, POLLIN, 0};
             if (poll(&p, 1, 100) <= 0) continue;
             u8 b;
-            if (::read(STDIN_FILENO, &b, 1) != 1) break;
-            if (escape) {
-                escape = false;
-                if (b == 'q' || b == 'Q') {
-                    quit = true;
-                    break;
-                }
-            } else if (b == 0x1D) {  // Ctrl-]
-                escape = true;
+            if (::read(STDIN_FILENO, &b, 1) != 1 || !take(b)) break;
+        }
+    });
+#else
+    std::thread reader([&] {
+        const HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+        while (!quit) {
+            if (!g_console_in) {  // a pipe or file: read as it comes
+                u8 b;
+                DWORD n = 0;
+                if (!ReadFile(in, &b, 1, &n, nullptr) || n != 1 || !take(b)) break;
                 continue;
             }
-            std::lock_guard<std::mutex> lock(in_mutex);
-            input.push_back(static_cast<char>(b));
+            if (WaitForSingleObject(in, 100) != WAIT_OBJECT_0) continue;
+            INPUT_RECORD rec[16];
+            DWORD n = 0;
+            if (!ReadConsoleInputW(in, rec, 16, &n)) break;
+            for (DWORD i = 0; i < n; ++i) {
+                const KEY_EVENT_RECORD& k = rec[i].Event.KeyEvent;
+                if (rec[i].EventType != KEY_EVENT || !k.bKeyDown || k.uChar.UnicodeChar == 0) continue;
+                for (WORD r = 0; r < std::max<WORD>(k.wRepeatCount, 1); ++r)
+                    if (k.uChar.UnicodeChar < 0x80 && !take(static_cast<u8>(k.uChar.UnicodeChar))) return;
+            }
         }
     });
 #endif
     u64 done = 0;
     auto next_periodic = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-    while (!quit && !g_interrupted && done < max && session.stopped().empty()) {
+    while (!quit && !g_interrupted && done < max && session.stopped().empty() && !session.switched_off()) {
         if (g_next_disc) {
             g_next_disc = 0;
             session.next_disc();
@@ -185,7 +253,17 @@ int run_headless(app::Session& session, u64 max, bool trace) {
         done += slice;
         {
             std::lock_guard<std::mutex> lock(in_mutex);
-            session.serial_input(0, input);
+            std::string bytes;
+            for (int c : input) {
+                if (c != kBreak) {
+                    bytes.push_back(static_cast<char>(c));
+                    continue;
+                }
+                session.serial_input(0, bytes);
+                bytes.clear();
+                session.serial_break(0);
+            }
+            session.serial_input(0, bytes);
             input.clear();
         }
         if (const auto now = std::chrono::steady_clock::now(); now >= next_periodic) {
@@ -194,10 +272,14 @@ int run_headless(app::Session& session, u64 max, bool trace) {
         }
     }
     quit = true;
-#if !defined(_WIN32)
+#if defined(_WIN32)
+    if (!g_console_in) reader.detach();  // (blocked reading a pipe)
+    else reader.join();
+#else
     reader.join();
-    restore_terminal();
 #endif
+    restore_terminal();
+    if (session.switched_off()) std::fprintf(stderr, "\r\nThe system switched itself off.\r\n");
     if (const std::string why = session.stopped(); !why.empty())
         std::fprintf(stderr, "\r\nCPU stopped: %s at %016llx\r\n", why.c_str(),
                      static_cast<unsigned long long>(m.cpu().pc()));
@@ -245,7 +327,8 @@ int main(int argc, char** argv) {
             const char* flag;
             const char* key;
             const char* value;
-        } kSwitches[] = {{"--no-jit", "jit", "0"}, {"--no-block-cache", "block_cache", "0"}};
+        } kSwitches[] = {{"--no-jit", "jit", "0"}, {"--no-block-cache", "block_cache", "0"},
+                         {"--no-idle-skip", "idle_skip", "0"}, {"--no-fast-disk", "fast_disk", "0"}};
         std::string key, value, error;
         for (const auto& v : kValued)
             if (!std::strcmp(a, v.flag)) key = v.key, value = next();

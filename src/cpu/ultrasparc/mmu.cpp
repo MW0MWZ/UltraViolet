@@ -11,6 +11,10 @@ namespace uv::usparc {
 namespace {
 
 constexpr u64 kLsuIm = 1u << 2, kLsuDm = 1u << 3;  // LSU control: I- and D-MMU enables
+// LSU control: the VA watchpoint on writes and reads, the PA watchpoint on
+// writes and reads; their byte masks are bits 32:25 (VA) and 40:33 (PA).
+constexpr u64 kLsuVw = 1u << 21, kLsuVr = 1u << 22, kLsuPw = 1u << 23, kLsuPr = 1u << 24;
+constexpr u64 kLsuWatch = kLsuVw | kLsuVr | kLsuPw | kLsuPr;
 
 // Fault type bits in the synchronous fault status registers.
 constexpr unsigned kFtPrivilege = 0x01, kFtSideEffect = 0x02, kFtAtomicUncacheable = 0x04, kFtIllegalAsi = 0x08,
@@ -192,14 +196,37 @@ bool UltraSparc::translate_fetch(u64 va, u64& pa) {
     return true;
 }
 
+// Whether an access of `size` bytes (the first eight of a larger one) at
+// `addr` reads or writes a byte the VA or PA watchpoint watches: the
+// watchpoint's doubleword, and a byte its mask selects (bit n the byte at
+// offset n).
+bool UltraSparc::watched(u64 addr, unsigned size, AccessKind kind, bool pa) const {
+    const bool reads = kind != AccessKind::Store, writes = kind == AccessKind::Store || kind == AccessKind::Atomic;
+    const u64 l = lsu_control_;
+    const bool on = pa ? (reads && (l & kLsuPr)) || (writes && (l & kLsuPw))
+                       : (reads && (l & kLsuVr)) || (writes && (l & kLsuVw));
+    if (!on || size == 0 || (addr & ~u64{7}) != (pa ? pa_watch_ : va_watch_)) return false;
+    const unsigned mask = static_cast<unsigned>(l >> (pa ? 33 : 25)) & 0xFF;
+    const unsigned n = std::min(size, 8u);
+    return mask & (((1u << n) - 1) << (addr & 7));
+}
+
+bool UltraSparc::watch_armed() const { return lsu_control_ & kLsuWatch; }
+
+// `size` 0: an access the watchpoints do not look at (a block transfer's
+// doublewords after its first).
 bool UltraSparc::translate_data(u64 va, u8 a, AccessKind kind, unsigned size, Access& out) {
-    (void)size;
     out.little = asi_is_little(a);
     const bool write = kind != AccessKind::Load;
+    const bool armed = watch_armed();
     if (a == asi::PHYS_USE_EC || a == asi::PHYS_BYPASS_EC_E || a == asi::PHYS_USE_EC_L ||
         a == asi::PHYS_BYPASS_EC_E_L) {
         out.pa = va & Bus::kAddressMask;
         out.side_effect = a == asi::PHYS_BYPASS_EC_E || a == asi::PHYS_BYPASS_EC_E_L;
+        if (armed && watched(out.pa, size, kind, true)) {
+            take_trap(tt::kPaWatchpoint);
+            return false;
+        }
         return true;
     }
     unsigned context, ct;
@@ -244,7 +271,15 @@ bool UltraSparc::translate_data(u64 va, u8 a, AccessKind kind, unsigned size, Ac
     if (!(lsu_control_ & kLsuDm)) {
         out.pa = va & Bus::kAddressMask;
         out.side_effect = (out.pa >> 40) & 1;  // I/O space is uncached, with side effects
+        if (armed && watched(out.pa, size, kind, true)) {  // (no VA watchpoint without the D-MMU)
+            take_trap(tt::kPaWatchpoint);
+            return false;
+        }
         return true;
+    }
+    if (armed && watched(va, size, kind, false)) {  // before the MMU's own traps
+        take_trap(tt::kVaWatchpoint);
+        return false;
     }
     if (!va_in_range(va)) {
         data_fault(tt::kDataAccessException, va, a, ct, context, kFtVaRange, write);
@@ -281,6 +316,10 @@ bool UltraSparc::translate_data(u64 va, u8 a, AccessKind kind, unsigned size, Ac
     out.pa = ((d & tte::kPaMask) & ~offset_mask) | (va & offset_mask);
     out.side_effect = d & tte::E;
     if (d & tte::IE) out.little = !out.little;
+    if (armed && watched(out.pa, size, kind, true)) {
+        take_trap(tt::kPaWatchpoint);
+        return false;
+    }
     return true;
 }
 
@@ -323,6 +362,7 @@ bool UltraSparc::phys_read(const Access& acc, unsigned size, u64& value) {
 }
 
 bool UltraSparc::phys_write(const Access& acc, unsigned size, u64 value) {
+    ++effects_;
     if (acc.little) value = swap_size(value, size);
     switch (size) {
         case 1: return bus_.write(acc.pa, static_cast<u8>(value));
@@ -381,6 +421,7 @@ bool UltraSparc::store(u64 va, u8 a, unsigned size, u64 value) {
 // An atomic access that translated also passed the store checks, on a
 // cacheable page.
 void UltraSparc::fast_fill(u64 va, u8 a, const Access& acc, AccessKind kind) {
+    if (watch_armed()) return;  // every access is looked at while a watchpoint is on
     const int mode = fast_class(a);
     if (mode < 0 || acc.little != asi_is_little(a)) return;  // (TTE.IE)
     constexpr u64 kPage = 0x1FFF;
@@ -410,7 +451,7 @@ bool UltraSparc::fast_device(u64 va, u8 a, AccessKind kind, Access& acc) const {
 }
 
 void UltraSparc::fast_fill_device(u64 va, u8 a, const Access& acc, AccessKind kind) {
-    if (kind != AccessKind::Load && kind != AccessKind::Store) return;
+    if (watch_armed() || (kind != AccessKind::Load && kind != AccessKind::Store)) return;
     const int mode = fast_class(a);
     if (mode < 0 || acc.little != asi_is_little(a)) return;  // (TTE.IE)
     constexpr u64 kPage = 0x1FFF;
@@ -440,7 +481,7 @@ bool UltraSparc::block_load(u64 va, u8 a, unsigned rd) {
     std::array<u64, 8> v{};
     for (unsigned i = 0; i < 8; ++i) {
         Access acc;
-        if (!translate_data(va + 8 * i, base, AccessKind::Load, 8, acc) || !phys_read(acc, 8, v[i])) return false;
+        if (!translate_data(va + 8 * i, base, AccessKind::Load, i ? 0 : 8, acc) || !phys_read(acc, 8, v[i])) return false;
         if (i == 0) fast_fill(va, base, acc, AccessKind::Load);  // (one page)
     }
     for (unsigned i = 0; i < 8; ++i) set_f64(rd + 2 * i, v[i]);
@@ -459,7 +500,7 @@ bool UltraSparc::block_store(u64 va, u8 a, unsigned rd) {
     const u8 base = base_memory_asi(a);
     std::array<Access, 8> acc{};
     for (unsigned i = 0; i < 8; ++i)
-        if (!translate_data(va + 8 * i, base, AccessKind::Store, 8, acc[i])) return false;
+        if (!translate_data(va + 8 * i, base, AccessKind::Store, i ? 0 : 8, acc[i])) return false;
     for (unsigned i = 0; i < 8; ++i) phys_write(acc[i], 8, freg64(rd + 2 * i));
     fast_fill(va, base, acc[0], AccessKind::Store);  // (one page)
     return true;
@@ -523,7 +564,32 @@ bool UltraSparc::partial_store(u64 va, u8 a, unsigned rd, u64 mask) {
     return true;
 }
 
-u64& UltraSparc::diag(u8 a, u64 va) { return diag_[(u64{a} << 56) | (va & 0x00FFFFFFFFFFFFFFull)]; }
+// The L1 caches' arrays as the diagnostic ASIs index them (UltraSPARC IIi
+// User's Manual, appendix A): the 16 KiB direct-mapped D-cache's data
+// (2048 doublewords, VA<13:3>) and tags (512 lines, VA<13:5>); the 16 KiB
+// two-way I-cache's instruction pairs and predecode bits (VA<13> the way,
+// <12:3> the pair) and its tags and LRU/next fields (VA<13> the way,
+// <12:5> the line). Each keeps the bits its format defines.
+u64& UltraSparc::diag(u8 a, u64 va) {
+    unsigned index;
+    switch (a) {
+        case asi::DCACHE_TAG:
+        case asi::ICACHE_TAG:
+        case asi::ICACHE_NEXT_FIELD: index = static_cast<unsigned>(va >> 5) & 0x1FF; break;
+        default: index = static_cast<unsigned>(va >> 3) & 0x7FF; break;  // data, instructions, predecode
+    }
+    return diag_[(u64{a} << 56) | index];
+}
+
+u64 UltraSparc::diag_mask(u8 a) {
+    switch (a) {
+        case asi::DCACHE_TAG: return 0x3FFFFFFF;        // tag PA<40:13> in 29:2, a valid bit per half line
+        case asi::ICACHE_TAG: return 0x1FFFFFFF00ull;   // valid 36, tag PA<40:13> in 35:8
+        case asi::ICACHE_PRE_DECODE: return 0xFFFF;
+        case asi::ICACHE_NEXT_FIELD: return 0x1FFFF00;  // LRU 24, set prediction 23, next field 22:12, branch 11:8
+        default: return ~u64{0};
+    }
+}
 
 u64 UltraSparc::tsb_pointer(const MmuRegs& mmu, bool size_64k) const {
     const unsigned n = static_cast<unsigned>(mmu.tsb) & 7;
@@ -651,8 +717,8 @@ void UltraSparc::mmu_write(bool data_side, u64 va, u64 value) {
         case 0x18: m.sfsr = value & 0xFF7FFF; break;
         case 0x28: m.tsb = value & ~u64{0xFF8}; break;
         case 0x30: m.tag_access = value; break;
-        case 0x38:
-            if (data_side) va_watch_ = value & ~u64{7};
+        case 0x38:  // VA<43:3>, sign-extended from bit 43
+            if (data_side) va_watch_ = static_cast<u64>(static_cast<s64>(value << 20) >> 20) & ~u64{7};
             break;
         case 0x40:
             if (data_side) pa_watch_ = value & 0x1FFFFFFFFF8ull;
@@ -755,6 +821,7 @@ bool UltraSparc::internal_asi_read(u8 a, u64 va, unsigned size, u64& value) {
 
 bool UltraSparc::internal_asi_write(u8 a, u64 va, unsigned size, u64 value) {
     attention_ = true;
+    ++effects_;
     switch (a) {
         case asi::LSU_CONTROL:
             lsu_control_ = value;
@@ -763,7 +830,7 @@ bool UltraSparc::internal_asi_write(u8 a, u64 va, unsigned size, u64 value) {
         case asi::ESTATE_ERROR_EN: estate_error_en_ = value & 7; return true;
         case asi::AFSR: afsr_ &= ~value; return true;  // write one to clear
         case asi::AFAR: return true;
-        case asi::UPA_CONFIG: upa_config_ = value; return true;
+        case asi::UPA_CONFIG: upa_config_ = value & kUpaConfigElim; return true;  // the rest reads 0 on the IIi
         case asi::INTR_RECEIVE: intr_receive_ = value & 0x20; return true;
         case asi::UDB_INTR_W:
             switch (va & 0xFF) {
@@ -794,7 +861,7 @@ bool UltraSparc::internal_asi_write(u8 a, u64 va, unsigned size, u64 value) {
         }
         case asi::IMMU_DEMAP: tlb_demap(immu_, va); return true;
         case asi::DMMU_DEMAP: tlb_demap(dmmu_, va); return true;
-        case asi::ECACHE_TAG_DATA: ecache_tag_data_ = value; return true;
+        case asi::ECACHE_TAG_DATA: ecache_tag_data_ = value & 0x3CFFF; return true;  // parity, state, tag (13:12 read 0)
         case asi::ECACHE_W: {
             const u64 index = va & (opt_.ecache_bytes - 1);
             switch ((va >> 39) & 3) {
@@ -809,7 +876,7 @@ bool UltraSparc::internal_asi_write(u8 a, u64 va, unsigned size, u64 value) {
         case asi::ICACHE_INSTR:
         case asi::ICACHE_TAG:
         case asi::ICACHE_PRE_DECODE:
-        case asi::ICACHE_NEXT_FIELD: diag(a, va) = value; return true;
+        case asi::ICACHE_NEXT_FIELD: diag(a, va) = value & diag_mask(a); return true;
         default: break;
     }
     if (asi_hook && asi_hook(a, va, size, true, value)) return true;

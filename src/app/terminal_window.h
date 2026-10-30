@@ -20,6 +20,8 @@ class TerminalWindow {
 public:
     using Send = std::function<void(const std::string&)>;
     TerminalWindow(std::string title, Terminal& terminal, Send send, float ui_scale);
+    // Pause/Break, or Ctrl+Shift+B: a BREAK on the line.
+    std::function<void()> on_break;
     ~TerminalWindow();
     TerminalWindow(const TerminalWindow&) = delete;
     TerminalWindow& operator=(const TerminalWindow&) = delete;

@@ -60,6 +60,7 @@ add_library(uv_emu STATIC
   src/devices/m48t59.cpp
   src/devices/ebus_misc.cpp
   src/devices/ebus_dma.cpp
+  src/devices/cs4231.cpp
   src/devices/fdc82077.cpp
   src/devices/hme.cpp
   src/devices/mach64.cpp
@@ -135,6 +136,7 @@ if(UV_WITH_SDL3)
 
     target_sources(ultraviolet PRIVATE
       src/app/gui.cpp
+      src/app/host_audio.cpp
       src/app/terminal_window.cpp
     )
     target_compile_definitions(ultraviolet PRIVATE UV_HAVE_SDL3=1)
@@ -225,7 +227,9 @@ if(UV_BUILD_TESTS)
     tests/input_tests.cpp
     tests/mach64_tests.cpp
     tests/jit_tests.cpp
+    tests/session_tests.cpp
+    tests/audio_tests.cpp
   )
-  target_link_libraries(uv_tests PRIVATE uv_emu uv_warnings)
+  target_link_libraries(uv_tests PRIVATE uv_app uv_warnings)
   add_test(NAME uv_tests COMMAND uv_tests)
 endif()
