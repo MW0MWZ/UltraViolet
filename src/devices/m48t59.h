@@ -5,13 +5,24 @@
 // read freeze, calibration), BCD seconds to year, the alarm, the watchdog
 // and the flags. The clock runs from the host's clock plus the offset the
 // guest last set.
+//
+// With a scheduler attached, the alarm (once a second, minute, hour, day
+// or month, as the repeat bits say) sets AF, and the watchdog (a multiple
+// of 1/16, 1/4, 1 or 4 seconds from its last write) sets WDF; either
+// drives the IRQ output (the alarm with AFE set, the watchdog with WDS
+// clear) until the flags are read. A watchdog steered to the reset output
+// (WDS set) pulses it and clears the watchdog, FT, AFE and ABE. On the
+// Ultra 5/10 IRQ drives the power supply's POWERON_L (an alarm switches a
+// system in standby on) and the reset output is not used.
 #pragma once
 
 #include <array>
 #include <ctime>
 #include <functional>
+#include <memory>
 #include <string>
 
+#include "core/scheduler.h"
 #include "mem/bus.h"
 
 namespace uv {
@@ -23,6 +34,13 @@ public:
     static constexpr int kYearBase = 1968;
 
     explicit M48t59(std::function<std::time_t()> host_clock = {});
+    ~M48t59();
+    // Guest time for the alarm and the watchdog (without, they do nothing).
+    void attach(Scheduler& scheduler, double cpu_hz);
+    // The IRQ output, and a watchdog's pulse on the reset output.
+    std::function<void(bool)> on_irq;
+    std::function<void()> on_watchdog_reset;
+    bool irq() const { return irq_; }
 
     const char* name() const override { return "m48t59"; }
     bool read(u64 offset, unsigned size, u64& value) override;
@@ -44,6 +62,11 @@ public:
 
 private:
     std::time_t now() const;
+    void schedule_alarm();
+    void alarm();
+    void restart_watchdog();
+    void watchdog();
+    void set_irq(bool on);
     void latch_clock();  // copies the running time into the clock registers
     u8 read_byte(unsigned addr);
     void write_byte(unsigned addr, u8 v);
@@ -60,6 +83,9 @@ private:
     // clock is often read many times a second.
     std::time_t converted_ = -1;
     std::array<u8, 7> converted_regs_{};
+    std::unique_ptr<Timer> alarm_timer_, watchdog_timer_;
+    double cpu_hz_ = 0;
+    bool irq_ = false;
 };
 
 }  // namespace uv

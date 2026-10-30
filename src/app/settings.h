@@ -33,10 +33,17 @@ struct Settings {
     std::vector<net::PortForward> forwards;
     Pacer::Mode timing = Pacer::Mode::Realtime;
     bool block_cache = true, jit = true;
+    bool idle_skip = true;  // run the guest's idle loops at once (UltraSparc::set_idle_skip)
+    // The IDE drives without a real drive's delays, DMA at host speed.
+    bool fast_disk = true;
     bool mouse_auto_capture = true;  // the window captures the mouse when the pointer moves onto the screen
     // The wheel, which the Sun mouse lacks, as keys: "off", "arrows" (Up
     // and Down) or "pages" (Page Up and Down).
     std::string wheel_keys = "off";
+    // The window's sound: the machine's audio and the keyboard's bell and
+    // click on the host, at a volume (percent).
+    bool sound = true;
+    unsigned volume = 80;
     std::string log = "warn";
 
     // The machine these settings describe (the PROM image, the network and

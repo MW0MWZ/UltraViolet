@@ -308,6 +308,15 @@ unsigned Mach64::current_line() const {
     return static_cast<unsigned>(t.line_at(sched_.now()) % t.total);
 }
 
+// The chosen line's interrupt comes as the scan finishes the line, at the
+// start of the next: Solaris's driver asks for it at the last displayed
+// line and loads the palette from it only if vertical blank has begun.
+// Past the frame: never.
+static unsigned vline_event(u32 vline, unsigned total) {
+    const unsigned line = vline & 0x7FF;
+    return line < total ? (line + 1) % total : total;
+}
+
 // Vertical blank and the chosen line latch their interrupt bits each time
 // the scan passes them.
 void Mach64::latch_interrupts() {
@@ -321,7 +330,7 @@ void Mach64::latch_interrupts() {
         return (first > from ? first : first + t.total) <= to;
     };
     if (passed(t.visible)) regs_[kCrtcIntCntl] |= kIntVblankInt;
-    if (passed(regs_[kCrtcVline] & 0x7FF) && (regs_[kCrtcVline] & 0x7FF) < t.total)
+    if (const unsigned v = vline_event(regs_[kCrtcVline], t.total); v < t.total && passed(v))
         regs_[kCrtcIntCntl] |= kIntVlineInt;
 }
 
@@ -338,7 +347,7 @@ void Mach64::schedule_interrupt() {
         next = std::min(next, l);
     };
     if (en & kIntVblankEn) consider(t.visible);
-    if ((en & kIntVlineEn) && (regs_[kCrtcVline] & 0x7FF) < t.total) consider(regs_[kCrtcVline] & 0x7FF);
+    if (const unsigned v = vline_event(regs_[kCrtcVline], t.total); (en & kIntVlineEn) && v < t.total) consider(v);
     if (next != ~0ull) crtc_timer_.schedule_at(t.start_of(next));
 }
 

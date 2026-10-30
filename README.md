@@ -21,8 +21,9 @@ UltraViolet is at the very beginning. In place so far:
   clock, the SuperIO's keyboard and mouse UARTs and floppy controller, the
   SAB82532 serial ports, the CMD646 IDE controller with an ATA disk and
   an ATAPI CD-ROM drive (bus-master DMA included), the on-board Happy
-  Meal Ethernet with its PHY, the on-board ATI Rage Pro graphics, and a
-  Sun Type 5 keyboard and mouse. OpenBoot finds them as its `disk`,
+  Meal Ethernet with its PHY, the on-board ATI Rage Pro graphics, the
+  CS4231 audio codec, the front-panel power button, and a Sun Type 5
+  keyboard and mouse. OpenBoot finds them as its `disk`,
   `cdrom`, `net`, `screen` and `keyboard`, and takes the screen and
   keyboard as its console; `boot cdrom` boots Solaris 8 from its install
   media to the installer's first question, and the network passes
@@ -37,7 +38,7 @@ UltraViolet is at the very beginning. In place so far:
   the JIT, and user-mode (libslirp) and TAP networking.
 
 Next come installing Solaris to disk and running its desktop (X on the
-Rage Pro's drawing engine), and sound; see
+Rage Pro's drawing engine); see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Building
@@ -140,10 +141,15 @@ The machine's screen is in the window, with the host's keyboard and mouse
 as its Sun keyboard and mouse: click the screen to give it the mouse,
 Ctrl+Alt+G (Ctrl+Option+G on a Mac) to take it back; Ctrl+Alt+A sends
 Stop-A, Ctrl+Alt+E changes to the next CD in the set, Ctrl+Alt+F switches
-to full screen. The serial ports have terminal windows (View menu). With
-`--console ttya` there is no keyboard, and OpenBoot and Solaris use ttya as
-the console. `--headless` runs without a window, ttya on the terminal
-(Ctrl-] then q quits). `--disk` is a raw image on the primary IDE channel
+to full screen. The Machine menu also has the front-panel power button, the
+Sun keys a PC keyboard lacks (Stop, Again, Props and the rest), powering on
+with keys held (Stop, Stop-D, Stop-F, Stop-N), and unplugging the keyboard.
+The machine's audio, and the keyboard's bell and clicks, play on the host
+(Settings, Sound). The serial ports have terminal windows (View menu), where
+Pause or Ctrl+Shift+B sends a BREAK. With `--console ttya` there is no
+keyboard, and OpenBoot and Solaris use ttya as the console (Ctrl+Alt+A then
+sends a BREAK). `--headless` runs without a window, ttya on the terminal
+(Ctrl-] then q quits; `~#` at the start of a line sends a BREAK). `--disk` is a raw image on the primary IDE channel
 (created at `--disk-size` megabytes if it does not exist); `--cdrom` is an
 ISO image in the CD-ROM drive (given more than once, a set of discs).
 `--help` lists the rest.

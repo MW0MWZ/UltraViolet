@@ -13,6 +13,7 @@ namespace {
 
 // Register offsets
 constexpr u32 kUpaPortId = 0x0000;
+constexpr u32 kUeAfsr = 0x0030, kUeceAfar = 0x0038, kCeAfsr = 0x0040, kUeceAfarAlias = 0x0048;
 constexpr u32 kIommuCtl = 0x0200, kIommuTsb = 0x0208, kIommuFlush = 0x0210;
 constexpr u32 kPciImap = 0x0C00, kObioImap = 0x1000, kPciIclr = 0x1400, kObioIclr = 0x1800, kRetryTimer = 0x1A00;
 constexpr u32 kTimer = 0x1C00, kWriteSync = 0x1C20;
@@ -29,8 +30,30 @@ constexpr unsigned kStateIdle = 0, kStatePending = 3;
 // Reset control
 constexpr u64 kRstPor = 1ull << 31, kRstSoftPor = 1ull << 30, kRstSoftXir = 1ull << 29;
 
-// PIO error status (PCI AFSR)
-constexpr u64 kAfsrPma = 1ull << 63;
+// PIO write error status (PCI AFSR): primary master abort, target abort,
+// excessive retries, parity error; the secondary bits four below; the
+// byte mask of the logged write (bit 32 byte 0).
+constexpr u64 kAfsrPma = 1ull << 63, kAfsrPrimary = 0xFull << 60, kAfsrErrors = 0xFFull << 56,
+              kAfsrByteMask = 0xFFull << 32;
+// The module's PCI status: signalled target abort, received master abort.
+constexpr u16 kStatusSta = 0x0800, kStatusRma = 0x2000;
+constexpr u64 kPciCtlErrEn = 1ull << 8;  // the PCI error interrupt enable
+
+// DMA error status (UE AFSR): primary DMA read and write, secondary read
+// and write, secondary and primary translation errors (bit layout as the
+// Linux sabre driver has it); CE AFSR the same without translation errors.
+constexpr u64 kUePdrd = 1ull << 62, kUePdwr = 1ull << 61, kUeSdrd = 1ull << 59, kUeSdwr = 1ull << 58,
+              kUeSdte = 1ull << 57, kUePdte = 1ull << 56;
+constexpr u64 kUeErrors = kUePdrd | kUePdwr | kUeSdrd | kUeSdwr | kUeSdte | kUePdte;
+constexpr u64 kCeErrors = kUePdrd | kUePdwr | kUeSdrd | kUeSdwr;
+constexpr u64 kUeLogged = (0xFFFFull << 32) | (7ull << 29) | (1ull << 23);  // byte mask, doubleword, block
+// IOMMU control: a translation error (bit 24) and its kind (26:25:
+// protection 0, invalid entry 1, time-out 2, ECC 3)
+constexpr u64 kIommuErr = 1ull << 24, kIommuErrStatus = 3ull << 25;
+constexpr unsigned kIommuProtection = 0, kIommuInvalid = 1;
+// The bus module's own interrupts: PCI error, uncorrectable and correctable
+// DMA errors (as a real Ultra 10's sabre node lists them)
+constexpr unsigned kInoPciErr = 0x30, kInoUe = 0x2E, kInoCe = 0x2F;
 
 // Timer limit fields
 constexpr u64 kLimitIntEn = 1ull << 31, kLimitToZero = 1ull << 30, kLimitMask = 0x1FFFFFFF;
@@ -77,6 +100,8 @@ public:
         save_reset_state();
     }
     const char* name() const override { return "sabre"; }
+    // A master abort or target abort the module received as a PCI master.
+    void received(u16 bit) { set_cfg16(pci::kStatus, cfg16(pci::kStatus) | bit); }
 };
 
 Sabre::Sabre(Bus& bus, Scheduler& scheduler, double cpu_hz, std::function<bool(u64)> send_vector)
@@ -125,6 +150,8 @@ void Sabre::reset(bool power_on) {
     state_.fill(kStateIdle);
     iommu_ctl_ = iommu_tsb_ = 0;
     pci_ctl_ = pci_afsr_ = pci_afar_ = pci_diag_ = pci_tasr_ = 0;
+    ue_afsr_ = ce_afsr_ = uece_afar_ = 0;
+    update_error_interrupts();
     reset_ctl_ = power_on ? kRstPor : (reset_ctl_ & ~kRstPor);
     tc_ = {};
     for (auto& t : tc_timer_) t->cancel();
@@ -183,6 +210,10 @@ u64 Sabre::reg(u32 o) const {
         case kIommuTsb: return iommu_tsb_;
         case kPciCtl: return pci_ctl_;
         case kPciAfsr: return pci_afsr_;
+        case kUeAfsr: return ue_afsr_;
+        case kCeAfsr: return ce_afsr_;
+        case kUeceAfar:
+        case kUeceAfarAlias: return uece_afar_;
         case kPciAfar: return pci_afar_;
         case kPciDiag: return pci_diag_;
         case kPciTasr: return pci_tasr_;
@@ -224,8 +255,24 @@ bool Sabre::regs_write(u64 offset, unsigned size, u64 value) {
         case kIommuCtl: iommu_ctl_ = v & 0x07F70007ull; return true;
         case kIommuTsb: iommu_tsb_ = v & 0x1FFFFFFE000ull; return true;
         case kIommuFlush: return true;  // translations are not cached
-        case kPciCtl: pci_ctl_ = (v & ~(1ull << 34)) | (pci_ctl_ & (1ull << 34) & ~v); return true;  // SERR is W1C
-        case kPciAfsr: pci_afsr_ &= ~v; return true;
+        case kPciCtl:
+            pci_ctl_ = (v & ~(1ull << 34)) | (pci_ctl_ & (1ull << 34) & ~v);  // SERR is W1C
+            update_error_interrupts();
+            return true;
+        case kPciAfsr:
+            pci_afsr_ &= ~(v & kAfsrErrors);  // the error bits clear when written with 1
+            update_error_interrupts();
+            return true;
+        case kUeAfsr:
+            ue_afsr_ &= ~(v & kUeErrors);
+            update_error_interrupts();
+            return true;
+        case kCeAfsr:
+            ce_afsr_ &= ~(v & kCeErrors);
+            update_error_interrupts();
+            return true;
+        case kUeceAfar:
+        case kUeceAfarAlias: return true;
         case kPciAfar: return true;
         case kPciDiag: pci_diag_ = v; return true;
         case kPciTasr: pci_tasr_ = v & 0xFF; return true;
@@ -323,16 +370,59 @@ bool Sabre::config_write(u64 offset, unsigned size, u64 value) {
     return true;
 }
 
+// A PIO write: while no primary error is held, the AFAR and the AFSR's
+// byte mask follow it (a real Ultra 10 reads them holding its last PIO
+// write: the SAB82532's command register at the ok prompt, the IDE
+// bus-master status under Solaris, with byte 0's mask bit; the manual
+// describes them only as logging the primary error, which they then keep).
+void Sabre::pio_write(u64 pa, unsigned size) {
+    if (pci_afsr_ & kAfsrPrimary) return;
+    pci_afar_ = pa & 0x1FFFFFFFFFCull;
+    const u64 mask = ((u64{1} << size) - 1) << (pa & 7);
+    pci_afsr_ = (pci_afsr_ & ~kAfsrByteMask) | ((mask & 0xFF) << 32);
+}
+
+// A PIO write terminated by a master abort: the primary error bit (or the
+// secondary one while a primary is held), the received master abort in
+// the module's PCI status, and the PCI error interrupt.
 void Sabre::pio_error(u64 bit) {
-    if (!(pci_afsr_ & (kAfsrPma | (1ull << 62) | (1ull << 61) | (1ull << 60)))) pci_afsr_ |= bit;
+    if (!(pci_afsr_ & kAfsrPrimary)) pci_afsr_ |= bit;
     else pci_afsr_ |= bit >> 4;  // a second error sets the secondary bit
+    if (bit == kAfsrPma) host_->received(kStatusRma);
+    update_error_interrupts();
+}
+
+// A DVMA access without a usable translation (an invalid entry, or a
+// write to a page not writable): the uncorrectable error status records a
+// translation error with its direction (the primary bits, or the secondary
+// ones while a primary error is held), the AFAR the TTE's address (the
+// IOMMU missed: it caches no translations), and the IOMMU control register
+// the kind of error. The master's cycle is target-aborted.
+void Sabre::dma_error(u32 dvma, bool write, unsigned kind, u64 tte_pa) {
+    if (!(ue_afsr_ & (kUePdrd | kUePdwr | kUePdte))) {
+        const u64 offset = (tte_pa >> 3) & 7;  // the doubleword in its 64 bytes
+        ue_afsr_ = (ue_afsr_ & ~kUeLogged) | kUePdte | (write ? kUePdwr : kUePdrd) | (offset << 29) |
+                   ((offset & 1) ? 0xFF00ull << 32 : 0x00FFull << 32);
+        uece_afar_ = tte_pa & 0x1FFFFFFFFF8ull;
+    } else {
+        ue_afsr_ |= kUeSdte | (write ? kUeSdwr : kUeSdrd);
+    }
+    host_->received(kStatusSta);
+    iommu_ctl_ = (iommu_ctl_ & ~kIommuErrStatus) | kIommuErr | (u64{kind} << 25);
+    UV_LOG(Debug, "sabre", "DMA translation error: %s @ %08x", write ? "write" : "read", dvma);
+    update_error_interrupts();
+}
+
+void Sabre::update_error_interrupts() {
+    set_interrupt(kInoPciErr, (pci_ctl_ & kPciCtlErrEn) && (pci_afsr_ & kAfsrErrors));
+    set_interrupt(kInoUe, ue_afsr_ & kUeErrors);
+    set_interrupt(kInoCe, ce_afsr_ & kCeErrors);
 }
 
 bool Sabre::io_read(u64 offset, unsigned size, u64& value) {
     u32 v;
     if (size > 4 || !root_.io_read(static_cast<u32>(offset), size, v)) {
-        pio_error(kAfsrPma);
-        pci_afar_ = kIoBase + offset;
+        host_->received(kStatusRma);  // a time-out to the processor, not logged here
         return false;
     }
     value = swap_size(v, size);
@@ -340,18 +430,16 @@ bool Sabre::io_read(u64 offset, unsigned size, u64& value) {
 }
 
 bool Sabre::io_write(u64 offset, unsigned size, u64 value) {
-    if (size > 4 || !root_.io_write(static_cast<u32>(offset), size, static_cast<u32>(swap_size(value, size)))) {
+    pio_write(kIoBase + offset, size);
+    if (size > 4 || !root_.io_write(static_cast<u32>(offset), size, static_cast<u32>(swap_size(value, size))))
         pio_error(kAfsrPma);
-        pci_afar_ = kIoBase + offset;
-    }
     return true;
 }
 
 bool Sabre::mem_read(u64 offset, unsigned size, u64& value) {
     u64 v;
     if (!root_.mem_read(static_cast<u32>(offset), size, v)) {
-        pio_error(kAfsrPma);
-        pci_afar_ = kMemBase + offset;
+        host_->received(kStatusRma);  // a time-out to the processor, not logged here
         UV_LOG(Debug, "sabre", "PCI master abort: read%u @ %08llx", size * 8, static_cast<unsigned long long>(offset));
         return false;
     }
@@ -362,9 +450,9 @@ bool Sabre::mem_read(u64 offset, unsigned size, u64& value) {
 u64 Sabre::mem_stable(u64 offset, unsigned size) { return root_.mem_stable(static_cast<u32>(offset), size); }
 
 bool Sabre::mem_write(u64 offset, unsigned size, u64 value) {
+    pio_write(kMemBase + offset, size);
     if (!root_.mem_write(static_cast<u32>(offset), size, swap_size(value, size))) {
         pio_error(kAfsrPma);
-        pci_afar_ = kMemBase + offset;
         UV_LOG(Debug, "sabre", "PCI master abort: write%u @ %08llx", size * 8, static_cast<unsigned long long>(offset));
     }
     return true;
@@ -375,10 +463,17 @@ bool Sabre::mem_write(u64 offset, unsigned size, u64 value) {
 // memory; each entry holds valid (bit 63), page size (61), writable (1)
 // and the physical page. With it disabled, DVMA addresses are physical.
 bool Sabre::translate(u32 dvma, bool write, u64& pa) const {
+    unsigned kind;
+    u64 tte_pa;
+    return translate(dvma, write, pa, kind, tte_pa);
+}
+
+bool Sabre::translate(u32 dvma, bool write, u64& pa, unsigned& kind, u64& tte_pa) const {
     if (!(iommu_ctl_ & 1)) {
         pa = dvma;
         return true;
     }
+    kind = kIommuInvalid;
     const unsigned tsb_size = static_cast<unsigned>(iommu_ctl_ >> 16) & 7;
     const bool big = iommu_ctl_ & 4;
     const unsigned page_shift = big ? 16 : 13;
@@ -386,20 +481,36 @@ bool Sabre::translate(u32 dvma, bool write, u64& pa) const {
     const u64 index = (dvma >> page_shift) & (entries - 1);
     u64 tte;
     u8 buf[8];
-    if (!bus_.read_block(iommu_tsb_ + index * 8, buf, 8)) return false;
+    tte_pa = iommu_tsb_ + index * 8;
+    if (!bus_.read_block(tte_pa, buf, 8)) return false;
     tte = load_be<u64>(buf);
     if (!(tte >> 63)) return false;
-    if (write && !(tte & 2)) return false;
+    if (write && !(tte & 2)) {
+        kind = kIommuProtection;
+        return false;
+    }
     const bool tte64k = (tte >> 61) & 1;
     const u64 mask = tte64k ? 0xFFFF : 0x1FFF;
     pa = ((tte & 0x1FFFFFFE000ull) & ~mask) | (dvma & mask);
     return true;
 }
 
+// A 32-bit DMA address is the module's only in the 512 MiB regions the
+// target address space register enables (OpenBoot enables 0xC000_0000 to
+// 0xDFFF_FFFF); elsewhere it is left to other PCI devices, and with none
+// there the master's cycle ends in a master abort.
+bool Sabre::claims(u32 dvma) const { return (pci_tasr_ >> (dvma >> 29)) & 1; }
+
 bool Sabre::dma_read(u32 dvma, u8* data, std::size_t length) {
     while (length) {
+        if (!claims(dvma)) return false;
         u64 pa;
-        if (!translate(dvma, false, pa)) return false;
+        unsigned kind;
+        u64 tte_pa;
+        if (!translate(dvma, false, pa, kind, tte_pa)) {
+            dma_error(dvma, false, kind, tte_pa);
+            return false;
+        }
         const std::size_t chunk = std::min<std::size_t>(length, 0x2000 - (dvma & 0x1FFF));
         if (!bus_.read_block(pa, data, chunk)) return false;
         dvma += static_cast<u32>(chunk);
@@ -411,8 +522,14 @@ bool Sabre::dma_read(u32 dvma, u8* data, std::size_t length) {
 
 bool Sabre::dma_write(u32 dvma, const u8* data, std::size_t length) {
     while (length) {
+        if (!claims(dvma)) return false;
         u64 pa;
-        if (!translate(dvma, true, pa)) return false;
+        unsigned kind;
+        u64 tte_pa;
+        if (!translate(dvma, true, pa, kind, tte_pa)) {
+            dma_error(dvma, true, kind, tte_pa);
+            return false;
+        }
         const std::size_t chunk = std::min<std::size_t>(length, 0x2000 - (dvma & 0x1FFF));
         if (!bus_.write_block(pa, data, chunk)) return false;
         dvma += static_cast<u32>(chunk);

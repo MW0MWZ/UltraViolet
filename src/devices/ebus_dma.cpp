@@ -16,8 +16,8 @@ constexpr u32 kWritable = EbusDma::kIntEn | EbusDma::kReset | EbusDma::kWrite | 
 
 void EbusDma::reset() {
     control_ = 0;
-    addr_ = count_ = 0;
-    loaded_ = tc_ = err_ = false;
+    addr_ = count_ = staged_count_ = next_addr_ = next_count_ = 0;
+    loaded_ = next_loaded_ = tc_ = err_ = false;
     update_irq();
 }
 
@@ -27,6 +27,7 @@ u32 EbusDma::csr() const {
     if (err_) v |= kErrPend;
     if (tc_) v |= kTc;
     if (loaded_) v |= kALoaded;
+    if (next_loaded_) v |= kNaLoaded;
     if (loaded_ && (control_ & kEnDma)) v |= kDmaOn;
     return v;
 }
@@ -76,22 +77,29 @@ bool EbusDma::write(u64 offset, unsigned size, u64 value) {
         if (m & v & (kTc | kIntPend)) tc_ = false;
         if (m & v & kErrPend) err_ = false;
         if (control_ & kReset) {
-            loaded_ = tc_ = err_ = false;
-            count_ = 0;
+            loaded_ = next_loaded_ = tc_ = err_ = false;
+            count_ = next_count_ = 0;
         }
     }
-    if (mask[kAddr >> 2]) addr_ = (addr_ & ~mask[1]) | (data[1] & mask[1]);
-    if (mask[kCount >> 2]) {
-        count_ = ((count_ & ~mask[2]) | (data[2] & mask[2])) & 0xFFFFFF;
-        loaded_ = count_ != 0;
-        tc_ = false;
+    // The count first, then the address, which loads the transfer.
+    if (mask[kCount >> 2]) staged_count_ = ((staged_count_ & ~mask[2]) | (data[2] & mask[2])) & 0xFFFFFF;
+    if (mask[kAddr >> 2] && !(control_ & kReset)) {
+        if (loaded_ && (control_ & kEnNext)) {
+            next_addr_ = (next_addr_ & ~mask[1]) | (data[1] & mask[1]);
+            next_count_ = staged_count_;
+            next_loaded_ = true;
+        } else {
+            addr_ = (addr_ & ~mask[1]) | (data[1] & mask[1]);
+            count_ = staged_count_;
+            loaded_ = true;
+        }
     }
     update_irq();
     return true;
 }
 
 std::size_t EbusDma::grant(std::size_t length, bool to_memory) const {
-    if (!loaded_ || !(control_ & kEnDma) || (control_ & kReset)) return 0;
+    if (!loaded_ || err_ || !(control_ & kEnDma) || (control_ & kReset)) return 0;
     if (static_cast<bool>(control_ & kWrite) != to_memory) return 0;
     return (control_ & kEnCnt) ? std::min<std::size_t>(length, count_) : length;
 }
@@ -106,22 +114,37 @@ std::size_t EbusDma::complete(std::size_t n, bool ok) {
     if (control_ & kEnCnt) {
         count_ -= static_cast<u32>(n);
         if (count_ == 0) {
-            loaded_ = false;
             tc_ = true;
+            // The next transfer, if one is loaded, becomes the current one.
+            loaded_ = next_loaded_;
+            next_loaded_ = false;
+            if (loaded_) {
+                addr_ = next_addr_;
+                count_ = next_count_;
+            }
         }
     }
     update_irq();
     return n;
 }
 
+// Each runs on through a chained next transfer.
 std::size_t EbusDma::to_memory(const u8* data, std::size_t length) {
-    const std::size_t n = grant(length, true);
-    return n ? complete(n, mem_write_ && mem_write_(addr_, data, n)) : 0;
+    std::size_t done = 0;
+    while (const std::size_t n = grant(length - done, true)) {
+        if (!complete(n, mem_write_ && mem_write_(addr_, data + done, n))) break;
+        done += n;
+    }
+    return done;
 }
 
 std::size_t EbusDma::from_memory(u8* data, std::size_t length) {
-    const std::size_t n = grant(length, false);
-    return n ? complete(n, mem_read_ && mem_read_(addr_, data, n)) : 0;
+    std::size_t done = 0;
+    while (const std::size_t n = grant(length - done, false)) {
+        if (!complete(n, mem_read_ && mem_read_(addr_, data + done, n))) break;
+        done += n;
+    }
+    return done;
 }
 
 }  // namespace uv

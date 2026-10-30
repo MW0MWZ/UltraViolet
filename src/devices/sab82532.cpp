@@ -13,7 +13,8 @@ constexpr u8 kStarXfw = 0x40, kStarRfne = 0x20, kStarTec = 0x08, kStarCec = 0x04
 constexpr u8 kCmdRmc = 0x80, kCmdRres = 0x40, kCmdRfrd = 0x20, kCmdXf = 0x08, kCmdXres = 0x01;
 // ISR0 / ISR1
 constexpr u8 kIsr0Tcd = 0x80, kIsr0Time = 0x40, kIsr0Rpf = 0x01;
-constexpr u8 kIsr1Alls = 0x20, kIsr1Xpr = 0x01;
+constexpr u8 kIsr1Brk = 0x80, kIsr1Brkt = 0x40, kIsr1Alls = 0x20, kIsr1Xpr = 0x01;
+constexpr double kBreakSeconds = 0.25;
 // RFC
 constexpr u8 kRfcRfdf = 0x10, kRfcTcde = 0x01;
 // Register offsets within a channel
@@ -45,6 +46,7 @@ void Sab82532::Channel::reset() {
     isr0 = 0;
     isr1 = kIsr1Xpr | kIsr1Alls;
     imr0 = imr1 = 0xFF;
+    in_break = false;
     tic_busy = false;
 }
 
@@ -84,6 +86,24 @@ void Sab82532::Channel::tx_tick() {
 
 void Sab82532::Channel::rx_tick() {
     const unsigned per_char = (rfc & kRfcRfdf) ? 2 : 1;
+    if (in_break) {
+        // The line returns to mark.
+        in_break = false;
+        isr1 |= kIsr1Brkt;
+        chip.update_irq();
+        rx_timer.schedule_in(char_cycles());
+        return;
+    }
+    if (line.rx_break()) {
+        // A break: no character goes to the RFIFO; BRK, then BRKT when the
+        // line returns to mark (a terminal's break lasts a quarter second).
+        line.rx_take();
+        in_break = true;
+        isr1 |= kIsr1Brk;
+        chip.update_irq();
+        rx_timer.schedule_in(static_cast<u64>(kBreakSeconds * chip.cpu_hz_));
+        return;
+    }
     if (line.rx_pending()) {
         if (rx.size() + per_char <= 32) {
             const u8 b = line.rx_take();

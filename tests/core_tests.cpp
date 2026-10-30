@@ -33,6 +33,27 @@ TEST(scheduler_orders_and_reschedules) {
     CHECK_EQ(s.next_event(), Scheduler::kNever);
 }
 
+// An event scheduled before the earliest pending one is reported (the CPU
+// running up to that one must stop for it); later ones are not.
+TEST(scheduler_reports_an_event_scheduled_earlier_than_the_next) {
+    u64 now = 0;
+    Scheduler s;
+    s.set_clock([&] { return now; });
+    unsigned earlier = 0;
+    s.set_on_earlier([&] { ++earlier; });
+    Timer a(s, [] {}), b(s, [] {}), c(s, [] {});
+    a.schedule_at(100);
+    CHECK_EQ(earlier, 1u);  // (from none pending)
+    b.schedule_at(200);
+    CHECK_EQ(earlier, 1u);
+    c.schedule_at(50);
+    CHECK_EQ(earlier, 2u);
+    c.schedule_at(300);  // (moved after the next)
+    CHECK_EQ(earlier, 2u);
+    a.cancel();
+    CHECK_EQ(earlier, 2u);
+}
+
 namespace {
 struct FakeHost {
     u64 now = 1000000000;

@@ -61,6 +61,7 @@ u8* Bus::code_flag(const u8* host) const {
 
 bool Bus::write_block(u64 paddr, const u8* data, std::size_t length) {
     constexpr u64 kCodeMask = (u64{1} << kCodePageShift) - 1;
+    ++dma_writes_;
     while (length) {
         if (paddr > kAddressMask) return false;
         const Page& p = page(paddr);

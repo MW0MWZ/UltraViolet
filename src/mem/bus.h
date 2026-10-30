@@ -125,6 +125,8 @@ public:
     // Accesses that went past host memory (to a device, ROM writes and bus
     // errors): one that leaves this unchanged reached host memory.
     u64 slow_accesses() const { return slow_accesses_; }
+    // Device DMA into memory (write_block calls).
+    u64 dma_writes() const { return dma_writes_; }
 
     // Debugger hook: every device (MMIO) read, after it completes.
     std::function<void(u64 paddr, unsigned size, u64 value)> device_read_hook;
@@ -189,6 +191,7 @@ private:
     bool read_slow(u64 paddr, unsigned size, u64& out);
     bool write_slow(u64 paddr, unsigned size, u64 value);
     u64 slow_accesses_ = 0;
+    u64 dma_writes_ = 0;
 
     std::unique_ptr<Chunk> empty_;               // shared by chunks nothing is mapped in
     std::vector<Chunk*> chunks_;                 // kNumChunks entries, each empty_ or owned

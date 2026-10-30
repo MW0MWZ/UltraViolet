@@ -70,16 +70,22 @@ public:
     LineFormat device;                 // the far end's format (baud 0: a terminal)
 
     void receive(u8 byte) { rx_.push_back(byte); }  // host -> guest
+    // A break: the line held at space for longer than a character (a
+    // terminal's BREAK, or a keyboard unplugged), in its place among the
+    // bytes received.
+    void receive_break() { rx_.push_back(kBreak); }
     bool rx_pending() const { return !rx_.empty(); }
-    u8 rx_take() {
-        const u8 b = rx_.front();
+    bool rx_break() const { return !rx_.empty() && rx_.front() == kBreak; }  // the next is a break
+    u8 rx_take() {  // (a break reads as 0)
+        const u8 b = static_cast<u8>(rx_.front());
         rx_.pop_front();
         return b;
     }
     void rx_clear() { rx_.clear(); }
 
 private:
-    std::deque<u8> rx_;
+    static constexpr u16 kBreak = 0x100;
+    std::deque<u16> rx_;
 };
 
 }  // namespace uv

@@ -40,6 +40,9 @@ public:
 
     // The host side; null: no cable (the link is down).
     void set_network(std::shared_ptr<net::NetBackend> backend);
+    // Frames go out and come in at the host's speed (1 GB/s) rather than
+    // the link's 10 or 100 Mbit/s (the machine's Max timing).
+    void set_fast(bool fast) { fast_ = fast; }
     // Takes frames the host has for the guest (between run slices).
     void poll();
 
@@ -80,6 +83,7 @@ private:
     bool link_up() const { return backend_ != nullptr; }
 
     double cpu_hz_;
+    bool fast_ = false;
     std::shared_ptr<net::NetBackend> backend_;
     Timer tx_timer_, rx_timer_;
 
