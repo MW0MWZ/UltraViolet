@@ -7,6 +7,12 @@
 // the device's interrupt: the CSR shows it as INT_PEND, together with
 // terminal count, and the channel interrupts when INT_EN is set. Bit
 // layout as used by the Linux ebus DMA code.
+//
+// A transfer is loaded by writing its byte count and then its address:
+// the address write loads it as the current transfer (A_LOADED) or, with
+// EN_NEXT set and one already loaded, as the next (NA_LOADED), which
+// follows the current one at its terminal count without a gap (as the
+// Linux, OpenBSD and NetBSD drivers chain audio buffers).
 #pragma once
 
 #include <cstddef>
@@ -62,8 +68,11 @@ private:
     std::function<bool(u32, u8*, std::size_t)> mem_read_;
     std::function<bool(u32, const u8*, std::size_t)> mem_write_;
     u32 control_ = 0;  // the writable CSR bits
-    u32 addr_ = 0, count_ = 0;
-    bool loaded_ = false;  // an address and count are waiting to be used
+    u32 addr_ = 0, count_ = 0;  // the current transfer
+    u32 staged_count_ = 0;      // the count written, taken by the next address write
+    u32 next_addr_ = 0, next_count_ = 0;
+    bool loaded_ = false;       // A_LOADED: the current transfer is set up
+    bool next_loaded_ = false;  // NA_LOADED: the next one is waiting
     bool tc_ = false, err_ = false, device_irq_ = false;
     bool irq_out_ = false;
 };

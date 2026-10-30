@@ -51,6 +51,7 @@ private:
         u8 tsax = 0, tsar = 0, xccr = 0, rccr = 0, xbcl = 0, xbch = 0;
         u8 isr0 = 0, isr1 = 0, imr0 = 0xFF, imr1 = 0xFF;
         bool tic_busy = false;
+        bool in_break = false;  // a break being received
         void reset();
         u64 char_cycles() const;
         unsigned threshold() const;

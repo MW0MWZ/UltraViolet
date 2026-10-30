@@ -174,6 +174,19 @@ TEST(cpu_traps_at_tl_above_zero_use_the_upper_half_of_the_table) {
     CHECK_EQ(r.cpu.pc(), Rig::kTba + 0x4000 + (0x101u << 5));
 }
 
+TEST(cpu_trap_at_maxtl_takes_a_watchdog_reset_not_a_halt) {
+    Rig r;
+    r.cpu.set_tl(kMaxTl);
+    r.cpu.set_pstate(pstate::PRIV | pstate::PEF | pstate::IE | pstate::MM);
+    r.exec({Tcc(cA, kIcc, 1)}, 1);  // error_state, left at once by a watchdog reset
+    CHECK(!r.cpu.halted());
+    CHECK_EQ(r.cpu.tl(), kMaxTl);
+    CHECK_EQ(r.cpu.trap_type(kMaxTl), 0x101u);  // the trap that caused it
+    CHECK_EQ(r.cpu.tpc(kMaxTl), Rig::kCode);
+    CHECK_EQ(r.cpu.pc(), kRstvAddr + 0x40);
+    CHECK_EQ(r.cpu.pstate_reg(), pstate::RED | pstate::PEF | pstate::PRIV | pstate::AG);  // IE and MM clear
+}
+
 TEST(cpu_divide_uses_y_and_saturates) {
     Rig r;
     r.cpu.set_reg(g1, 0);
@@ -387,6 +400,61 @@ TEST(cpu_dmmu_write_to_a_read_only_page_is_a_protection_trap) {
     r.exec({STXA(g1, g3, g0, asi::DMMU), STXA(g2, g0, g0, asi::DTLB_DATA_IN), STXA(g4, g0, g0, asi::LSU_CONTROL),
             STX(g0, g1, 0)});
     CHECK_EQ(r.cpu.trap_type(1), tt::kFastDataAccessProtection);
+}
+
+TEST(cpu_watchpoints_trap_before_a_watched_byte_is_touched) {
+    // PA watchpoint on byte 4 of the doubleword at 0x20000, for reads (MMU off).
+    {
+        Rig r;
+        r.ram[0x20004] = 0x5A;
+        r.cpu.set_reg(g1, 0x20000);
+        r.cpu.set_reg(g2, 0x40);
+        r.cpu.set_reg(g3, (u64{0x10} << 33) | (1u << 24));  // PM byte 4, PR
+        r.exec({STXA(g1, g2, g0, asi::DMMU), STXA(g3, g0, g0, asi::LSU_CONTROL), LDUW(g4, g1, 0), LDUB(g5, g1, 5),
+                STB(g0, g1, 4)});
+        CHECK_EQ(r.cpu.reg(g4), 0u);  // bytes 0-3: not watched
+        CHECK_EQ(r.cpu.reg(g5), 0u);
+        CHECK_EQ(r.cpu.tl(), 0u);     // (a store, with only reads watched)
+        r.exec({LDUH(g6, g1, 4)}, 1);
+        CHECK_EQ(r.cpu.tl(), 1u);
+        CHECK_EQ(r.cpu.trap_type(1), tt::kPaWatchpoint);
+        CHECK_EQ(r.cpu.reg(g6), 0u);  // before the access
+    }
+    // VA watchpoint (D-MMU on) on writes to byte 0 at VA 0x40000008: it
+    // comes before the MMU's own traps (the page is read-only).
+    {
+        Rig r;
+        r.cpu.set_reg(g1, 0x40000000);
+        r.cpu.set_reg(g2, tte::V | 0x4000 | tte::CP);
+        r.cpu.set_reg(g3, 0x30);
+        r.cpu.set_reg(g4, 0x40000008);
+        r.cpu.set_reg(g5, 0x38);
+        r.cpu.set_reg(g6, 8 | (u64{0x01} << 25) | (1u << 21));  // DM, VM byte 0, VW
+        r.exec({STXA(g1, g3, g0, asi::DMMU), STXA(g2, g0, g0, asi::DTLB_DATA_IN), STXA(g4, g5, g0, asi::DMMU),
+                STXA(g6, g0, g0, asi::LSU_CONTROL), LDX(g7, g1, 8)});
+        CHECK_EQ(r.cpu.tl(), 0u);  // reads are not watched
+        r.exec({STB(g0, g1, 8)}, 1);
+        CHECK_EQ(r.cpu.trap_type(1), tt::kVaWatchpoint);
+        // A trap that enters RED_state clears the LSU control register.
+        CHECK(r.cpu.lsu_control() != 0);
+    }
+}
+
+TEST(cpu_performance_counters_count_instructions_and_cycles_in_the_traced_modes) {
+    Rig r;
+    // PIC.D0 instructions, D1 cycles, privileged mode traced (ST).
+    r.cpu.set_reg(g1, (1u << 4) | 2);
+    r.exec({WRASR(16, g1, g0), WRASR(17, g0, g0), NOP, NOP, NOP, NOP, RDASR(g2, 17)});
+    CHECK_EQ(r.cpu.reg(g2) & 0xFFFFFFFF, 5u);  // the write to PIC (which completes after it) and the four NOPs
+    CHECK((r.cpu.reg(g2) >> 32) >= 5u);
+    // Only user mode traced (UT): nothing counts here.
+    r.cpu.set_reg(g1, (1u << 4) | 4);
+    r.exec({WRASR(16, g1, g0), WRASR(17, g0, g0), NOP, NOP, RDASR(g2, 17)});
+    CHECK_EQ(r.cpu.reg(g2), 0u);
+    // PCR is privileged: privileged_opcode from user mode.
+    r.cpu.set_pstate(pstate::PEF);
+    r.exec({RDASR(g3, 16)}, 1);
+    CHECK_EQ(r.cpu.trap_type(1), tt::kPrivilegedOpcode);
 }
 
 TEST(cpu_tsb_pointers_follow_the_tag_access_register) {

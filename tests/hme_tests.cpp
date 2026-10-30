@@ -282,6 +282,26 @@ TEST(hme_transmits_from_the_ring) {
     CHECK_EQ(r.rd(0x0100) & 0x03000000, 0x03000000u);
 }
 
+// At the host's speed (the machine's Max timing) a frame's wire time is
+// next to nothing: a 1500-byte frame is back within 2 us, where at 100
+// Mbit/s it takes over 120.
+TEST(hme_at_host_speed_sends_without_the_wire_time) {
+    for (bool fast : {false, true}) {
+        Rig r;
+        r.hme.set_fast(fast);
+        r.init(kMac);
+        const std::vector<u8> f = ip_frame(kMac, 1500);
+        std::memcpy(r.mem.data() + 0x8000, f.data(), f.size());
+        r.put_le(0x0804, 0x8000);
+        r.put_le(0x0800, 0x80000000u | 3u << 29 | 1500);
+        r.wr(0x2000, 1);
+        r.run(200);  // 2 us at 100 MHz
+        CHECK_EQ((r.le(0x0800) & 0x80000000u) == 0, fast);
+        r.run(20000);
+        CHECK_EQ(r.le(0x0800) & 0x80000000u, 0u);
+    }
+}
+
 // Frames for this address, broadcast and hashed multicast arrive in the
 // next buffer (from the first-byte offset), padded to 60, with their length
 // and the complemented checksum from the configured start; others are not

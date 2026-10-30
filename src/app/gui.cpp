@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Andy Taylor
 // The main window: the Rage Pro's picture between a menu bar and a status
 // bar, with the Settings dialog and the serial terminal windows. The
-// machine runs on this thread, a millisecond of guest time at a go between
-// frames.
+// machine runs on a thread of its own; this one takes events as they come
+// and draws, holding the machine while it uses it.
 #include <SDL3/SDL.h>
 
 #include <algorithm>
@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "app/display_sdl.h"
+#include "app/host_audio.h"
 #include "app/menu_model.h"
 #include "app/proms.h"
 #include "app/session.h"
@@ -46,6 +47,7 @@ constexpr const char* kAlt = "Alt";
 constexpr const char* kAppName = "UltraViolet";
 
 // Sun Type 5 key numbers the window sends itself.
+constexpr u8 kSunD = 0x4F, kSunF = 0x50, kSunN = 0x69;
 constexpr u8 kSunStop = 0x01, kSunA = 0x4D, kSunUp = 0x14, kSunDown = 0x1B, kSunPageUp = 0x60, kSunPageDown = 0x7B;
 
 std::string file_name(const std::string& path) {
@@ -68,6 +70,9 @@ constexpr SDL_DialogFileFilter kNvramFilters[] = {{"NVRAM images", "bin;nvram;nv
 constexpr SDL_DialogFileFilter kDiskFilters[] = {{"Disk images", "img;raw;dsk;hd;hdd"}, {"All files", "*"}};
 constexpr SDL_DialogFileFilter kDiscFilters[] = {{"CD-ROM images", "iso;img;bin;raw;cdr"}, {"All files", "*"}};
 constexpr SDL_DialogFileFilter kSettingsFilters[] = {{"Settings", "ini;conf;cfg"}, {"All files", "*"}};
+
+constexpr const char* kDiscLocked =
+    "The system has locked the disc in the drive: eject it from the system (eject cdrom)";
 
 constexpr std::array<u64, 7> kDiskSizesMiB = {1024, 2048, 4096, 8192, 16384, 32768, 65536};
 
@@ -99,12 +104,17 @@ private:
         std::string path;
     };
 
-    // Machine
-    void power_on();
+    // Machine (power_on: with these Sun keys held for a while)
+    void power_on(std::vector<u8> held = {});
     void power_off();
     void reset();
     void stop_a();
+    void send_break(unsigned port);
+    void plug_keyboard(bool plugged);
+    void power_button();
     void eject();
+    void next_disc();
+    void apply_sound();
     void status(std::string text) {
         status_text_ = std::move(text);
         status_until_ns_ = SDL_GetTicksNS() + 4000000000ull;
@@ -127,7 +137,8 @@ private:
     void update_title();
 
     // Drawing
-    void frame();
+    bool frame();
+    void present();
     void draw_menu();
     std::vector<MenuEntry> menus();
     void draw_entries(const std::vector<MenuEntry>& entries);
@@ -137,6 +148,7 @@ private:
     void draw_popups();
     void update_picture();
     void update_meters(u64 now_ns);
+    void take_serial_output();
 
     // Files
     void choose(Pick what, const std::string& current);
@@ -168,7 +180,6 @@ private:
     bool native_menus_ = false;                   // macOS: the system menu bar has the menus
     std::vector<std::function<void()>> posted_;  // actions chosen there, run from the main loop
     int pending_frames_ = 3;
-    u64 picture_ns_ = 0;  // host time the last picture of the display took to make
 
     bool captured_ = false;
     // Following the guest's hardware cursor (see mouse_frame)
@@ -177,6 +188,9 @@ private:
     int push_[4] = {};  // pushed against the left, right, top and bottom edges
     float sync_x_ = 0, sync_y_ = 0;
     int sent_x_ = 0, sent_y_ = 0;          // the last steering step
+    int step_cx_ = 0, step_cy_ = 0;        // where the cursor was when it was sent
+    bool stepped_ = false;
+    int still_ = 0;                        // frames the cursor has stood still with the mouse idle
     float gain_x_ = 1.0f, gain_y_ = 1.0f;  // the guest's pointer acceleration, as seen
     // Moving onto the screen may capture the mouse; not again after a release
     // until the pointer has been off the screen.
@@ -189,8 +203,21 @@ private:
     std::array<bool, SDL_SCANCODE_COUNT> keys_down_{};
     std::array<u8, 128> sun_held_{};
 
+    // Sound: the machine's audio, the keyboard's bell and clicks (the
+    // keyboard's counts last heard).
+    HostAudio audio_;
+    u32 rings_heard_ = 0, clicks_heard_ = 0;
+    // Keys held from power-on, and when they are let go.
+    std::vector<u8> held_keys_;
+    u64 release_held_ns_ = 0;
+    static constexpr u64 kHoldNs = 10000000000ull;
+
     std::array<Terminal, 2> terminals_;
     std::array<std::unique_ptr<TerminalWindow>, 2> terminal_windows_;
+    // Serial port bytes: sent by the machine (from its thread), and typed
+    // or answered here, for the machine.
+    std::mutex serial_mutex_;
+    std::array<std::string, 2> serial_out_, serial_in_;
 
     // Status bar
     Light disk_light_, cd_light_, net_light_;
@@ -303,84 +330,114 @@ int Gui::run() {
     // The serial ports, each in a terminal window of its own.
     static const char* const kPortNames[2] = {"Serial Port A (ttya)", "Serial Port B (ttyb)"};
     for (unsigned port = 0; port < 2; ++port) {
-        terminals_[port].set_reply([this, port](const std::string& s) { session_.serial_input(port, s); });
+        auto send = [this, port](const std::string& s) { serial_in_[port] += s; };
+        terminals_[port].set_reply(send);
         terminal_windows_[port] = std::make_unique<TerminalWindow>(
-            std::string(kAppName) + " - " + kPortNames[port], terminals_[port],
-            [this, port](const std::string& s) { session_.serial_input(port, s); }, scale_);
+            std::string(kAppName) + " - " + kPortNames[port], terminals_[port], send, scale_);
+        terminal_windows_[port]->on_break = [this, port] { send_break(port); };
     }
     session_.set_serial_output([this](unsigned port, u8 byte) {
-        if (port < 2) terminals_[port].feed(byte);
+        std::lock_guard<std::mutex> lock(serial_mutex_);
+        if (port < 2) serial_out_[port] += static_cast<char>(byte);
     });
-    // After everything the menus describe exists.
-    native_menus_ = install_native_menus([this] { return menus(); },
-                                         [this](std::function<void()> a) { posted_.push_back(std::move(a)); });
+    if (audio_.open())
+        session_.set_audio_output([this](const s16* frames, std::size_t count, unsigned rate) {
+            audio_.play(frames, count, rate);
+        });
+    apply_sound();
+    // After everything the menus describe exists. The system menu bar asks
+    // for them while events are being fetched, with the machine running.
+    native_menus_ = install_native_menus(
+        [this] {
+            Session::Hold hold(session_);
+            return menus();
+        },
+        [this](std::function<void()> a) { posted_.push_back(std::move(a)); });
 
-    if (options_.power_on) power_on();
-    else if (!prom_choice(session_.settings()).ok) open_settings();  // no PROM image yet
-    update_title();
+    session_.start_thread();
+    {
+        Session::Hold hold(session_);
+        if (options_.power_on) power_on();
+        else if (!prom_choice(session_.settings()).ok) open_settings();  // no PROM image yet
+        update_title();
+    }
 
     constexpr u64 kFrameNs = 1000000000ull / 60;
     u64 next_frame_ns = SDL_GetTicksNS();
     u64 next_periodic_ns = next_frame_ns + 1000000000ull;
-    while (!quit_) {
-        if (stop_) break;
-        if (next_disc_) {
-            next_disc_ = 0;
-            session_.next_disc();
-        }
-        if (session_.on()) {
-            const u64 slice = static_cast<u64>(session_.settings().cpu_mhz * 1000);  // about 1 ms of guest time
-            while (SDL_GetTicksNS() < next_frame_ns && session_.stopped().empty()) session_.run(slice);
-            if (const std::string why = session_.stopped(); !why.empty()) {
-                power_off();
-                message("The machine has stopped:\n\n" + why);
-            }
-        } else {
-            SDL_WaitEventTimeout(nullptr, 50);
-        }
-        const u64 now = SDL_GetTicksNS();
-        if (now < next_frame_ns) continue;
-        next_frame_ns = std::max(next_frame_ns + kFrameNs, now);
-        if (now >= next_periodic_ns) {
-            next_periodic_ns = now + 1000000000ull;
-            session_.periodic();
-        }
+    std::vector<SDL_Event> events;
+    while (!quit_ && !stop_) {
+        // Events as they come, and a frame every sixtieth of a second; the
+        // machine is held only while they are dealt with, never while
+        // waiting or drawing.
+        u64 now = SDL_GetTicksNS();
         SDL_Event ev;
-        while (SDL_PollEvent(&ev)) handle_event(ev);
-        if (!posted_.empty()) {  // chosen from the system menu bar
-            auto actions = std::move(posted_);
-            posted_.clear();
-            for (auto& a : actions) a();
-            pending_frames_ = std::max(pending_frames_, 3);
-        }
-        {
-            std::deque<PickResult> picks;
-            {
-                std::lock_guard<std::mutex> lock(picks_mutex_);
-                picks.swap(picks_);
+        if (now < next_frame_ns &&
+            SDL_WaitEventTimeout(&ev, static_cast<Sint32>((next_frame_ns - now + 999999) / 1000000)))
+            events.push_back(ev);
+        while (SDL_PollEvent(&ev)) events.push_back(ev);
+        now = SDL_GetTicksNS();
+        const bool frame_due = now >= next_frame_ns;
+        bool draw = false;
+        if (!events.empty() || frame_due || !posted_.empty()) {
+            Session::Hold hold(session_);
+            for (const SDL_Event& e : events) handle_event(e);
+            events.clear();
+            for (unsigned port = 0; port < 2; ++port) {
+                if (serial_in_[port].empty()) continue;
+                session_.serial_input(port, serial_in_[port]);
+                serial_in_[port].clear();
             }
-            for (const auto& p : picks) apply_choice(p);
-            if (!picks.empty()) pending_frames_ = std::max(pending_frames_, 2);
+            if (!posted_.empty()) {  // chosen from the system menu bar
+                auto actions = std::move(posted_);
+                posted_.clear();
+                for (auto& a : actions) a();
+                pending_frames_ = std::max(pending_frames_, 3);
+            }
+            if (frame_due) {
+                if (next_disc_) {
+                    next_disc_ = 0;
+                    next_disc();
+                }
+                if (session_.switched_off()) {
+                    power_off();
+                    status("The system switched itself off");
+                }
+                if (const std::string why = session_.stopped(); !why.empty()) {
+                    power_off();
+                    message("The machine has stopped:\n\n" + why);
+                }
+                if (now >= next_periodic_ns) {
+                    next_periodic_ns = now + 1000000000ull;
+                    session_.periodic();
+                }
+                std::deque<PickResult> picks;
+                {
+                    std::lock_guard<std::mutex> lock(picks_mutex_);
+                    picks.swap(picks_);
+                }
+                for (const auto& p : picks) apply_choice(p);
+                if (!picks.empty()) pending_frames_ = std::max(pending_frames_, 2);
+                mouse_frame();
+                draw = frame();
+            }
         }
-        mouse_frame();
-        frame();
+        if (!frame_due) continue;
+        next_frame_ns = std::max(next_frame_ns + kFrameNs, now);
+        if (draw) present();
+        take_serial_output();
         for (auto& t : terminal_windows_) t->frame(now);
-        // The machine runs for at least as long again as making the picture
-        // took, and four times as long while it is behind real time: a host
-        // slow to draw shows fewer frames a second, rather than leaving the
-        // machine behind.
-        if (picture_ns_) {
-            const Ultra5_10* m = session_.machine();
-            const u64 share = m && m->pacer().lag() > 0.05 ? 4 : 1;
-            next_frame_ns = std::max(next_frame_ns, SDL_GetTicksNS() + share * picture_ns_);
-        }
-        picture_ns_ = 0;
     }
 
-    if (!options_.screenshot.empty() && session_.on() && !session_.save_screenshot(options_.screenshot))
-        std::fprintf(stderr, "screenshot: no video signal\n");
-    power_off();
-    if (!options_.power_on && options_.settings_file.empty()) save_settings_to(settings_path_);
+    {
+        Session::Hold hold(session_);
+        if (!options_.screenshot.empty() && session_.on() && !session_.save_screenshot(options_.screenshot))
+            std::fprintf(stderr, "screenshot: no video signal\n");
+        power_off();
+        if (!options_.power_on && options_.settings_file.empty()) save_settings_to(settings_path_);
+        session_.set_audio_output({});
+    }
+    audio_.close();
     for (auto& t : terminal_windows_) t.reset();
     if (texture_) SDL_DestroyTexture(texture_);
     ImGui_ImplSDLRenderer3_Shutdown();
@@ -394,12 +451,18 @@ int Gui::run() {
 
 // --- Machine ---------------------------------------------------------------
 
-void Gui::power_on() {
+void Gui::power_on(std::vector<u8> held) {
     if (session_.on()) return;
     std::string error;
     if (!session_.power_on(error)) {
         message("The Ultra 5/10 cannot be powered on:\n\n" + error);
         return;
+    }
+    if (auto* m = session_.machine(); m && m->keyboard() && !held.empty()) {
+        for (u8 k : held) m->post_key(k, true);
+        held_keys_ = std::move(held);
+        release_held_ns_ = SDL_GetTicksNS() + kHoldNs;
+        status("Holding the keys while OpenBoot starts");
     }
     for (auto& t : terminals_) t.reset();
     picture_stale_ = true;
@@ -414,6 +477,7 @@ void Gui::power_off() {
     if (!session_.on()) return;
     set_captured(false);
     release_keys();
+    held_keys_.clear();
     session_.power_off();
     picture_ = false;
     picture_stale_ = true;
@@ -433,8 +497,8 @@ void Gui::reset() {
 void Gui::stop_a() {
     auto* m = session_.machine();
     if (!m) return;
-    if (!m->keyboard()) {
-        status("No keyboard (the console is ttya): send a break on Serial Port A instead");
+    if (!m->keyboard()) {  // the console is ttya: its abort is a BREAK
+        send_break(0);
         return;
     }
     m->post_key(kSunStop, true);
@@ -443,13 +507,50 @@ void Gui::stop_a() {
     m->post_key(kSunStop, false);
 }
 
+// A BREAK on a serial port, after what has been typed into it.
+void Gui::send_break(unsigned port) {
+    if (!session_.machine()) return;
+    session_.serial_input(port, serial_in_[port]);
+    serial_in_[port].clear();
+    session_.serial_break(port);
+    status(port == 0 ? "BREAK sent on Serial Port A" : "BREAK sent on Serial Port B");
+}
+
+void Gui::plug_keyboard(bool plugged) {
+    auto* m = session_.machine();
+    if (!m || !m->keyboard()) return;
+    release_keys();
+    m->post_keyboard_plugged(plugged);
+    status(plugged ? "Keyboard plugged in" : "Keyboard unplugged: Solaris and OpenBoot take this as an abort");
+}
+
+void Gui::power_button() {
+    if (auto* m = session_.machine()) {
+        m->press_power_button();
+        status("Power button pressed: the system shuts down if its software answers it");
+    }
+}
+
+void Gui::apply_sound() {
+    audio_.set_enabled(session_.settings().sound);
+    audio_.set_volume(static_cast<float>(session_.settings().volume) / 100.0f);
+}
+
 void Gui::eject() {
     if (session_.disc_in_drive() < 0) {
         status("The CD-ROM drive is empty");
         return;
     }
-    session_.eject();
+    if (!session_.eject()) {
+        status(kDiscLocked);
+        return;
+    }
     status("Disc ejected");
+}
+
+void Gui::next_disc() {
+    if (session_.disc_locked()) status(kDiscLocked);
+    else session_.next_disc();
 }
 
 // --- Input -------------------------------------------------------------------
@@ -483,6 +584,8 @@ void Gui::capture_at(float x, float y) {
     sync_x_ = (x - dest_.x) * static_cast<float>(tex_w_) / dest_.w;
     sync_y_ = (y - dest_.y) * static_cast<float>(tex_h_) / dest_.h;
     sent_x_ = sent_y_ = 0;
+    stepped_ = false;
+    still_ = 0;
     gain_x_ = gain_y_ = 1.0f;
 }
 
@@ -523,30 +626,51 @@ void Gui::mouse_frame() {
     int cx = 0, cy = 0;
     const bool cursor = m->graphics().cursor_position(cx, cy) && tex_w_ && tex_h_;
     if (syncing_) {
-        if (!cursor || ++sync_frames_ > 120) {
+        // Moves made meanwhile move the target. Each step waits for the one
+        // before to land: the Sun mouse sends at 1200 baud, and the guest
+        // moves its pointer when it gets to it, so a step sent each frame
+        // would be steered from where the pointer was, not where it was
+        // going, and swing about. A step has landed when the mouse has
+        // nothing left to send and the pointer has moved and stood still; a
+        // step that has not moved it is waited for up to a second (a busy
+        // guest can take that long to act on its mouse, and the first
+        // movement after boot is lost while Solaris finds the mouse's baud
+        // rate), so the steps do not pile up and land all at once; if it
+        // still has not, the guest holds the pointer there (a grab), and
+        // the steering ends. The guest accelerates larger
+        // steps: how much is learnt from what the last whole step did, and
+        // most of the rest of the way is sent.
+        sync_x_ += static_cast<float>(x);
+        sync_y_ += static_cast<float>(y);
+        x = y = 0;
+        still_ = m->mouse_idle() && cx == last_cx_ && cy == last_cy_ ? still_ + 1 : 0;
+        const bool moved = cx != step_cx_ || cy != step_cy_;
+        if (!cursor || ++sync_frames_ > 600 || (stepped_ && !moved && still_ >= 60 && sync_frames_ > 120)) {
             syncing_ = false;
-        } else {
-            // Moves made meanwhile move the target. The guest accelerates
-            // larger steps: how much is learnt from what the last step did,
-            // and most of the rest of the way is sent each frame, so the
-            // pointer gets there in a few frames without overshooting much.
-            sync_x_ += static_cast<float>(x);
-            sync_y_ += static_cast<float>(y);
+        } else if (!stepped_ || still_ >= (moved ? 2 : 60)) {
+            auto learn = [](int sent, int got, float& gain) {
+                if (std::abs(sent) >= 4 && got * sent > 0)
+                    gain = std::clamp(static_cast<float>(got) / static_cast<float>(sent), 1.0f, 8.0f);
+            };
+            if (stepped_) {
+                learn(sent_x_, cx - step_cx_, gain_x_);
+                learn(sent_y_, cy - step_cy_, gain_y_);
+            }
             const int rest_x = static_cast<int>(std::lround(sync_x_)) - (cx + hot_x_);
             const int rest_y = static_cast<int>(std::lround(sync_y_)) - (cy + hot_y_);
-            auto steer = [](int rest, int& sent, int moved, float& gain) {
-                if (std::abs(sent) >= 4 && moved * sent > 0)
-                    gain = std::clamp(static_cast<float>(moved) / static_cast<float>(sent), 1.0f, 8.0f);
-                sent = std::abs(rest) <= 2 ? rest : static_cast<int>(std::lround(static_cast<float>(rest) * 0.75f / gain));
-                sent = std::clamp(sent, -112, 127);
-                return sent;
+            auto step = [](int rest, float gain) {
+                const int sent = std::abs(rest) <= 2 ? rest : static_cast<int>(std::lround(static_cast<float>(rest) * 0.9f / gain));
+                return std::clamp(sent, -112, 127);
             };
             if (std::abs(rest_x) <= 1 && std::abs(rest_y) <= 1) {
                 syncing_ = false;
-                x = y = 0;
             } else {
-                x = steer(rest_x, sent_x_, cx - last_cx_, gain_x_);
-                y = steer(rest_y, sent_y_, cy - last_cy_, gain_y_);
+                x = sent_x_ = step(rest_x, gain_x_);
+                y = sent_y_ = step(rest_y, gain_y_);
+                step_cx_ = cx;
+                step_cy_ = cy;
+                stepped_ = true;
+                still_ = 0;
             }
         }
     }
@@ -592,6 +716,14 @@ void Gui::mouse_frame() {
 // A host key to the Sun keyboard, by its position.
 void Gui::key(SDL_Scancode sc, bool down) {
     auto* m = session_.machine();
+#if defined(__APPLE__)
+    // macOS reports Caps Lock as down while it is on and up when it goes
+    // off: each change is a press of the Sun's Caps Lock (which toggles).
+    if (sc == SDL_SCANCODE_CAPSLOCK) {
+        if (m) tap_key(SunKeyboard::from_usb(SDL_SCANCODE_CAPSLOCK));
+        return;
+    }
+#endif
     if (!m || static_cast<std::size_t>(sc) >= keys_down_.size() || keys_down_[sc] == down) return;
     keys_down_[sc] = down;
     const u8 sun = SunKeyboard::from_usb(sc);
@@ -625,7 +757,7 @@ bool Gui::hotkey(const SDL_KeyboardEvent& k) {
             if (down) stop_a();
             return true;
         case SDL_SCANCODE_E:
-            if (down) session_.next_disc();
+            if (down) next_disc();
             return true;
         case SDL_SCANCODE_F:
             if (down) toggle_fullscreen();
@@ -741,9 +873,7 @@ void Gui::update_picture() {
     shown_version_ = gfx.display_version();
     unsigned w = 0, h = 0;
     const bool had = picture_;
-    const u64 start = SDL_GetTicksNS();
     picture_ = gfx.render(pixels_, w, h);
-    picture_ns_ = SDL_GetTicksNS() - start;
     if (picture_ != had) update_title();
     if (!picture_) return;
     if (!texture_ || w != tex_w_ || h != tex_h_) {
@@ -777,11 +907,35 @@ void Gui::update_meters(u64 now) {
     last_instructions_ = instructions;
 }
 
-void Gui::frame() {
+// What the serial ports sent, to their terminals.
+void Gui::take_serial_output() {
+    std::array<std::string, 2> out;
+    {
+        std::lock_guard<std::mutex> lock(serial_mutex_);
+        out.swap(serial_out_);
+    }
+    for (unsigned port = 0; port < 2; ++port)
+        for (char c : out[port]) terminals_[port].feed(static_cast<u8>(c));
+}
+
+// Updates what the window shows from the machine and lays out the frame
+// (the machine held); true if there is a frame to present.
+bool Gui::frame() {
     const u64 now = SDL_GetTicksNS();
     update_picture();
     if (auto* m = session_.machine()) {
         update_meters(now);
+        if (!held_keys_.empty() && now >= release_held_ns_) {
+            for (u8 k : held_keys_) m->post_key(k, false);
+            held_keys_.clear();
+        }
+        if (const SunKeyboard* k = m->keyboard()) {
+            audio_.set_bell(k->bell());
+            if (k->bell_rings() != rings_heard_) audio_.ring();
+            if (k->clicks() != clicks_heard_) audio_.click();
+            rings_heard_ = k->bell_rings();
+            clicks_heard_ = k->clicks();
+        }
         // The status bar is looked at ten times a second, and redrawn only
         // when what it shows has changed: an idle machine costs no frames.
         if (now >= next_status_ns_) {
@@ -801,7 +955,7 @@ void Gui::frame() {
         status_text_.clear();
         pending_frames_ = std::max(pending_frames_, 1);
     }
-    if (pending_frames_ <= 0) return;
+    if (pending_frames_ <= 0) return false;
     --pending_frames_;
 
     ImGui_ImplSDLRenderer3_NewFrame();
@@ -841,7 +995,12 @@ void Gui::frame() {
     draw_settings();
     draw_popups();
     ImGui::Render();
+    return true;
+}
 
+// Draws the frame laid out last (the machine running meanwhile).
+void Gui::present() {
+    ImGuiIO& io = ImGui::GetIO();
     SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
     SDL_RenderClear(renderer_);
     if (picture_ && texture_) {
@@ -869,14 +1028,44 @@ std::vector<MenuEntry> Gui::menus() {
     std::vector<E> machine;
     if (!m) {
         machine.push_back(E::item("Power On", [this] { power_on(); }).key('P'));
+        // Keys held as the machine comes on, which OpenBoot reads from the
+        // keyboard's self-test response.
+        std::vector<E> held;
+        held.push_back(E::item("Stop (skip POST)", [this] { power_on({kSunStop}); }));
+        held.push_back(E::item("Stop-D (diagnostics)", [this] { power_on({kSunStop, kSunD}); }));
+        held.push_back(E::item("Stop-F (Forth on ttya)", [this] { power_on({kSunStop, kSunF}); }));
+        held.push_back(E::item("Stop-N (NVRAM defaults)", [this] { power_on({kSunStop, kSunN}); }));
+        machine.push_back(E::submenu("Power On Holding", std::move(held)));
     } else {
         machine.push_back(E::item("Power Off Now", [this] { power_off(); })
                               .tip("Cuts the power at once, without shutting down (the NVRAM is kept)"));
         machine.push_back(E::item("Reset", [this] { reset(); }).tip("Restarts the machine from OpenBoot at once"));
+        machine.push_back(E::item("Press Power Button", [this] { power_button(); })
+                              .tip("The front-panel button: the system shuts down and switches off, if its software answers it"));
         machine.push_back(E::separator());
-        machine.push_back(E::item("Send Stop-A", [this] { stop_a(); }, m->keyboard() != nullptr)
+        machine.push_back(E::item(m->keyboard() ? "Send Stop-A" : "Send BREAK (Stop-A)", [this] { stop_a(); })
                               .key('A')
-                              .tip("The abort keys: OpenBoot's ok prompt (go resumes the system)"));
+                              .tip("The abort keys, or a BREAK on ttya when it is the console: OpenBoot's ok prompt "
+                                   "(go resumes the system)"));
+        if (m->keyboard()) {
+            // The Sun keys a PC keyboard lacks (the left-hand block, Help, Power).
+            static const struct {
+                const char* name;
+                u8 code;
+            } kSunKeys[] = {{"Stop (L1)", 0x01},  {"Again (L2)", 0x03}, {"Props (L3)", 0x19}, {"Undo (L4)", 0x1A},
+                            {"Front (L5)", 0x31}, {"Copy (L6)", 0x33},  {"Open (L7)", 0x48},  {"Paste (L8)", 0x49},
+                            {"Find (L9)", 0x5F},  {"Cut (L10)", 0x61},  {"Help", 0x76},       {"Power", 0x30}};
+            std::vector<E> keys;
+            for (const auto& k : kSunKeys) keys.push_back(E::item(k.name, [this, code = k.code] { tap_key(code); }));
+            machine.push_back(E::submenu("Sun Keys", std::move(keys)));
+        }
+        if (const SunKeyboard* k = m->keyboard()) {
+            const bool plugged = k->plugged();
+            machine.push_back(E::item(plugged ? "Unplug Keyboard" : "Plug In Keyboard",
+                                      [this, plugged] { plug_keyboard(!plugged); })
+                                  .tip(plugged ? "The line rests at space: a break, which Solaris and OpenBoot take as an abort"
+                                               : "The keyboard powers up and reports itself, as when plugged in"));
+        }
     }
     machine.push_back(E::separator());
     machine.push_back(E::item("Settings...", [this] { open_settings(); }).as(E::Role::Settings));
@@ -893,14 +1082,15 @@ std::vector<MenuEntry> Gui::menus() {
     media.push_back(E::heading("CD-ROM (secondary IDE master)"));
     media.push_back(E::item("Eject", [this] { eject(); }, loaded));
     media.push_back(E::item("Insert Disc...", [this] { choose(Pick::InsertDisc, {}); }, m != nullptr));
-    media.push_back(E::item("Next Disc in Set", [this] { session_.next_disc(); }, m && !session_.discs().empty())
+    media.push_back(E::item("Next Disc in Set", [this] { next_disc(); }, m && !session_.discs().empty())
                         .key('E'));
     const std::vector<std::string>& discs = session_.discs();
     if (!discs.empty()) media.push_back(E::separator());
     for (std::size_t i = 0; i < discs.size(); ++i) {
         const bool in = session_.disc_in_drive() == static_cast<int>(i);
         media.push_back(E::item(file_name(discs[i]), [this, i] {
-                            if (!session_.select_disc(static_cast<int>(i))) status("The disc could not be opened");
+                            if (session_.disc_locked()) status(kDiscLocked);
+                            else if (!session_.select_disc(static_cast<int>(i))) status("The disc could not be opened");
                         }, m != nullptr, in).tip(discs[i]));
     }
     media.push_back(E::separator());
@@ -1128,6 +1318,7 @@ bool Gui::accept_settings() {
     if (session_.on()) s.cdroms = session_.discs();  // the drive's set is kept by the drive
     session_.set_settings(s);
     save_settings_to(settings_path_);
+    apply_sound();
     settings_error_.clear();
     if (session_.on()) status("Settings saved; most take effect at the next power-on");
     return true;
@@ -1396,6 +1587,12 @@ void Gui::draw_settings() {
             ImGui::Spacing();
             ImGui::Checkbox("JIT (translate guest code to host code)", &edit_.jit);
             ImGui::Checkbox("Block cache (decode guest code once)", &edit_.block_cache);
+            ImGui::Checkbox("Idle skipping", &edit_.idle_skip);
+            ImGui::SetItemTooltip("While the guest waits in its idle loop, guest time moves on to the next event\n"
+                                  "at once and the host sleeps, instead of running the loop round and round");
+            ImGui::Checkbox("Fast disk", &edit_.fast_disk);
+            ImGui::SetItemTooltip("The hard disk and CD-ROM answer at once and transfer at host speed, rather than\n"
+                                  "with a real drive's delays and the IDE controller's 16.6 MB/s");
             ImGui::Spacing();
             label("Log level");
             ImGui::SetNextItemWidth(120 * scale_);
@@ -1423,6 +1620,17 @@ void Gui::draw_settings() {
             if (ImGui::Combo("##wheel", &wheel, "Not used\0As the Up and Down arrow keys\0As Page Up and Page Down\0"))
                 edit_.wheel_keys = kWheelKeys[wheel];
             ImGui::TextDisabled("The Sun mouse has no wheel: it can be sent as keys instead.");
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Sound")) {
+            ImGui::Checkbox("Play the machine's sound on this computer", &edit_.sound);
+            ImGui::SetItemTooltip("The on-board audio, and the keyboard's bell and key clicks");
+            ImGui::Spacing();
+            label("Volume");
+            ImGui::SetNextItemWidth(-1);
+            int volume = static_cast<int>(edit_.volume);
+            if (ImGui::SliderInt("##volume", &volume, 0, 100, "%d%%")) edit_.volume = static_cast<unsigned>(volume);
+            ImGui::TextDisabled("Takes effect at once, without powering off.");
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
@@ -1593,7 +1801,8 @@ void Gui::apply_choice(const PickResult& r) {
             break;
         case Pick::AddDisc: edit_.cdroms.push_back(r.path); break;
         case Pick::InsertDisc:
-            if (!session_.insert_disc(r.path)) message("The disc could not be opened:\n\n" + r.path);
+            if (session_.disc_locked()) message(kDiscLocked);
+            else if (!session_.insert_disc(r.path)) message("The disc could not be opened:\n\n" + r.path);
             break;
         case Pick::OpenSettings: {
             Settings s;

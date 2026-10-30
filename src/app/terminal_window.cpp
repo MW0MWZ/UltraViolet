@@ -163,6 +163,10 @@ void TerminalWindow::type(const std::string& bytes) {
 
 void TerminalWindow::key_down(const SDL_KeyboardEvent& key) {
     const bool ctrl = key.mod & SDL_KMOD_CTRL, shift = key.mod & SDL_KMOD_SHIFT, cmd = key.mod & SDL_KMOD_GUI;
+    if (key.key == SDLK_PAUSE || (((ctrl && shift) || cmd) && key.key == SDLK_B)) {
+        if (on_break) on_break();
+        return;
+    }
     if ((ctrl && shift) || cmd) {  // copy and paste: Ctrl+Shift+C/V, or Cmd+C/V on a Mac
         if (key.key == SDLK_C) copy();
         else if (key.key == SDLK_V) paste();

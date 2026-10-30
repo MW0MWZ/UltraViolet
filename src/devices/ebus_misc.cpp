@@ -26,6 +26,7 @@ void SuperIoConfig::reset() {
     regs_[8] = sid_;  // SID: the chip's identification
     index_ = 0;
     first_read_ = true;
+    armed_ = false;
 }
 
 bool SuperIoConfig::read(u64 offset, unsigned, u64& value) {
@@ -43,10 +44,14 @@ bool SuperIoConfig::write(u64 offset, unsigned, u64 value) {
     if ((offset & 1) == 0) {
         index_ = v;
         first_read_ = false;
-    } else if (index_ != 8) {
-        // Data writes are made twice in succession on the real chip; the
-        // second carries the value, so taking each is equivalent.
-        regs_[index_] = v;
+        armed_ = false;
+    } else if (!armed_) {
+        // A configuration register takes the second of two consecutive
+        // writes to the data port (PC87332 datasheet, 2.2).
+        armed_ = true;
+    } else {
+        armed_ = false;
+        if (index_ != 8) regs_[index_] = v;
     }
     return true;
 }
@@ -130,7 +135,19 @@ bool FlashProm::write(u64 offset, unsigned size, u64 value) {
 }
 
 RegisterBlock::RegisterBlock(std::string name, std::size_t size, u8 fill)
-    : name_(std::move(name)), bytes_(size, fill), seen_(size, false) {}
+    : name_(std::move(name)), fill_(fill), bytes_(size, fill), seen_(size, false) {}
+
+bool PowerControl::read(u64 offset, unsigned size, u64& value) {
+    value = 0;
+    for (unsigned i = 0; i < size; ++i) value = (value << 8) | bytes_[(offset + i) % kSize];
+    return true;
+}
+
+bool PowerControl::write(u64 offset, unsigned size, u64 value) {
+    for (unsigned i = 0; i < size; ++i) bytes_[(offset + i) % kSize] = static_cast<u8>(value >> (8 * (size - 1 - i)));
+    if ((bytes_[0] & kSystemOff) && on_power_off) on_power_off();
+    return true;
+}
 
 bool RegisterBlock::read(u64 offset, unsigned size, u64& value) {
     value = 0;

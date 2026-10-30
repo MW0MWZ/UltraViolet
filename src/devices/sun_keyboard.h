@@ -31,6 +31,12 @@ public:
     void key(u8 code, bool down);
     // Every key up (as when the window loses the keyboard).
     void release_all();
+    // Unplugged, the line rests at space: a break (which Solaris takes as
+    // an abort, as from the keyboard's Stop-A) and nothing more until it is
+    // plugged in again, when the keyboard powers up and sends its self-test
+    // response (FF, its type, then 7F or the keys held).
+    void set_plugged(bool plugged);
+    bool plugged() const { return plugged_; }
 
     // The Type 5 key in the place of a USB keyboard's key (HID usage page 7,
     // as SDL's scancodes number them); 0 if there is none.
@@ -40,6 +46,11 @@ public:
     u8 leds() const { return leds_; }  // num 1, compose 2, scroll 4, caps 8, kana 0x10
     bool bell() const { return bell_; }
     bool click() const { return click_; }
+    // How many times the bell has been turned on, and keys have clicked
+    // (click on, a key going down), since power-on: so a bell or click too
+    // short to be seen between two looks is still heard.
+    u32 bell_rings() const { return bell_rings_; }
+    u32 clicks() const { return clicks_; }
 
 private:
     void command(u8 byte);
@@ -50,7 +61,8 @@ private:
     double cpu_hz_;
     Timer self_test_;
     u8 layout_ = kLayoutUs, leds_ = 0;
-    bool bell_ = false, click_ = false, led_next_ = false;
+    bool bell_ = false, click_ = false, led_next_ = false, plugged_ = true;
+    u32 bell_rings_ = 0, clicks_ = 0;
     std::array<bool, 128> down_{};
 };
 
@@ -65,6 +77,8 @@ public:
     void set_buttons(unsigned buttons) { buttons_ = buttons & 7; }
     // Sends a packet if there is news and the line has finished the last.
     void poll();
+    // Nothing waiting to be sent, and the last packet has left the line.
+    bool idle() const { return dx_ == 0 && dy_ == 0 && !line_.rx_pending(); }
 
 private:
     SerialLine& line_;

@@ -35,7 +35,23 @@ void SunKeyboard::reset() {
     bell_ = click_ = led_next_ = false;
 }
 
+void SunKeyboard::set_plugged(bool plugged) {
+    if (plugged == plugged_) return;
+    plugged_ = plugged;
+    self_test_.cancel();
+    line_.rx_clear();
+    leds_ = 0;
+    bell_ = click_ = led_next_ = false;
+    if (!plugged) {
+        line_.receive_break();
+        return;
+    }
+    // Power-up: the self-test, then its response.
+    self_test_.schedule_in(static_cast<u64>(cpu_hz_ * kSelfTestSeconds));
+}
+
 void SunKeyboard::command(u8 b) {
+    if (!plugged_) return;
     if (led_next_) {  // SETLED's parameter, whatever its value
         leds_ = b;
         led_next_ = false;
@@ -50,7 +66,10 @@ void SunKeyboard::command(u8 b) {
             bell_ = click_ = false;
             self_test_.schedule_in(static_cast<u64>(cpu_hz_ * kSelfTestSeconds));
             break;
-        case kBellOn: bell_ = true; break;
+        case kBellOn:
+            if (!bell_) ++bell_rings_;
+            bell_ = true;
+            break;
         case kBellOff: bell_ = false; break;
         case kClickOn: click_ = true; break;
         case kClickOff: click_ = false; break;
@@ -75,9 +94,11 @@ void SunKeyboard::self_test_done() {
 
 void SunKeyboard::key(u8 code, bool down) {
     if (code == 0 || code >= kIdle - 1 || down_[code] == down) return;
+    if (!plugged_) return;
     down_[code] = down;
     if (self_test_.active()) return;  // (reported with the self-test response)
     if (down) {
+        if (click_) ++clicks_;
         send(code);
         return;
     }

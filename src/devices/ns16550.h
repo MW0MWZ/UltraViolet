@@ -40,6 +40,7 @@ private:
     };
 
     void update_irq();
+    bool rx_interrupt() const;
     LineFormat format() const;
     u64 char_cycles() const;
     u64 device_cycles() const;  // a character time on the line (the device's, if it has one)

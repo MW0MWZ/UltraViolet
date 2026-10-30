@@ -56,12 +56,18 @@ public:
     // (re)schedule timers, including themselves.
     void run_due(u64 now);
 
+    // Called when an event is scheduled before the earliest one pending (a
+    // device the CPU just wrote to): the CPU, running up to that one, must
+    // stop for it.
+    void set_on_earlier(std::function<void()> fn) { on_earlier_ = std::move(fn); }
+
 private:
     friend class Timer;
     void insert(Timer* t);
     void remove(Timer* t);
 
     std::function<u64()> now_;
+    std::function<void()> on_earlier_;
     void update_next() { next_ = queue_.empty() ? kNever : queue_.front()->when_; }
 
     std::vector<Timer*> queue_;  // sorted by when_; device count is small, so insertion sort is fine

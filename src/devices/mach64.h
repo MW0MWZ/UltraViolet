@@ -36,6 +36,9 @@ public:
     void reset() override;
 
     const std::vector<u8>& vram() const { return vram_; }
+    // The palette DAC's entries (R, G, B) and pixel read mask.
+    const std::array<std::array<u8, 3>, 256>& palette() const { return palette_; }
+    u8 dac_mask() const { return dac_mask_; }
 
     // The picture as the monitor would show it: `width` x `height` pixels of
     // 0x00RRGGBB (blank while the CRTC or display is off). False if no mode

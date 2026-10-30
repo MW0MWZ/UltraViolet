@@ -3,6 +3,7 @@
 #include "app/session.h"
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 
@@ -35,6 +36,63 @@ bool create_blank_image(const std::string& path, u64 bytes, std::string& error) 
     return true;
 }
 
+Session::~Session() {
+    if (thread_.joinable()) {
+        {
+            Hold hold(*this);
+            quit_ = true;
+        }
+        thread_.join();
+    }
+    power_off();
+}
+
+void Session::start_thread() {
+    if (!thread_.joinable()) thread_ = std::thread([this] { machine_thread(); });
+}
+
+void Session::machine_thread() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    for (;;) {
+        resume_.wait(lock, [this] {
+            return quit_ || (holds_.load(std::memory_order_acquire) == 0 && machine_ && !machine_->cpu().halted() &&
+                             !machine_->switched_off());
+        });
+        if (quit_) return;
+        machine_->run(slice_);
+    }
+}
+
+// The pacer waits here while guest time is ahead of the wall clock; a hold
+// ends the wait at once (the next slice waits for what is left).
+void Session::host_sleep(u64 ns) {
+    std::unique_lock<std::mutex> lock(sleep_mutex_);
+    wake_.wait_for(lock, std::chrono::nanoseconds(ns), [this] { return holds_.load(std::memory_order_acquire) > 0; });
+}
+
+namespace {
+thread_local unsigned t_holds = 0;  // holds this thread has
+}  // namespace
+
+Session::Hold::Hold(Session& session) : s_(session), nested_(t_holds++ > 0) {
+    if (nested_) return;
+    s_.holds_.fetch_add(1, std::memory_order_acq_rel);
+    {
+        std::lock_guard<std::mutex> lock(s_.sleep_mutex_);
+    }
+    s_.wake_.notify_all();
+    s_.mutex_.lock();
+}
+
+Session::Hold::~Hold() {
+    --t_holds;
+    if (nested_) return;
+    // (Released under the lock, so the machine's thread cannot miss it.)
+    s_.holds_.fetch_sub(1, std::memory_order_acq_rel);
+    s_.mutex_.unlock();
+    s_.resume_.notify_all();
+}
+
 bool Session::power_on(std::string& error) {
     if (machine_) return true;
     const Settings& s = settings_;
@@ -59,6 +117,7 @@ bool Session::power_on(std::string& error) {
         return false;
     }
     if (turbo_ && turbo_available()) o.timing = Pacer::Mode::Max;
+    o.host_clock.sleep_ns = [this](u64 ns) { host_sleep(ns); };
     try {
         machine_ = std::make_unique<Ultra5_10>(o);
     } catch (const std::exception& e) {
@@ -68,12 +127,15 @@ bool Session::power_on(std::string& error) {
     UV_LOG(Info, "session", "flash PROM: %s (OpenBoot %s)", prom.path.c_str(), prom.version.c_str());
     machine_->cpu().set_block_cache(s.block_cache);
     machine_->cpu().set_jit(s.jit);
+    machine_->cpu().set_idle_skip(s.idle_skip);
+    slice_ = static_cast<u64>(s.cpu_mhz * 1000);
     disc_ = s.cdroms.empty() ? -1 : 0;
     if (disc_ >= 0 && machine_->disc().empty()) {
         UV_LOG(Warn, "session", "cannot open the disc %s", s.cdroms.front().c_str());
         disc_ = -1;
     }
     wire_serial();
+    machine_->set_audio_sink(audio_out_);
     return true;
 }
 
@@ -99,6 +161,11 @@ void Session::set_serial_output(std::function<void(unsigned, u8)> out) {
     if (machine_) wire_serial();
 }
 
+void Session::set_audio_output(Cs4231::AudioSink out) {
+    audio_out_ = std::move(out);
+    if (machine_) machine_->set_audio_sink(audio_out_);
+}
+
 void Session::wire_serial() {
     auto out = serial_out_;
     machine_->ttya().transmit = [out](u8 b) {
@@ -116,20 +183,33 @@ void Session::serial_input(unsigned port, const std::string& bytes) {
     machine_->poll_serial();
 }
 
+void Session::serial_break(unsigned port) {
+    if (!machine_) return;
+    (port == 0 ? machine_->ttya() : machine_->ttyb()).receive_break();
+    machine_->poll_serial();
+}
+
+// The drive's eject button does nothing while the system has locked the
+// disc in (PREVENT MEDIUM REMOVAL): it has to be ejected from the system.
+bool Session::disc_locked() const { return machine_ && !machine_->disc().empty() && machine_->cdrom().locked(); }
+
 bool Session::select_disc(int index) {
     if (!machine_ || index < 0 || index >= static_cast<int>(settings_.cdroms.size())) return false;
+    if (disc_locked()) return false;
     if (!machine_->insert_cdrom(settings_.cdroms[static_cast<std::size_t>(index)])) return false;
     disc_ = index;
     return true;
 }
 
-void Session::eject() {
-    if (machine_) machine_->insert_cdrom({});
+bool Session::eject() {
+    if (!machine_ || disc_locked()) return false;
+    machine_->insert_cdrom({});
+    return true;
 }
 
-void Session::next_disc() {
-    if (!machine_ || settings_.cdroms.empty()) return;
-    select_disc(disc_ < 0 ? 0 : (disc_ + 1) % static_cast<int>(settings_.cdroms.size()));
+bool Session::next_disc() {
+    if (!machine_ || settings_.cdroms.empty()) return false;
+    return select_disc(disc_ < 0 ? 0 : (disc_ + 1) % static_cast<int>(settings_.cdroms.size()));
 }
 
 bool Session::insert_disc(const std::string& path) {
@@ -143,7 +223,7 @@ bool Session::insert_disc(const std::string& path) {
 }
 
 void Session::run(u64 instructions) {
-    if (machine_ && !machine_->cpu().halted()) machine_->run(instructions);
+    if (machine_ && !machine_->cpu().halted() && !machine_->switched_off()) machine_->run(instructions);
 }
 
 void Session::periodic() {

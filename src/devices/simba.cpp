@@ -14,14 +14,27 @@ Simba::Simba(bool bus_a, std::function<u64()> ticks)
     // control and diagnostics are writable; the DMA and PIO error status
     // registers (0xC8, 0xE8) are write-one-to-clear.
     for (unsigned r = 0xB8; r < 0x100; r += 4) set_wmask(static_cast<u8>(r), 4, 0xFFFFFFFF);
+    // Not implemented (APB User's Manual): the I/O and memory base and
+    // limit registers (the address maps take their place), the upper I/O
+    // halves, the expansion ROM and interrupt line: they read 0. Of the
+    // bridge control, only secondary reset, master-abort mode, SERR# and
+    // parity error response are writable.
+    set_wmask(pci::kIoBase, 2, 0);
+    set_wmask(pci::kMemBase, 4, 0);
+    set_wmask(pci::kPrefBase, 4, 0);
+    set_wmask(pci::kIoBaseUpper, 4, 0);
+    set_wmask(0x38, 4, 0);
+    set_wmask(pci::kInterruptLine, 1, 0);
+    set_wmask(pci::kBridgeControl, 2, 0x0063);
     for (unsigned r : {0xC8u, 0xCCu, 0xE8u, 0xECu}) {
         set_wmask(static_cast<u8>(r), 4, 0);
         set_w1c(static_cast<u8>(r), 4, 0xFFFFFFFF);
     }
-    if (bus_a) {
-        set_cfg8(kIoMap, 0xFF);
-        set_cfg8(kMemMap, 0xFF);
-    }
+    // The bus with the boot flash (function 1, which Sun calls bus A and
+    // the APB manual bus B) forwards all memory at reset, as the APB's BOOT
+    // pin selects; the I/O maps and the other bus's start empty (APB
+    // User's Manual 805-1251, chapter 4).
+    if (bus_a) set_cfg8(kMemMap, 0xFF);
     save_reset_state();
 }
 

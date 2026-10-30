@@ -77,6 +77,11 @@ private:
     bool mem_write(u64 offset, unsigned size, u64 value);
     u64 mem_stable(u64 offset, unsigned size);
     void pio_error(u64 bit);
+    void pio_write(u64 pa, unsigned size);
+    bool claims(u32 dvma) const;
+    void dma_error(u32 dvma, bool write, unsigned kind, u64 tte_pa);
+    void update_error_interrupts();
+    bool translate(u32 dvma, bool write, u64& pa, unsigned& kind, u64& tte_pa) const;
 
     u64& imap(unsigned ino);
     void dispatch(unsigned ino);
@@ -99,6 +104,7 @@ private:
     Timer retry_timer_;
     u64 iommu_ctl_ = 0, iommu_tsb_ = 0;
     u64 pci_ctl_ = 0, pci_afsr_ = 0, pci_afar_ = 0, pci_diag_ = 0, pci_tasr_ = 0;
+    u64 ue_afsr_ = 0, ce_afsr_ = 0, uece_afar_ = 0;
     u64 reset_ctl_ = 0;
     // Timer/counters: 29-bit counts at 1 MHz; the limit register holds the
     // interrupt enable (bit 31), clear-at-limit (bit 30), restart (bit 29)

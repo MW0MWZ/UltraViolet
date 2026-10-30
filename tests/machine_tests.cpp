@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andy Taylor
 #include <algorithm>
+#include <cstring>
 #include <ctime>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "core/endian.h"
@@ -12,7 +14,9 @@
 #include "devices/ns16550.h"
 #include "devices/pci.h"
 #include "devices/sab82532.h"
+#include "devices/sun_keyboard.h"
 #include "machine/ultra5_10/ultra5_10.h"
+#include "sparc_asm.h"
 #include "test.h"
 
 using namespace uv;
@@ -186,6 +190,120 @@ TEST(pci_decoding_follows_every_configuration_change) {
     CHECK(bus_read(root, 0x80002010) == ~0ull);
 }
 
+// OpenBoot's reset-all stores the soft power-on reset bit to Sabre's reset
+// control register: the reset comes after the store, between instructions,
+// and the instruction after the store never runs (it used to run in the
+// reset state, which took OpenBoot to error_state).
+// OpenBoot's power-off writes bit 0 of the power control register (EBus
+// 0x724000, its first byte): the system switches off after the store and
+// runs no further.
+TEST(machine_ver_mask_follows_the_processor_module) {
+    using namespace uv::test::sparc;
+    for (const auto& [mhz, ecache, mask] : {std::tuple{300.0, 512u << 10, 0x13u}, {360.0, 2u << 20, 0x13u},
+                                           {360.0, 256u << 10, 0x91u}, {440.0, 2u << 20, 0x91u}}) {
+        Ultra5_10::Options o = small_options();
+        o.cpu_hz = mhz * 1e6;
+        o.ecache_bytes = ecache;
+        store_be<u32>(o.prom.data() + 0x20, RDPR(g1, prVER));
+        Ultra5_10 m(o);
+        m.run(1);
+        CHECK_EQ((m.cpu().reg(g1) >> 24) & 0xFF, mask);
+        CHECK_EQ(m.cpu().reg(g1) >> 32, 0x00170012u);  // TI, the IIi
+    }
+}
+
+TEST(machine_switches_itself_off_through_the_power_register) {
+    using namespace uv::test::sparc;
+    Ultra5_10::Options o = small_options();
+    const u32 code[] = {
+        SETHI(g2, 0x01000000),  // (the first byte, as a 32-bit big-endian store puts it)
+        MOVi(g1, 0x1FF),
+        SLLXi(g1, g1, 32),
+        SETHI(g3, 0xF1724000),
+        OR(g1, g1, g3),         // the power register through the EBus at power-on, 0x1FFF1724000
+        STWA(g2, g1, g0, 0x15),
+        ADDi(g5, g5, 1),        // never reached
+    };
+    for (std::size_t i = 0; i < std::size(code); ++i) store_be<u32>(o.prom.data() + 0x20 + 4 * i, code[i]);
+    Ultra5_10 m(o);
+    m.run(100);
+    CHECK(m.switched_off());
+    CHECK_EQ(m.cpu().reg(g5), 0u);
+    const u64 at = m.cpu().instructions();
+    m.run(100);
+    CHECK_EQ(m.cpu().instructions(), at);  // off
+    m.reset();                             // the power switch
+    CHECK(!m.switched_off());
+    m.run(3);
+    CHECK_EQ(m.cpu().instructions(), at + 3);
+}
+
+TEST(machine_soft_resets_come_after_the_store_that_asks_for_them) {
+    using namespace uv::test::sparc;
+    for (const auto& [bit, vector] : {std::pair<u32, u64>{0x40000000, 0x20}, {0x20000000, 0x60}}) {
+        Ultra5_10::Options o = small_options();
+        const u32 code[] = {
+            WRPRi(7, g0, 0),  // TL 0 (an XIR at MAXTL is error_state)
+            SETHI(g2, bit),
+            MOVi(g1, 0x1FE),
+            SLLXi(g1, g1, 32),
+            SETHI(g3, 0xF000),
+            ORi(g3, g3, 0x20),
+            OR(g1, g1, g3),       // Sabre's reset control register, 0x1FE0000F020
+            STXA(g2, g1, g0, 0x14),
+            ADDi(g5, g5, 1),      // never reached
+        };
+        for (std::size_t i = 0; i < std::size(code); ++i) store_be<u32>(o.prom.data() + 0x20 + 4 * i, code[i]);
+        Ultra5_10 m(o);
+        m.run(std::size(code) - 1);  // up to the store
+        CHECK_EQ(m.cpu().pc(), usparc::kRstvAddr + vector);
+        CHECK_EQ(m.cpu().reg(g5), 0u);
+        CHECK(!m.cpu().halted());
+        if (vector != 0x20) continue;
+        m.run(100);  // round again, and again
+        CHECK_EQ(m.cpu().reg(g5), 0u);
+        CHECK(!m.cpu().halted());
+    }
+}
+
+// A device the processor gives work to in the middle of a run acts when
+// it is due, not when the run ends: the count of Sabre's timer 0, set to
+// go back to zero at its limit (8 us after the store), read 4500 steps on,
+// is the same whether the machine runs in one go or a step at a time.
+TEST(machine_events_scheduled_by_a_store_come_on_time) {
+    using namespace uv::test::sparc;
+    Ultra5_10::Options o = small_options();
+    const u32 code[] = {
+        MOVi(g1, 0x1FE),
+        SLLXi(g1, g1, 32),
+        SETHI(g3, 0x1C00),
+        OR(g1, g1, g3),  // timer 0's count, 0x1FE00001C00
+        ADDi(g4, g1, 8),  // and its limit
+        SETHI(g2, 0x40000000),
+        ORi(g2, g2, 8),  // back to zero at 8 us
+        STXA(g0, g1, g0, 0x14),
+        STXA(g2, g4, g0, 0x14),
+        SETHI(l0, 1024),
+        ADDi(l0, l0, 476),  // 1500 times round, 4500 steps
+        SUBcci(l0, l0, 1),
+        Bicc(cNE, -1),
+        NOP,
+        LDXA(g5, g1, g0, 0x14),
+        Bicc(cA, 0),
+        NOP,
+    };
+    for (std::size_t i = 0; i < std::size(code); ++i) store_be<u32>(o.prom.data() + 0x20 + 4 * i, code[i]);
+    constexpr u64 kRun = 4600;
+    Ultra5_10 whole(o), stepped(o);
+    whole.run(kRun);
+    for (u64 i = 0; i < kRun; ++i) stepped.run(1);
+    CHECK_EQ(whole.cpu().pc(), stepped.cpu().pc());
+    CHECK_EQ(whole.cpu().reg(l0), 0u);
+    CHECK_EQ(whole.cpu().reg(g5), stepped.cpu().reg(g5));
+    // (4500 steps at 440 MHz, about 10 us, less the 8 us before it went back)
+    CHECK_EQ(whole.cpu().reg(g5), 2u);
+}
+
 TEST(machine_boot_prom_and_nvram_are_reachable_at_power_on) {
     Ultra5_10 m(small_options());
     u16 v = 0;
@@ -228,11 +346,16 @@ TEST(machine_power_on_registers_read_as_on_a_real_ultra_10) {
     CHECK_EQ(cfg_read32(m, cfg(1, 3, 0, 0x54)), 0xCC00C000u);
     CHECK_EQ(cfg_read32(m, cfg(1, 3, 0, 0x58)), 0x00004000u);
     CHECK_EQ(cfg_read32(m, cfg(1, 3, 0, 0x70)) >> 24, 0xF0u);  // UDIDETCR0
+    cfg_write32(m, cfg(1, 3, 0, 0x78), 0x05000000);              // UDIDETCR1, as Solaris sets its modes
+    CHECK_EQ(cfg_read32(m, cfg(1, 3, 0, 0x78)) >> 24, 0xF0u);  // reads as the real one does after Solaris
     // SuperIO: OBP's FER value reads back with bits 7:6 set; SID 0x90.
     const u64 sio = 0x1FFF130015Cull;
     CHECK(m.bus().write(sio, u8{0}));
-    CHECK(m.bus().write(sio + 1, u8{0x0F}));
+    CHECK(m.bus().write(sio + 1, u8{0x0F}));  // (a single write changes nothing)
     u8 b = 0;
+    CHECK(m.bus().read(sio + 1, b));
+    CHECK_EQ(b, 0xC0u);
+    CHECK(m.bus().write(sio + 1, u8{0x0F}));  // the second consecutive write takes
     CHECK(m.bus().read(sio + 1, b));
     CHECK_EQ(b, 0xCFu);
     CHECK(m.bus().write(sio, u8{8}));
@@ -242,6 +365,21 @@ TEST(machine_power_on_registers_read_as_on_a_real_ultra_10) {
     u32 csr = 0;
     CHECK(m.bus().read(0x1FFF1706000ull, csr));
     CHECK_EQ(byteswap(csr) >> 28, 0xCu);
+}
+
+TEST(simba_has_no_base_and_limit_registers_and_resets_its_maps_as_the_apb_manual_says) {
+    Ultra5_10 m(small_options());
+    for (unsigned fn : {0u, 1u}) {
+        cfg_write32(m, cfg(0, 1, fn, 0x1C), 0xFFFFFFFFu);  // I/O base and limit, secondary status
+        CHECK_EQ(cfg_read32(m, cfg(0, 1, fn, 0x1C)) & 0xFFFF, 0u);
+        cfg_write32(m, cfg(0, 1, fn, 0x20), 0xFFF0FFF0u);  // memory base and limit
+        CHECK_EQ(cfg_read32(m, cfg(0, 1, fn, 0x20)), 0u);
+        cfg_write32(m, cfg(0, 1, fn, 0x3C), 0xFFFFFFFFu);  // interrupt line and pin, bridge control
+        CHECK_EQ(cfg_read32(m, cfg(0, 1, fn, 0x3C)), 0x00630000u);
+    }
+    // At reset only the boot bus (function 1) forwards memory; no I/O.
+    CHECK_EQ(cfg_read32(m, cfg(0, 1, 1, 0xDC)) >> 16, 0xFF00u);  // memory map FF, I/O map 0
+    CHECK_EQ(cfg_read32(m, cfg(0, 1, 0, 0xDC)) >> 16, 0u);
 }
 
 TEST(machine_memory_banks_mirror_and_empty_banks_read_zero) {
@@ -281,6 +419,32 @@ TEST(sabre_maps_interrupts_to_vectors_and_holds_them_until_cleared) {
     CHECK_EQ(m.sabre().reg(0x1858), 0u);
 }
 
+TEST(machine_ebus_audio_auxio_and_power_button_answer_where_openboot_puts_them) {
+    Ultra5_10 m(small_options());
+    constexpr u64 ebus = 0x1FFF1000000ull;  // EBus BAR1 at power-on
+    // The codec: index, then data a word on.
+    u8 b = 0;
+    CHECK(m.bus().write(ebus + 0x200000, u8{12}));
+    CHECK(m.bus().read(ebus + 0x200004, b));
+    CHECK_EQ(b, 0x8Au);
+    // The auxio registers (the system LED in the first), and the floppy's
+    // and audio's auxiliary registers, read back what was written.
+    for (u64 at : {0x726000ull, 0x728000ull, 0x72A000ull, 0x72C000ull, 0x72F000ull, 0x720000ull, 0x722000ull}) {
+        u32 v = 0;
+        CHECK(m.bus().write(ebus + at, byteswap(u32{0x01})));
+        CHECK(m.bus().read(ebus + at, v));
+        CHECK_EQ(byteswap(v), 0x01u);
+    }
+    CHECK(m.system_led());
+    m.reset();
+    CHECK(!m.system_led());
+    // The power button interrupts through INO 0x25.
+    m.bus().write(Sabre::kRegsBase + 0x1028, u64{0x80000000ull});
+    CHECK_EQ(m.sabre().reg(0x1828), 0u);
+    m.press_power_button();
+    CHECK_EQ(m.sabre().reg(0x1828), 3u);  // pending
+}
+
 TEST(sabre_iommu_translates_dvma_through_the_tsb) {
     Ultra5_10 m(small_options());
     // TSB at 0x10000, 8 KiB pages, 1K entries: DVMA page n uses entry n.
@@ -293,6 +457,82 @@ TEST(sabre_iommu_translates_dvma_through_the_tsb) {
     CHECK(m.sabre().translate(0xFF800000u + 3 * 0x2000 + 0x123, true, pa));
     CHECK_EQ(pa, 0x200123u);
     CHECK(!m.sabre().translate(0xFF800000u + 4 * 0x2000, false, pa));  // invalid entry
+}
+
+TEST(sabre_logs_pio_writes_and_their_master_aborts_not_reads) {
+    Ultra5_10 m(small_options());
+    auto& b = m.bus();
+    constexpr u64 nowhere = Sabre::kMemBase + 0x90000000ull;  // no device decodes it
+    auto status = [&] { return cfg_read32(m, cfg(0, 0, 0, 4)) >> 16; };
+    // A PIO write that completes: its address and byte mask, no error.
+    CHECK(b.write(0x1FFF1400020ull, u8{0x01}));  // the SAB82532's command register
+    CHECK_EQ(m.sabre().reg(0x2018), 0x1FFF1400020ull);
+    CHECK_EQ(m.sabre().reg(0x2010), 0x100000000ull);  // byte 0
+    // A read that master-aborts: a bus error to the processor, the PCI
+    // status's received master abort, nothing in the PIO write AFSR.
+    u32 v = 0;
+    CHECK(!b.read(nowhere, v));
+    CHECK_EQ(m.sabre().reg(0x2010), 0x100000000ull);
+    CHECK(status() & 0x2000);
+    cfg_write32(m, cfg(0, 0, 0, 4), 0x20000000u);  // cleared by writing 1
+    CHECK(!(status() & 0x2000));
+    // A write that master-aborts: logged, and the PCI error interrupt once
+    // enabled and mapped.
+    b.write(Sabre::kRegsBase + 0x1080, u64{0x80000000ull});  // PCI error map valid
+    CHECK(b.write(nowhere + 4, u16{0x1234}));
+    CHECK_EQ(m.sabre().reg(0x2010) >> 56, 0x80u);
+    CHECK_EQ(m.sabre().reg(0x2018), nowhere + 4);
+    CHECK_EQ((m.sabre().reg(0x2010) >> 32) & 0xFF, 0x30u);  // bytes 4 and 5
+    CHECK_EQ(m.sabre().reg(0x1880), 0u);  // ERRINT_EN still clear
+    b.write(Sabre::kRegsBase + 0x2000, u64{0x100});
+    CHECK_EQ(m.sabre().reg(0x1880), 3u);
+    // A second error is secondary; the primary's address stays.
+    CHECK(b.write(nowhere + 8, u8{0}));
+    CHECK_EQ(m.sabre().reg(0x2010) >> 56, 0x88u);
+    CHECK_EQ(m.sabre().reg(0x2018), nowhere + 4);
+    b.write(Sabre::kRegsBase + 0x2010, ~u64{0});  // the error bits clear when written with 1
+    CHECK_EQ(m.sabre().reg(0x2010) >> 56, 0u);
+}
+
+TEST(sabre_dma_answers_only_its_target_space_and_logs_translation_errors) {
+    Ultra5_10 m(small_options());
+    auto& b = m.bus();
+    u8 buf[4]{};
+    // Nothing claimed until the target address space register enables a region.
+    CHECK(!m.sabre().dma_read(0x1000, buf, 4));
+    b.write(Sabre::kRegsBase + 0x2028, u64{0x41});  // 0x0000_0000 and 0xC000_0000 regions
+    CHECK(m.sabre().dma_read(0x1000, buf, 4));      // pass-through with the IOMMU off
+    CHECK(!m.sabre().dma_read(0x20001000u, buf, 4));
+    CHECK_EQ(m.sabre().reg(0x30), 0u);  // not the module's: nothing logged
+    // The IOMMU on, a 1K-entry TSB at 0x10000 with entry 2 valid but read-only.
+    const u64 tsb = 0x10000;
+    store_be<u64>(m.bus().host_write_ptr(tsb + 2 * 8), 0x8000000000000000ull | 0x200000);
+    b.write(Sabre::kRegsBase + 0x208, u64{tsb});
+    b.write(Sabre::kRegsBase + 0x200, u64{1});
+    b.write(Sabre::kRegsBase + 0x1070, u64{0x80000000ull});  // UE map valid
+    CHECK(m.sabre().dma_read(0xC0004000u, buf, 4));  // entry 2
+    // A read through an invalid entry (3): a primary translation error on
+    // a read, the TTE's address, an invalid-entry error in the IOMMU, a
+    // target abort, and the UE interrupt.
+    CHECK(!m.sabre().dma_read(0xC0006000u, buf, 4));
+    const u64 afsr = m.sabre().reg(0x30);
+    CHECK_EQ(afsr >> 56, 0x41u);                          // P_DRD, P_DTE
+    CHECK_EQ(m.sabre().reg(0x38), tsb + 3 * 8);
+    CHECK_EQ((afsr >> 29) & 7, 3u);                       // the doubleword in its 64 bytes
+    CHECK_EQ((afsr >> 32) & 0xFFFF, 0xFF00u);
+    CHECK_EQ(m.sabre().reg(0x200) & (7ull << 24), 3ull << 24);  // error, invalid
+    CHECK(cfg_read32(m, cfg(0, 0, 0, 4)) >> 16 & 0x0800);  // signalled target abort
+    CHECK_EQ(m.sabre().reg(0x1870), 3u);
+    // A write to the read-only page: secondary bits only.
+    CHECK(!m.sabre().dma_write(0xC0004000u, buf, 4));
+    CHECK_EQ(m.sabre().reg(0x30) >> 56, 0x47u);  // + S_DWR, S_DTE
+    CHECK_EQ(m.sabre().reg(0x38), tsb + 3 * 8);
+    b.write(Sabre::kRegsBase + 0x30, ~u64{0});
+    CHECK_EQ(m.sabre().reg(0x30) >> 56, 0u);
+    // Now a protection error is the primary one.
+    CHECK(!m.sabre().dma_write(0xC0004000u, buf, 4));
+    CHECK_EQ(m.sabre().reg(0x30) >> 56, 0x21u);  // P_DWR, P_DTE
+    CHECK_EQ(m.sabre().reg(0x200) & (7ull << 24), 1ull << 24);  // error, protection
 }
 
 TEST(m48t59_clock_reads_and_sets_in_bcd) {
@@ -322,6 +562,79 @@ TEST(m48t59_clock_reads_and_sets_in_bcd) {
     CHECK_EQ(rd(0x1FFD), 0x01u);
     CHECK_EQ(rd(0x1FFE), 0x03u);
     CHECK_EQ(rd(0x1FFF), 0x36u);
+}
+
+TEST(m48t59_alarm_and_watchdog_raise_their_flags_and_irq) {
+    Scheduler sched;
+    u64 now = 0;
+    constexpr double hz = 1e6;
+    sched.set_clock([&] { return now; });
+    std::time_t host = 86400 * 10;  // a midnight
+    M48t59 rtc([&] { return host + static_cast<std::time_t>(now / hz); });
+    rtc.set_next_second([&] { return (now / static_cast<u64>(hz) + 1) * static_cast<u64>(hz); });
+    rtc.attach(sched, hz);
+    bool irq = false;
+    rtc.on_irq = [&](bool on) { irq = on; };
+    auto run_to = [&](double seconds) {
+        const u64 end = static_cast<u64>(seconds * hz);
+        while (sched.next_event() <= end) {
+            now = std::max(now, sched.next_event());
+            sched.run_due(now);
+        }
+        now = end;
+    };
+    auto rd = [&](unsigned a) {
+        u64 v = 0;
+        rtc.read(a, 1, v);
+        return static_cast<unsigned>(v);
+    };
+    auto wr = [&](unsigned a, unsigned v) { rtc.write(a, 1, v); };
+    // Once a minute at 30 seconds (RPT1 clear, the rest set), the IRQ enabled.
+    wr(0x1FF2, 0x30);
+    wr(0x1FF3, 0x80);
+    wr(0x1FF4, 0x80);
+    wr(0x1FF5, 0x80);
+    wr(0x1FF6, 0x80);
+    run_to(29.5);
+    CHECK(!irq);
+    CHECK_EQ(rd(0x1FF0) & 0x40, 0u);
+    run_to(30.01);
+    CHECK(irq);
+    CHECK_EQ(rd(0x1FF0) & 0x40, 0x40u);  // the read that clears it sees it set
+    CHECK(!irq);
+    CHECK_EQ(rd(0x1FF0) & 0x40, 0u);
+    run_to(90.01);  // and a minute later
+    CHECK(irq);
+    rd(0x1FF0);
+    // Without AFE the flag rises alone.
+    wr(0x1FF6, 0);
+    run_to(150.01);
+    CHECK(!irq);
+    CHECK_EQ(rd(0x1FF0) & 0x40, 0x40u);
+    wr(0x1FF5, 0);  // to disable the alarm: date 0, RPT bits clear
+    wr(0x1FF4, 0);
+    wr(0x1FF3, 0);
+    wr(0x1FF2, 0);
+    // The watchdog: 3 x 1 second to the IRQ (WDS clear), restarted by a write.
+    wr(0x1FF7, 3 << 2 | 2);
+    run_to(152.5);
+    wr(0x1FF7, 3 << 2 | 2);
+    run_to(155.4);
+    CHECK(!irq);
+    run_to(155.6);
+    CHECK(irq);
+    CHECK_EQ(rd(0x1FF0) & 0x80, 0x80u);
+    CHECK(!irq);
+    // Steered to the reset output: a pulse, and the watchdog, FT and AFE cleared.
+    bool reset = false;
+    rtc.on_watchdog_reset = [&] { reset = true; };
+    wr(0x1FF6, 0x80);
+    wr(0x1FF7, 0x80 | 1 << 2 | 0);  // 1/16 s
+    run_to(155.7);
+    CHECK(reset);
+    CHECK_EQ(rd(0x1FF7), 0u);
+    CHECK_EQ(rd(0x1FF6) & 0x80, 0u);
+    CHECK(!irq);
 }
 
 TEST(m48t59_idprom_checksum) {
@@ -373,6 +686,52 @@ TEST(ns16550_transmits_receives_and_identifies_interrupts) {
     CHECK_EQ(rd(2), 0x04u);  // received data available
     CHECK_EQ(rd(0), static_cast<unsigned>('z'));
     CHECK(!(rd(5) & 1));
+}
+
+// With the FIFO on, received data interrupts only at the trigger level, or
+// with less after the line has been idle for four character times; the
+// interrupt line follows IIR. (Raised for any data, it told the driver of
+// a mouse packet below the trigger that IIR then denied, over and over.)
+TEST(ns16550_receive_interrupt_follows_the_fifo_trigger_and_timeout) {
+    Scheduler s;
+    u64 now = 0;
+    s.set_clock([&] { return now; });
+    SerialLine line;
+    Ns16550 u(s, line, 1843200.0, 1843200.0 * 16);
+    bool irq = false;
+    u.set_irq_sink([&](bool a) { irq = a; });
+    auto rd = [&](unsigned r) {
+        u64 v = 0;
+        u.read(r, 1, v);
+        return static_cast<unsigned>(v);
+    };
+    u.write(3, 1, 0x80);
+    u.write(0, 1, 1);
+    u.write(3, 1, 0x03);
+    u.write(2, 1, 0x81);  // FIFO on, trigger at 8
+    u.write(4, 1, 0x08);
+    u.write(1, 1, 0x01);  // received data interrupts only
+    auto feed = [&](const char* bytes) {
+        for (const char* p = bytes; *p; ++p) line.receive(static_cast<u8>(*p));
+        u.poll_line();
+        for (std::size_t i = 0; i < std::strlen(bytes); ++i) {
+            now += 2600;  // a character time at 115200 baud here
+            s.run_due(now);
+        }
+    };
+    feed("abcde");  // a mouse packet: below the trigger
+    CHECK(rd(5) & 1);
+    CHECK(!irq);
+    CHECK_EQ(rd(2) & 0x0F, 0x01u);
+    now += 5 * 2600;  // idle: the timeout
+    s.run_due(now);
+    CHECK(irq);
+    CHECK_EQ(rd(2) & 0x0F, 0x0Cu);
+    for (int i = 0; i < 5; ++i) rd(0);
+    CHECK(!irq);
+    feed("12345678");  // the trigger level: at once
+    CHECK(irq);
+    CHECK_EQ(rd(2) & 0x0F, 0x04u);
 }
 
 TEST(sab82532_transmit_fifo_fills_in_order_at_any_address) {
@@ -439,6 +798,84 @@ TEST(sab82532_masked_statuses_stay_hidden_and_stored_unless_ipc_vis) {
     CHECK(!irq);
 }
 
+TEST(serial_breaks_reach_both_uarts_in_their_own_ways) {
+    // SAB82532: BRK, no character in the RFIFO, then BRKT a quarter second on.
+    {
+        Scheduler s;
+        u64 now = 0;
+        s.set_clock([&] { return now; });
+        SerialLine a, b;
+        constexpr double hz = 1e6;
+        Sab82532 se(s, a, b, hz);
+        u64 v = 0;
+        se.read(0x3B, 1, v);      // clear the reset XPR/ALLS
+        se.write(0x3B, 1, 0x3F);  // IMR1: BRK and BRKT unmasked
+        a.receive_break();
+        a.receive('x');
+        se.poll_lines();
+        auto run_to = [&](double t) {
+            const u64 end = static_cast<u64>(t * hz);
+            while (s.next_event() <= end) {
+                now = std::max(now, s.next_event());
+                s.run_due(now);
+            }
+            now = end;
+        };
+        run_to(0.01);
+        se.read(0x3B, 1, v);
+        CHECK_EQ(v & 0xC0, 0x80u);  // BRK
+        se.read(0x3B, 1, v);
+        CHECK_EQ(v & 0xC0, 0u);     // (cleared by the read)
+        run_to(0.3);
+        se.read(0x3B, 1, v);
+        CHECK_EQ(v & 0x40, 0x40u);  // BRKT
+        se.write(0x20, 1, 0x20);    // RFRD: the FIFO holds only the 'x'
+        se.read(0x2A, 1, v);        // RBCL
+        CHECK_EQ(v, 1u);
+        se.read(0x00, 1, v);
+        CHECK_EQ(v, static_cast<u64>('x'));
+    }
+    // NS16550: a zero character with BI and FE.
+    {
+        Scheduler s;
+        u64 now = 0;
+        s.set_clock([&] { return now; });
+        SerialLine line;
+        Ns16550 u(s, line, 1843200.0, 1843200.0 * 16);
+        u.write(3, 1, 0x80);
+        u.write(0, 1, 1);
+        u.write(3, 1, 0x03);
+        line.receive_break();
+        u.poll_line();
+        now += 100000;
+        s.run_due(now);
+        u64 v = 0;
+        u.read(5, 1, v);
+        CHECK_EQ(v & 0x19, 0x19u);  // BI, FE, DR
+        u.read(0, 1, v);
+        CHECK_EQ(v, 0u);
+    }
+}
+
+TEST(sun_keyboard_unplugged_breaks_the_line_and_reports_itself_when_plugged_in) {
+    Scheduler s;
+    u64 now = 0;
+    s.set_clock([&] { return now; });
+    SerialLine line;
+    SunKeyboard k(s, line, 1e6);
+    k.set_plugged(false);
+    CHECK(line.rx_break());
+    line.rx_take();
+    k.key(0x4D, true);  // (nothing: unplugged)
+    CHECK(!line.rx_pending());
+    k.set_plugged(true);
+    now += 100000;
+    s.run_due(now);
+    std::vector<u8> got;
+    while (line.rx_pending()) got.push_back(line.rx_take());
+    CHECK(got == (std::vector<u8>{0xFF, 0x04, 0x7F}));
+}
+
 TEST(ebus_dma_routes_device_interrupts_and_counts_to_terminal_count) {
     EbusDma dma("test-dma");
     std::vector<u8> mem(64);
@@ -463,8 +900,9 @@ TEST(ebus_dma_routes_device_interrupts_and_counts_to_terminal_count) {
     CHECK(!(get(0) & EbusDma::kIntPend));
     // Four bytes to memory at 0x10, counted to terminal count.
     put(0, EbusDma::kIntEn | EbusDma::kWrite | EbusDma::kEnDma | EbusDma::kEnCnt);
+    put(8, 4);  // the count, then the address, which loads the transfer
+    CHECK(!(get(0) & EbusDma::kALoaded));
     put(4, 0x10);
-    put(8, 4);
     CHECK(get(0) & EbusDma::kALoaded);
     const u8 data[6] = {1, 2, 3, 4, 5, 6};
     CHECK_EQ(dma.to_memory(data, 6), 4u);
@@ -477,6 +915,52 @@ TEST(ebus_dma_routes_device_interrupts_and_counts_to_terminal_count) {
     put(0, get(0));  // writing the CSR back clears TC, as drivers do
     CHECK(!(get(0) & EbusDma::kTc));
     CHECK(!irq);
+}
+
+TEST(ebus_dma_chains_the_next_transfer_at_terminal_count) {
+    EbusDma dma("test-dma");
+    std::vector<u8> mem(64);
+    for (unsigned i = 0; i < mem.size(); ++i) mem[i] = static_cast<u8>(i);
+    dma.set_dma_port([&](u32 a, u8* d, std::size_t n) { std::copy_n(mem.begin() + a, n, d); return true; },
+                     [&](u32 a, const u8* d, std::size_t n) { std::copy_n(d, n, mem.begin() + a); return true; });
+    auto put = [&](unsigned reg, u32 v) { dma.write(reg, 4, byteswap(v)); };
+    auto get = [&](unsigned reg) {
+        u64 v = 0;
+        dma.read(reg, 4, v);
+        return byteswap(static_cast<u32>(v));
+    };
+    // From memory (a playback), as the audio drivers set it up: the first
+    // buffer loaded before the channel is enabled, the next while it runs.
+    put(0, EbusDma::kReset);
+    put(0, 0);
+    put(8, 4);
+    put(4, 0x00);
+    put(0, EbusDma::kIntEn | EbusDma::kEnDma | EbusDma::kEnCnt | EbusDma::kEnNext);
+    CHECK((get(0) & (EbusDma::kALoaded | EbusDma::kNaLoaded)) == EbusDma::kALoaded);
+    put(8, 3);
+    put(4, 0x20);
+    CHECK((get(0) & (EbusDma::kALoaded | EbusDma::kNaLoaded)) == (EbusDma::kALoaded | EbusDma::kNaLoaded));
+    CHECK_EQ(get(4), 0x00u);  // the current address reads back
+    CHECK_EQ(get(8), 4u);
+    // Six bytes run through the first buffer into the next without a gap.
+    u8 out[8]{};
+    CHECK_EQ(dma.from_memory(out, 6), 6u);
+    CHECK(out[3] == 3 && out[4] == 0x20 && out[5] == 0x21);
+    CHECK((get(0) & (EbusDma::kTc | EbusDma::kALoaded | EbusDma::kNaLoaded)) == (EbusDma::kTc | EbusDma::kALoaded));
+    CHECK_EQ(get(4), 0x22u);
+    CHECK_EQ(get(8), 1u);
+    put(0, get(0));  // the interrupt handler acknowledges the terminal count
+    CHECK(!(get(0) & EbusDma::kTc));
+    CHECK_EQ(dma.from_memory(out, 6), 1u);  // the end of the chain
+    CHECK((get(0) & (EbusDma::kTc | EbusDma::kALoaded)) == EbusDma::kTc);
+    // Without EN_NEXT a second address replaces the current transfer.
+    put(0, EbusDma::kEnDma | EbusDma::kEnCnt);
+    put(8, 2);
+    put(4, 0x10);
+    put(8, 2);
+    put(4, 0x30);
+    CHECK(!(get(0) & EbusDma::kNaLoaded));
+    CHECK_EQ(get(4), 0x30u);
 }
 
 TEST(fdc82077_reset_reports_four_drives_and_version) {
@@ -559,4 +1043,47 @@ TEST(sab82532_says_how_long_a_read_holds) {
     CHECK_EQ(se.stable_until(0x3B, 1), Device::kForever);
     CHECK_EQ(se.stable_until(0x20, 1), Device::kForever);  // STAR
     CHECK_EQ(se.stable_until(0x00, 1), Device::kForever);  // RFIFO, empty
+}
+
+// A new NVRAM is a machine set up before: OpenBoot's configuration with
+// the boot from the disk alone, auto-boot on, the least diagnostics and
+// the diagnostic switch off, under a checksum OpenBoot accepts; a Sun
+// Ethernet address (random unless given) and a host ID with the same last
+// three bytes. A blank (all-zero) image is taken as new as well.
+TEST(ultra5_10_new_nvram_is_a_sane_starting_point) {
+    auto checksum_ok = [](const u8* p) {
+        u8 sum = 0x17;
+        for (unsigned i = 0x0C; i < 0x1FD8; ++i) sum ^= p[i];
+        return sum == p[0];
+    };
+    Ultra5_10::Options o = small_options();
+    o.mac = std::array<u8, 6>{0x08, 0x00, 0x20, 0xAB, 0xCD, 0xEF};
+    {
+        Ultra5_10 m(o);
+        const u8* p = m.nvram().data();
+        CHECK(checksum_ok(p));
+        CHECK_EQ(p[1], 0x00u);    // diag-switch? false
+        CHECK_EQ(p[2], 0x20u);    // diag-level min
+        CHECK_EQ(p[0x5D3], 0xFFu);  // auto-boot? true
+        CHECK_EQ(p[0x2CA], 4u);     // boot-device "disk"
+        CHECK(std::equal(p + 0x2CB, p + 0x2CB + 4, "disk"));
+        CHECK_EQ(p[0x618 + 2], 8u);  // input-device "keyboard"
+        const u8* id = p + 0x1FD8;
+        CHECK_EQ(id[0], 0x01u);
+        CHECK_EQ(id[1], 0x80u);
+        CHECK_EQ(id[5], 0xABu);
+        CHECK_EQ(id[7], 0xEFu);
+        CHECK_EQ(id[12], 0xABu);  // serial = the address's last three bytes
+        CHECK_EQ(id[14], 0xEFu);
+    }
+    // Random addresses: Sun's prefix, and two machines unlike each other.
+    o.mac.reset();
+    Ultra5_10 a(o), b(o);
+    const u8* ia = a.nvram().data() + 0x1FD8;
+    const u8* ib = b.nvram().data() + 0x1FD8;
+    CHECK_EQ(ia[2], 0x08u);
+    CHECK_EQ(ia[3], 0x00u);
+    CHECK_EQ(ia[4], 0x20u);
+    CHECK(!std::equal(ia + 5, ia + 8, ib + 5));
+    CHECK(checksum_ok(a.nvram().data()));
 }

@@ -8,6 +8,10 @@ namespace {
 constexpr u32 kLegacyCommand[2] = {0x1F0, 0x170}, kLegacyControl[2] = {0x3F4, 0x374};
 constexpr u8 kRevision = 0x03;    // PCI0646U2
 constexpr u8 kProgIf = 0x8A;      // bus master; both channels in compatibility mode, either may be switched
+// The Ultra DMA timing registers: a real Ultra 10 reads 0xF0 in both at the
+// ok prompt and again after Solaris has set its modes (this revision has
+// no Ultra DMA; Linux enables it from revision 5).
+constexpr u8 kUdidetcr = 0xF0;
 }  // namespace
 
 Cmd646::Cmd646(Scheduler& scheduler, double cpu_hz)
@@ -50,7 +54,6 @@ Cmd646::Cmd646(Scheduler& scheduler, double cpu_hz)
 void Cmd646::reset() {
     pci::Function::reset();
     intr_ = mrdmode_ = bmidecsr_ = 0;
-    udidetcr_ = {0xF0, 0xF0};
     level_ = {};
     ch0_.reset();
     ch1_.reset();
@@ -71,9 +74,9 @@ void Cmd646::update_line() {
 u8 Cmd646::bm_read(unsigned offset) {
     switch (offset & 15) {
         case 0x1: return static_cast<u8>(mrdmode_ | ((intr_ & 3) << 2));
-        case 0x3: return udidetcr_[0];
+        case 0x3:
+        case 0xB: return kUdidetcr;
         case 0x9: return bmidecsr_;
-        case 0xB: return udidetcr_[1];
         default: return channel((offset >> 3) & 1).bm_read(offset & 7);
     }
 }
@@ -85,9 +88,9 @@ void Cmd646::bm_write(unsigned offset, u8 value) {
             mrdmode_ = value & 0xF3;
             update_line();
             break;
-        case 0x3: udidetcr_[0] = value; break;
+        case 0x3:
+        case 0xB: break;  // UDIDETCR: no Ultra DMA before revision 5; reads 0xF0 whatever is written
         case 0x9: bmidecsr_ = value; break;
-        case 0xB: udidetcr_[1] = value; break;
         default: channel((offset >> 3) & 1).bm_write(offset & 7, value); break;
     }
 }

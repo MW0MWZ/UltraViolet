@@ -75,8 +75,9 @@ Ultra5_10::Options Settings::options() const {
     o.nvram_path = nvram;
     o.disk_path = disk;
     o.cdrom_path = cdroms.empty() ? std::string() : cdroms.front();
-    if (mac) std::copy(mac->begin(), mac->end(), o.mac);
+    o.mac = mac;
     o.timing = timing;
+    o.fast_disk = fast_disk;
     o.keyboard = console == "screen";
     o.keyboard_layout = keyboard_layout(keyboard);
     return o;
@@ -187,7 +188,12 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
     } else if (key == "timing") ok = parse_timing(v, s.timing);
     else if (key == "block_cache") ok = parse_bool(v, s.block_cache);
     else if (key == "jit") ok = parse_bool(v, s.jit);
+    else if (key == "idle_skip") ok = parse_bool(v, s.idle_skip);
+    else if (key == "fast_disk") ok = parse_bool(v, s.fast_disk);
     else if (key == "mouse_auto_capture") ok = parse_bool(v, s.mouse_auto_capture);
+    else if (key == "sound") ok = parse_bool(v, s.sound);
+    else if (key == "volume") ok = parse_number(v, n) && n >= 0 && n <= 100 && n == static_cast<unsigned>(n) &&
+                                  (s.volume = static_cast<unsigned>(n), true);
     else if (key == "wheel_keys") ok = (v == "off" || v == "arrows" || v == "pages") && (s.wheel_keys = v, true);
     else if (key == "log") ok = (v == "trace" || v == "debug" || v == "info" || v == "warn" || v == "error" || v == "off") &&
                                (s.log = v, true);
@@ -268,8 +274,8 @@ bool save_settings(const std::string& path, const Settings& s, std::string& erro
           << "\nnet=" << s.net << "\n";
         for (const auto& fw : s.forwards) f << "hostfwd=" << forward_text(fw) << "\n";
         f << "timing=" << timing_name(s.timing) << "\nblock_cache=" << (s.block_cache ? 1 : 0)
-          << "\njit=" << (s.jit ? 1 : 0) << "\nlog=" << s.log << "\nmouse_auto_capture=" << (s.mouse_auto_capture ? 1 : 0)
-          << "\nwheel_keys=" << s.wheel_keys << "\n";
+          << "\njit=" << (s.jit ? 1 : 0) << "\nidle_skip=" << (s.idle_skip ? 1 : 0) << "\nfast_disk=" << (s.fast_disk ? 1 : 0) << "\nlog=" << s.log << "\nmouse_auto_capture=" << (s.mouse_auto_capture ? 1 : 0)
+          << "\nwheel_keys=" << s.wheel_keys << "\nsound=" << (s.sound ? 1 : 0) << "\nvolume=" << s.volume << "\n";
         if (!f) {
             error = "cannot write " + tmp;
             return false;

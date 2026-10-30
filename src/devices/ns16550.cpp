@@ -62,10 +62,18 @@ void Ns16550::set_modem_inputs(bool cts, bool dsr, bool ri, bool dcd) {
     update_irq();
 }
 
+// Received data interrupts (as IIR shows it) at the FIFO's trigger level,
+// or with less after the timeout; without the FIFO, at every character.
+bool Ns16550::rx_interrupt() const {
+    static constexpr unsigned kTrigger[4] = {1, 4, 8, 14};
+    if (!(ier_ & kIerRda) || !(lsr_ & kLsrDr)) return false;
+    return rx_timeout_ || !(fcr_ & 1) || rx_fifo_.size() >= kTrigger[fcr_ >> 6];
+}
+
 void Ns16550::update_irq() {
     bool pending = false;
     if ((ier_ & kIerRls) && (lsr_ & 0x1E)) pending = true;
-    if ((ier_ & kIerRda) && ((lsr_ & kLsrDr) || rx_timeout_)) pending = true;
+    if (rx_interrupt()) pending = true;
     if ((ier_ & kIerThre) && thre_pending_) pending = true;
     if ((ier_ & kIerMs) && (msr_ & 0x0F)) pending = true;
     if (irq_) irq_(pending && (mcr_ & 0x08) /* OUT2 gates the interrupt */);
@@ -124,7 +132,15 @@ void Ns16550::poll_line() {
 }
 
 void Ns16550::rx_tick() {
-    if (line_.rx_pending() && !(mcr_ & kMcrLoop)) {
+    if (line_.rx_break() && !(mcr_ & kMcrLoop)) {
+        // A break: one zero character, with BI (and the framing error a
+        // zero stop bit is).
+        line_.rx_take();
+        rx_wire_ = {};
+        rx_streaming_ = false;
+        rx_push(0, kLsrBi | kLsrFe);
+        rx_timer_.schedule_in(device_cycles());
+    } else if (line_.rx_pending() && !(mcr_ & kMcrLoop)) {
         const u8 b = line_.rx_take();
         if (line_.device.baud > 0) {
             // The device's character as the UART samples it at its own rate:
@@ -197,11 +213,7 @@ bool Ns16550::read(u64 offset, unsigned, u64& value) {
         case 2: {
             u8 iir = 0x01;
             if ((ier_ & kIerRls) && (lsr_ & 0x1E)) iir = 0x06;
-            else if ((ier_ & kIerRda) && rx_timeout_ && (lsr_ & kLsrDr)) iir = 0x0C;
-            else if ((ier_ & kIerRda) && (lsr_ & kLsrDr)) {
-                static constexpr unsigned kTrigger[4] = {1, 4, 8, 14};
-                iir = (!(fcr_ & 1) || rx_fifo_.size() >= kTrigger[fcr_ >> 6]) ? 0x04 : 0x01;
-            }
+            else if (rx_interrupt()) iir = rx_timeout_ ? 0x0C : 0x04;
             if (iir == 0x01 && (ier_ & kIerThre) && thre_pending_) {
                 iir = 0x02;
                 thre_pending_ = false;  // reading IIR acknowledges it

@@ -10,10 +10,12 @@
 // as master of the secondary. Bus B carries the slots.
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <ctime>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -23,6 +25,7 @@
 #include "cpu/ultrasparc/ultrasparc.h"
 #include "devices/atapi_cdrom.h"
 #include "devices/cmd646.h"
+#include "devices/cs4231.h"
 #include "devices/ebus_dma.h"
 #include "devices/ebus_misc.h"
 #include "devices/fdc82077.h"
@@ -58,7 +61,9 @@ public:
         u32 ecache_bytes = 2u << 20;
         std::vector<u8> prom;    // the flash image (1 MiB: OpenBoot, then POST)
         std::string nvram_path;  // NVRAM contents, loaded at start and saved on stop
-        u8 mac[6] = {0x08, 0x00, 0x20, 0x55, 0x56, 0x01};
+        // The Ethernet address a new NVRAM gets (none: a random Sun address,
+        // 08:00:20:xx:xx:xx, the host ID's serial the same last three bytes).
+        std::optional<std::array<u8, 6>> mac;
         std::string disk_path;   // ATA disk image (primary master); empty: none
         u64 disk_create_bytes = 0;  // create the disk image at this size if it does not exist
         std::string cdrom_path;  // CD image in the drive (secondary master); empty: no disc
@@ -71,6 +76,10 @@ public:
         // runs); Realtime keeps guest time to the wall clock, the processor
         // as fast as the host allows.
         Pacer::Mode timing = Pacer::Mode::Free;
+        // The IDE drives act at once and DMA runs at host speed, rather than
+        // with a real drive's command delays and the controller's transfer
+        // rate (always so with Max timing).
+        bool fast_disk = false;
         // The host side of the on-board Ethernet (HME); none: no cable.
         std::shared_ptr<net::NetBackend> network;
         // A Sun Type 5 keyboard and mouse on the keyboard port. Without
@@ -78,9 +87,14 @@ public:
         // display, the screen is the console.
         bool keyboard = false;
         u8 keyboard_layout = SunKeyboard::kLayoutUs;
+        // The host clock guest time keeps to (default: the system's), as
+        // the pacer takes it.
+        Pacer::HostClock host_clock;
     };
 
-    // On-board interrupt numbers (INO) of the EBus devices.
+    // On-board interrupt numbers (INO) of the EBus devices. The audio's
+    // first interrupt (capture) is 0x23, its second (playback) 0x24, as the
+    // Linux and OpenBSD drivers take them.
     static constexpr unsigned kInoParallel = 0x22, kInoAudioRecord = 0x23, kInoAudioPlay = 0x24, kInoPower = 0x25,
                               kInoFloppy = 0x27, kInoKeyboard = 0x29, kInoMouse = 0x2A, kInoSerial = 0x2B;
     // INTA of the bus A devices, from the Simba's interrupt-map: RIO (device 1,
@@ -91,8 +105,12 @@ public:
     ~Ultra5_10();
 
     void reset();
-    // Runs up to `instructions` instructions (stops early if the CPU halts).
+    // Runs up to `instructions` instructions (stops early if the CPU halts
+    // or the system switches itself off).
     void run(u64 instructions);
+    // The system has switched itself off (the power control register): it
+    // runs no further until reset.
+    bool switched_off() const { return switched_off_; }
     void save_nvram();
 
     usparc::UltraSparc& cpu() { return cpu_; }
@@ -122,6 +140,11 @@ public:
     void post_key(u8 code, bool down);
     void post_release_keys();
     void post_mouse(int dx, int dy, unsigned buttons);
+    // The keyboard (and mouse, which plugs into it) unplugged or plugged in.
+    void post_keyboard_plugged(bool plugged);
+    // All mouse movement posted has reached the guest's mouse port (none
+    // waiting to be taken, gathered or sent down the line).
+    bool mouse_idle() const { return !input_waiting_.load(std::memory_order_acquire) && (!mouse_ || mouse_->idle()); }
     SunKeyboard* keyboard() { return keyboard_.get(); }
 
     // For the window: how busy the disk, CD-ROM and network have been, the
@@ -133,19 +156,33 @@ public:
     Activity activity() const { return {disk_image_.accesses(), cd_image_.accesses(), hme_.frames()}; }
     const Pacer& pacer() const { return pacer_; }
     void set_timing(Pacer::Mode mode);
+    void set_fast_disk(bool fast);
     std::string disc() const { return cd_image_.is_open() ? cd_image_.path() : std::string(); }
     Mach64& graphics() { return mach64_; }
+    Cs4231& audio() { return audio_; }
+    // Where the audio's playback goes (16-bit stereo frames at a rate).
+    void set_audio_sink(Cs4231::AudioSink sink) { audio_.set_audio_sink(std::move(sink)); }
+    // A press of the front-panel power button: its interrupt, which asks
+    // the system to shut down (Solaris, Linux and OpenBSD switch off).
+    void press_power_button();
+    // The system LED in the auxio register (on: the system has started).
+    bool system_led() const { return auxio_led_ && (auxio_led_->data()[0] & 1); }
 
 private:
     // Maps the flash image straight onto the processor's bus while reads of
     // it return the array and the path to it (Simba A, the EBus BAR0) is
     // decoded, so instruction fetches skip the PCI path.
     void update_prom_mapping();
+    void apply_fast_io();
+    bool nvram_blank() const;
+    void write_new_nvram();
     u64 prom_pa_ = 0, prom_map_size_ = 0;
 
     Options opt_;
     Pacer pacer_;
     u64 paced_at_ = 0;  // guest time of the last pacer update
+    enum class SoftReset { None, Por, Xir } soft_reset_ = SoftReset::None;  // asked for, to come between instructions
+    bool switched_off_ = false;
     u64 pci_ticks_fx_ = 0;  // PCI clocks per CPU cycle, as a 0.64 fraction
     u64 pci_ticks() const;
     u64 hz_ = 0, per_second_fx_ = 0;  // the CPU clock, and 2^64 / it
@@ -174,7 +211,7 @@ private:
     std::unique_ptr<SunMouse> mouse_;
     // Input from the host, waiting for the emulation thread.
     struct InputEvent {
-        enum Kind : u8 { Key, ReleaseKeys, Mouse } kind;
+        enum Kind : u8 { Key, ReleaseKeys, Mouse, Plug } kind;
         u8 code;
         bool down;
         int dx, dy;
@@ -188,6 +225,9 @@ private:
     std::unique_ptr<AtaDisk> disk_;
     AtapiCdrom cdrom_;
     std::vector<std::unique_ptr<RegisterBlock>> blocks_;
+    RegisterBlock* auxio_led_ = nullptr;
+    PowerControl power_;
+    Cs4231 audio_;
     // An empty memory bank: reads as zero, writes are lost (no bus error).
     class EmptyBank final : public Device {
     public:

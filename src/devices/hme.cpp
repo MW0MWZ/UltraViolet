@@ -310,7 +310,7 @@ u64 Hme::wire_cycles(std::size_t bytes) const {
     // Preamble and start delimiter, the frame, its FCS and the gap after it.
     const double bits = 8.0 * static_cast<double>(8 + bytes + 4 + 12);
     const bool fast = (phy_[kPar] & 0x40) == 0;  // (SPEED_10 clear: 100 Mbit/s)
-    return static_cast<u64>(bits / (fast ? 100e6 : 10e6) * cpu_hz_) + 1;
+    return static_cast<u64>(bits / (fast_ ? 8e9 : fast ? 100e6 : 10e6) * cpu_hz_) + 1;
 }
 
 // ---- transmit ----

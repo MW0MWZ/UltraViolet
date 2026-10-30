@@ -8,6 +8,7 @@
 #include <bit>
 #include <cstdio>
 #include <limits>
+#include <numeric>
 
 #include "core/endian.h"
 #include "core/log.h"
@@ -111,7 +112,33 @@ void UltraSparc::reset() {
     set_pc(kRstvAddr + 0x20);
 }
 
+// The performance counters (PIC.D0 and D1) count the events PCR.S0 and S1
+// select in the modes PCR.UT (user) and ST (privileged) select: brought up
+// to date when read or written, when the PCR changes and whenever PSTATE
+// does (the mode). Only Cycle_cnt and Instr_cnt count; the other events
+// (cache references and hits, dispatch stalls) need a cache and pipeline
+// model this processor does not have, and stay where they are.
+void UltraSparc::pic_count() {
+    const u64 cycles_now = cycles(), instr_now = instructions();
+    const u64 dc = cycles_now - pic_cycles_, di = instr_now - pic_instr_;
+    pic_cycles_ = cycles_now;
+    pic_instr_ = instr_now;
+    if (!(pcr_ & (pic_priv_ ? 2 : 4))) {
+        pic_priv_ = pstate_ & pstate::PRIV;
+        return;
+    }
+    pic_priv_ = pstate_ & pstate::PRIV;
+    auto add = [&](unsigned select, unsigned shift) {
+        const u64 n = select == 0 ? dc : select == 1 ? di : 0;
+        const u64 d = ((pic_ >> shift) + n) & 0xFFFFFFFF;
+        pic_ = (pic_ & ~(u64{0xFFFFFFFF} << shift)) | (d << shift);
+    };
+    add(static_cast<unsigned>(pcr_ >> 4) & 15, 0);
+    add(static_cast<unsigned>(pcr_ >> 11) & 15, 32);
+}
+
 void UltraSparc::update_globals() {
+    if (UV_UNLIKELY(pcr_ & 6) && pic_priv_ != static_cast<bool>(pstate_ & pstate::PRIV)) pic_count();
     unsigned set = 0;
     if (pstate_ & pstate::AG) set = 1;
     else if (pstate_ & pstate::MG) set = 2;
@@ -216,6 +243,7 @@ u64 UltraSparc::cycle_at_once(const Block& b, unsigned back, u64 room, u64 next)
                       std::equal(now.regs.begin(), now.regs.begin() + now.count, poll_snap_.regs.begin());
     poll_snap_ = now;
     if (!same || !(pstate_ & pstate::PRIV)) return 0;  // (reading TICK may trap)
+    if (watch_armed()) return 0;  // (each access is to be looked at)
     // The loads: each holds still until `until` (the last in an iteration
     // at `last`), or is a clock, read at the time of any step by reading it
     // with the step count set to that step.
@@ -391,6 +419,99 @@ u64 UltraSparc::count_down(u32 loop, u64 room) {
     return steps;
 }
 
+namespace {
+// A place is given up when the loop has not come back to it within this
+// many steps, or has come back this many times in a row changed; another
+// is then watched after kIdleRetry steps.
+constexpr u64 kIdleMaxPeriod = u64{1} << 16;
+constexpr unsigned kIdleMisses = 4;
+constexpr u64 kIdleRetry = u64{1} << 13;
+}  // namespace
+
+void UltraSparc::idle_state(IdleState& s) const {
+    s.pc = pc_, s.npc = npc_, s.y = y_, s.tba = tba_, s.softint = softint_, s.tick_cmpr = tick_cmpr_;
+    s.tick_offset = tick_offset_, s.fsr = fsr_, s.gsr = gsr_, s.pcr = pcr_, s.dcr = dcr_, s.lsu = lsu_control_;
+    s.pctx = primary_context_, s.sctx = secondary_context_, s.intr_receive = intr_receive_;
+    s.globals = globals_, s.windows = windows_, s.f = f_, s.trap = trap_;
+    s.ccr = ccr_, s.asi = asi_, s.fprs = fprs_, s.pstate = pstate_;
+    s.tl = tl_, s.pil = pil_, s.cwp = cwp_, s.cansave = cansave_, s.canrestore = canrestore_, s.cleanwin = cleanwin_;
+    s.otherwin = otherwin_, s.wstate = wstate_, s.tick_npt = tick_npt_;
+}
+
+// Watches the place a block is about to start at: the state here, and
+// what has been done so far.
+void UltraSparc::idle_watch() {
+    idle_pc_ = pc_;
+    idle_period_ = 0;
+    idle_state(idle_state_);
+    idle_steps_at_ = cycles_;
+    idle_instret_at_ = instret_;
+    idle_effects_at_ = effects_;
+    idle_slow_at_ = bus_.slow_accesses();
+    idle_dma_at_ = bus_.dma_writes();
+    idle_delay_at_ = delay_steps_;
+}
+
+// Back at the place watched: true if it is an idle loop's (idle_found_).
+// Whatever was done in between was done from the same state as now, and
+// changed nothing it read (nothing was written) or that tells time apart
+// (TICK was not read), so doing it again comes back here the same.
+bool UltraSparc::idle_visit() {
+    const u64 period = cycles_ - idle_steps_at_;
+    if (period == 0) return false;  // (the same moment: a run starting where the last ended)
+    if (period <= kIdleMaxPeriod && effects_ == idle_effects_at_ && bus_.slow_accesses() == idle_slow_at_ &&
+        bus_.dma_writes() == idle_dma_at_ && delay_steps_ == idle_delay_at_) {
+        IdleState now;
+        idle_state(now);
+        if (now == idle_state_) {
+            // Back to the same state: the loop's time round is a whole
+            // part of `period` (the place may be come back to only every
+            // so many times round, where translated code goes on from block
+            // to block), and of the last one found from the same state.
+            const u64 instr = instret_ - idle_instret_at_;
+            if (idle_period_) {
+                const u64 p = std::gcd(idle_period_, period);
+                idle_period_instr_ = instr / (period / p);
+                idle_period_ = p;
+            } else {
+                idle_period_ = period;
+                idle_period_instr_ = instr;
+            }
+            idle_steps_at_ = cycles_;
+            idle_instret_at_ = instret_;
+            idle_misses_ = 0;
+            idle_found_ = true;
+            return true;
+        }
+    }
+    if (++idle_misses_ > kIdleMisses) {
+        idle_pc_ = kNoIdle;
+        idle_retry_ = cycles_ + kIdleRetry;
+        return false;
+    }
+    idle_watch();  // (from here: an interrupt, or the loop's first time round, may have changed it)
+    return false;
+}
+
+u64 UltraSparc::skip_idle(u64 until, u64 max_steps) {
+    if (!idle_found_) return 0;
+    idle_found_ = false;
+    // Every step skipped comes before guest time reaches `until` and before
+    // TICK_COMPARE's match, so each is then taken as it would have been.
+    u64 room = std::min(max_steps, steps_until(until) - 1);
+    if (tick_match_ != ~u64{0}) room = std::min(room, tick_match_ > cycles_ ? tick_match_ - cycles_ - 1 : 0);
+    const u64 k = room / idle_period_;
+    if (k == 0) return 0;
+    const u64 steps = k * idle_period_, instr = k * idle_period_instr_;
+    cycles_ += steps;
+    instret_ += instr;
+    idle_instructions_ += instr;
+    idle_time_fx_ += steps * cpi_fx_;
+    idle_steps_at_ = cycles_;
+    idle_instret_at_ = instret_;
+    return steps;
+}
+
 u64 UltraSparc::steps_until(u64 when) const {
     if (when <= cycles()) return 1;
     // The first step whose time reaches `when`, counted from the base.
@@ -408,6 +529,21 @@ void UltraSparc::update_tick_interrupt() {
     const u64 now = (cycles() + tick_offset_) & ~(u64{1} << 63);
     const u64 cmp = tick_cmpr_ & ~(u64{1} << 63);
     tick_match_ = cmp > now ? cycles_ + steps_until(cycles() + (cmp - now)) : ~u64{0};
+}
+
+// After a delay loop charged above the usual rate: guest time moved on
+// further than the steps run, and a TICK_CMPR it reached or passed on the
+// way interrupts (TICK_INT), as stepping through it would have. (The match
+// was pending: writes to TICK and TICK_CMPR work it out again.)
+void UltraSparc::tick_after_delay() {
+    if (tick_match_ != ~u64{0} && !(tick_cmpr_ >> 63)) {
+        const u64 now = (cycles() + tick_offset_) & ~(u64{1} << 63);
+        if ((tick_cmpr_ & ~(u64{1} << 63)) <= now) {
+            softint_ |= 1;
+            attention_ = true;
+        }
+    }
+    update_tick_interrupt();
 }
 
 bool UltraSparc::deliver_interrupt_vector(u64 d0, u64 d1, u64 d2) {
@@ -447,14 +583,22 @@ void UltraSparc::enter_error_state(const char* why) {
     halt_reason_ = std::string("error_state: ") + why;
 }
 
+// A trap at TL = MAXTL (or a SIR there) is error_state, which the IIi
+// leaves at once by a watchdog reset to itself: TL stays at MAXTL, TT
+// holds the type of the trap that caused it, and the processor goes to
+// RSTV + 0x40 in RED_state (UltraSPARC IIi User's Manual, chapter 17).
 void UltraSparc::take_trap(unsigned type) {
     trapped_ = true;
-    if (tl_ == kMaxTl && type > tt::kRedState) {
-        enter_error_state("trap at TL = MAXTL");
-        return;
+    unsigned vector_type = type;
+    bool reset = type >= tt::kPowerOnReset && type <= tt::kSoftwareInitiatedReset;
+    if (tl_ == kMaxTl && (type > tt::kRedState || type == tt::kSoftwareInitiatedReset)) {
+        UV_LOG(Warn, "cpu", "error_state (trap 0x%03x at TL = MAXTL, pc %016llx): watchdog reset", type,
+               static_cast<unsigned long long>(pc_));
+        vector_type = tt::kWatchdogReset;
+        reset = true;
     }
     const unsigned old_tl = tl_;
-    if (type >= tt::kPowerOnReset && type <= tt::kSoftwareInitiatedReset) {
+    if (reset) {
         tl_ = type == tt::kPowerOnReset ? kMaxTl : (tl_ < kMaxTl ? tl_ + 1 : kMaxTl);
     } else {
         ++tl_;
@@ -465,14 +609,23 @@ void UltraSparc::take_trap(unsigned type) {
     t.tnpc = npc_;
     t.tt = type;
 
-    u16 ps = pstate_ & (pstate::MM | pstate::RED | pstate::TLE);
-    ps |= pstate::PEF | pstate::PRIV;
-    if (ps & pstate::TLE) ps |= pstate::CLE;
-    if (type == tt::kInterruptVector) ps |= pstate::IG;
-    else if (type >= tt::kFastInstructionAccessMmuMiss && type <= tt::kFastDataAccessProtection + 3) ps |= pstate::MG;
-    else ps |= pstate::AG;
-    const bool reset = type >= tt::kPowerOnReset && type <= tt::kSoftwareInitiatedReset;
-    if (reset || tl_ == kMaxTl) ps |= pstate::RED;
+    u16 ps;
+    if (reset || tl_ == kMaxTl) {
+        // Resets and RED_state entry: TSO, the alternate globals, and the
+        // LSU control register (caches, MMUs, watchpoints) cleared.
+        ps = pstate::RED | pstate::PEF | pstate::PRIV | pstate::AG;
+        if (lsu_control_) {
+            lsu_control_ = 0;
+            flush_soft_tlb();
+        }
+    } else {
+        ps = pstate_ & (pstate::MM | pstate::RED | pstate::TLE);
+        ps |= pstate::PEF | pstate::PRIV;
+        if (ps & pstate::TLE) ps |= pstate::CLE;
+        if (type == tt::kInterruptVector) ps |= pstate::IG;
+        else if (type >= tt::kFastInstructionAccessMmuMiss && type <= tt::kFastDataAccessProtection + 3) ps |= pstate::MG;
+        else ps |= pstate::AG;
+    }
     pstate_ = ps;
 
     if (type == tt::kCleanWindow) {
@@ -486,7 +639,7 @@ void UltraSparc::take_trap(unsigned type) {
 
     u64 vector;
     if (reset) {
-        vector = kRstvAddr + (type << 5);
+        vector = kRstvAddr + (vector_type << 5);
     } else if (tl_ == kMaxTl) {
         vector = kRstvAddr + (tt::kRedState << 5);
     } else {
@@ -510,8 +663,10 @@ void UltraSparc::check_interrupts() {
 }
 
 void UltraSparc::run(u64 instructions) {
+    stop_ = false;
+    idle_found_ = false;
     if (block_cache_ && !trace_hook) return run_blocks(instructions);
-    for (u64 i = 0; i < instructions && !halted_; ++i) step();
+    for (u64 i = 0; i < instructions && !halted_ && !stop_; ++i) step();
 }
 
 // The same as step() repeated, except that the instructions of a block are
@@ -520,7 +675,12 @@ void UltraSparc::run(u64 instructions) {
 // the block, as does any change of control flow.
 void UltraSparc::run_blocks(u64 instructions) {
     u64 done = 0;
-    while (done < instructions && !halted_) {
+    // Idle loops: a place not come back to is given up; a new one is the
+    // start of the second block run (the first starts where the last run
+    // ended, which may be anywhere).
+    if (idle_pc_ != kNoIdle && cycles_ - idle_steps_at_ > kIdleMaxPeriod) idle_pc_ = kNoIdle;
+    unsigned watch = idle_skip_ && idle_pc_ == kNoIdle && cycles_ >= idle_retry_ ? 2 : 0;
+    while (done < instructions && !halted_ && !stop_) {
         trapped_ = false;
         if (UV_UNLIKELY(cycles_ >= tick_match_)) {
             softint_ |= 1;
@@ -531,6 +691,11 @@ void UltraSparc::run_blocks(u64 instructions) {
         if (trapped_) {
             trapped_ = false;
             continue;
+        }
+        if (UV_UNLIKELY(pc_ == idle_pc_) && idle_visit()) return;
+        if (UV_UNLIKELY(watch) && --watch == 0) {
+            idle_misses_ = 0;
+            idle_watch();
         }
         ++cycles_;
         const u64 page = pc_ >> 13, off = pc_ & 0x1FFF;
@@ -572,7 +737,7 @@ void UltraSparc::run_blocks(u64 instructions) {
                 instret_ = instret0 + k - (trapped_ ? 1 : 0);
                 if (UV_UNLIKELY(delay_charged_)) {  // (see set_delay_cycles_per_step)
                     delay_charged_ = false;
-                    update_tick_interrupt();
+                    tick_after_delay();
                     return;
                 }
                 continue;
@@ -603,7 +768,7 @@ void UltraSparc::run_blocks(u64 instructions) {
             instret_ += k;
             if (UV_UNLIKELY(delay_charged_)) {
                 delay_charged_ = false;
-                update_tick_interrupt();
+                tick_after_delay();
                 return;
             }
         }
@@ -767,7 +932,10 @@ bool UltraSparc::read_pr(unsigned r, u64& v) {
         case 1: v = trap_[tl_].tnpc; return true;
         case 2: v = trap_[tl_].tstate; return true;
         case 3: v = trap_[tl_].tt; return true;
-        case 4: v = tick(); return true;
+        case 4:
+            v = tick();
+            ++effects_;
+            return true;
         case 5: v = tba_; return true;
         case 6: v = pstate_; return true;
         case 7: v = tl_; return true;
@@ -829,12 +997,13 @@ bool UltraSparc::read_asr(unsigned r, u64& v) {
                 return false;
             }
             v = tick();
+            ++effects_;
             return true;
         case 5: v = mask_address(pc_); return true;
         case 6: v = fprs_; return true;
         case 16:  // PCR
             if (!priv) {
-                take_trap(tt::kPrivilegedAction);
+                take_trap(tt::kPrivilegedOpcode);
                 return false;
             }
             v = pcr_;
@@ -844,7 +1013,9 @@ bool UltraSparc::read_asr(unsigned r, u64& v) {
                 take_trap(tt::kPrivilegedAction);
                 return false;
             }
+            pic_count();
             v = pic_;
+            ++effects_;
             return true;
         case 18:
         case 22:
@@ -876,16 +1047,18 @@ bool UltraSparc::write_asr(unsigned r, u64 v) {
         case 6: fprs_ = static_cast<u8>(v & 7); return true;
         case 16:
             if (!priv) {
-                take_trap(tt::kPrivilegedAction);
+                take_trap(tt::kPrivilegedOpcode);
                 return false;
             }
-            pcr_ = v;
+            pic_count();
+            pcr_ = v & 0x78F7;  // S1, S0, UT, ST, PRIV
             return true;
         case 17:
             if ((pcr_ & 1) && !priv) {
                 take_trap(tt::kPrivilegedAction);
                 return false;
             }
+            pic_count();
             pic_ = v;
             return true;
         case 19:
@@ -904,7 +1077,7 @@ bool UltraSparc::write_asr(unsigned r, u64 v) {
                 take_trap(tt::kPrivilegedOpcode);
                 return false;
             }
-            if (r == 18) dcr_ = v;
+            if (r == 18) dcr_ = v & 0x3D;  // MS, MVX, GS (bit 1 reserved)
             else if (r == 20) softint_ |= v & 0x1FFFF;
             else if (r == 21) softint_ &= ~(v & 0x1FFFF);
             else if (r == 22) softint_ = v & 0x1FFFF;

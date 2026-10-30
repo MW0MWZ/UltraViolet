@@ -117,8 +117,16 @@ public:
     void reset();
     // Externally initiated reset (XIR): RED_state at the reset vector + 0x60.
     void externally_initiated_reset() { take_trap(tt::kExternallyInitiatedReset); }
-    // Executes up to `instructions` instructions (fewer if halted).
+    // Executes up to `instructions` instructions (fewer if halted, or
+    // stopped).
     void run(u64 instructions);
+    // Ends the run under way after the instruction being executed (a store
+    // to a register that resets the system: the reset comes after it,
+    // between instructions).
+    void stop_run() {
+        stop_ = true;
+        attention_ = true;
+    }
     void step();
     // Decoded-block cache: run() executes straight-line runs of instructions
     // fetched and translated once per block instead of once per instruction.
@@ -182,6 +190,7 @@ public:
     unsigned trap_type(unsigned level) const { return trap_[level].tt; }
     u64 tick() const;
     u64 softint() const { return softint_; }
+    u64 tick_cmpr() const { return tick_cmpr_; }
     u64 lsu_control() const { return lsu_control_; }
     u8 asi_reg() const { return asi_; }
     u8 fprs() const { return fprs_; }
@@ -231,6 +240,27 @@ public:
     u64 delay_steps() const { return delay_steps_; }
     u64 delay_cycles() const { return delay_time_fx_ >> 16; }
 
+    // Idle loops: when a block is about to start at the same place as
+    // before with every register as it was then, and nothing has been
+    // written since (no store, no device access, no DMA, no reading of
+    // TICK or the performance counters), each later time round the loop
+    // does the same until an interrupt, an event or DMA changes something.
+    // run() then ends there, idle_period() gives the steps of a time round,
+    // and skip_idle() goes round as many times as end before guest time
+    // `until`, before TICK_COMPARE matches and within `max_steps`, at once,
+    // leaving the processor as running them would. On by default.
+    void set_idle_skip(bool enabled) {
+        idle_skip_ = enabled;
+        idle_pc_ = kNoIdle;
+        idle_found_ = false;
+    }
+    u64 idle_period() const { return idle_found_ ? idle_period_ : 0; }
+    u64 skip_idle(u64 until, u64 max_steps);
+    // The instructions skipped so, and the guest time they took (the
+    // pacer leaves them out of the host's speed).
+    u64 idle_instructions() const { return idle_instructions_; }
+    u64 idle_cycles() const { return idle_time_fx_ >> 16; }
+
     // Stops run() (the machine wants control, or the CPU entered error_state).
     bool halted() const { return halted_; }
     void set_halted(bool h) { halted_ = h; }
@@ -249,6 +279,7 @@ private:
     struct TrapLevel {
         u64 tpc = 0, tnpc = 0, tstate = 0;
         unsigned tt = 0;
+        bool operator==(const TrapLevel&) const = default;
     };
 
     // Memory access attributes for one translation.
@@ -352,6 +383,7 @@ private:
     void check_interrupts();
     void update_globals();
     void update_tick_interrupt();
+    void tick_after_delay();
     unsigned window(int delta) const { return static_cast<unsigned>(static_cast<int>(cwp_) + delta + kWindows) % kWindows; }
 
     bool cond_icc(unsigned cond, unsigned cc4) const;
@@ -362,6 +394,8 @@ private:
     u64 mask_address(u64 va) const { return (pstate_ & pstate::AM) ? (va & 0xFFFFFFFFull) : va; }
     bool translate_fetch(u64 va, u64& pa);
     bool translate_data(u64 va, u8 asi, AccessKind kind, unsigned size, Access& out);
+    bool watched(u64 addr, unsigned size, AccessKind kind, bool pa) const;
+    bool watch_armed() const;
     TlbEntry* tlb_lookup(MmuRegs& mmu, u64 va, unsigned context);
     void data_fault(unsigned trap, u64 va, u8 asi, unsigned context_type, unsigned context, unsigned ft, bool write,
                     bool side_effect = false);
@@ -493,7 +527,8 @@ private:
     void fpop1(u32 insn);
     void fpop2(u32 insn);
     void impdep1(u32 insn);
-    void fp_unimplemented();  // fp_exception_other, unimplemented_FPop (quad operations, unknown opf)
+    void fp_unimplemented();
+    void fp_unfinished();  // fp_exception_other, unimplemented_FPop (quad operations, unknown opf)
     // Ends an arithmetic FPop with the exceptions it raised: traps if any is
     // enabled in TEM (returns false: the result must not be written), else
     // accrues them.
@@ -531,6 +566,9 @@ private:
     u64 tick_match_ = ~u64{0};  // the step (cycles_ value) at which TICK reaches TICK_CMPR
     u64 softint_ = 0;
     u64 dcr_ = 0, pcr_ = 0, pic_ = 0, gsr_ = 0;
+    u64 pic_cycles_ = 0, pic_instr_ = 0;  // the processor's counts when the PICs were last brought up to date
+    bool pic_priv_ = false;               // the mode they were counting in
+    void pic_count();
 
     u64 lsu_control_ = 0, estate_error_en_ = 0, afsr_ = 0, afar_ = 0, upa_config_ = 0;
     u64 intr_receive_ = 0;            // bit 5 busy
@@ -560,6 +598,9 @@ private:
     bool direct_64k_ = false;  // the last fast_data_access_protection was on a 64 KiB page
     std::unordered_map<u64, u64> diag_;  // L1 cache tag/data arrays seen through the diagnostic ASIs, by ASI and address
     u64& diag(u8 asi, u64 va);
+    static u64 diag_mask(u8 asi);
+    // UPA_CONFIG: only ELIM (35:33, the E-cache size limit) is implemented.
+    static constexpr u64 kUpaConfigElim = 7ull << 33;
     // The E-cache as the diagnostic ASIs see it: data by doubleword and a tag
     // per 64-byte line, indexed modulo its size (so larger offsets alias, as
     // on the real cache), and the tag staging register.
@@ -570,6 +611,10 @@ private:
     u64 fsr_ = 0;
 
     u64 cycles_ = 0, instret_ = 0;  // steps, and instructions retired
+    // Stores, writes of internal registers and reads of TICK and the
+    // performance counters, by execute() and translated code: an idle loop
+    // does none.
+    u64 effects_ = 0;
     // Guest time = time_base_ + (cycles_ - step_base_) * cpi_fx_ / 65536.
     u64 time_base_ = 0, step_base_ = 0, cpi_fx_ = 65536;
     // Delay loops run at once: the charge for a step (16.16; 0: the usual
@@ -583,8 +628,40 @@ private:
     // otherwise only look at between blocks: the interrupt conditions, the
     // fetch translation, or the code being run.
     bool attention_ = false;
+    bool stop_ = false;  // see stop_run()
     bool block_cache_ = true;
     std::vector<Block> blocks_;
+
+    // Idle loops (see set_idle_skip): the state an idle loop must come back
+    // to, at the place watched (a block about to start), with what had been
+    // done by then.
+    struct IdleState {
+        u64 pc = 0, npc = 0, y = 0, tba = 0, softint = 0, tick_cmpr = 0, tick_offset = 0, fsr = 0, gsr = 0;
+        u64 pcr = 0, dcr = 0, lsu = 0, pctx = 0, sctx = 0, intr_receive = 0;
+        std::array<std::array<u64, 8>, 4> globals{};
+        std::array<u64, kWindows * 16> windows{};
+        std::array<u32, 64> f{};
+        std::array<TrapLevel, kMaxTl + 1> trap{};
+        u8 ccr = 0, asi = 0, fprs = 0;
+        u16 pstate = 0;
+        unsigned tl = 0, pil = 0, cwp = 0, cansave = 0, canrestore = 0, cleanwin = 0, otherwin = 0, wstate = 0;
+        bool tick_npt = false;
+        bool operator==(const IdleState&) const = default;
+    };
+    void idle_state(IdleState& s) const;
+    void idle_watch();
+    bool idle_visit();
+    static constexpr u64 kNoIdle = 1;  // (never a pc: those are word aligned)
+    bool idle_skip_ = true;
+    bool idle_found_ = false;  // run() ended at an idle loop's place
+    u64 idle_pc_ = kNoIdle;    // the place watched
+    IdleState idle_state_;
+    u64 idle_steps_at_ = 0, idle_instret_at_ = 0, idle_effects_at_ = 0, idle_slow_at_ = 0, idle_dma_at_ = 0,
+        idle_delay_at_ = 0;
+    u64 idle_period_ = 0, idle_period_instr_ = 0;  // a time round, in steps and instructions
+    unsigned idle_misses_ = 0;                     // times back at the place without a match
+    u64 idle_retry_ = 0;                           // the step from which another place may be watched
+    u64 idle_instructions_ = 0, idle_time_fx_ = 0;
     std::string halt_reason_;
 };
 
