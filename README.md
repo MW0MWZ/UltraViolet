@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="graphics/UltraViolet_Logo.png" alt="UltraViolet logo" width="280"><br>
+  <sub>Logo &copy; Andy Taylor (MW0MWZ)</sub>
+</p>
+
 # UltraViolet
 
 An open-source emulator for Sun **UltraSPARC** workstations, starting with the

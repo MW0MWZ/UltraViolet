@@ -254,6 +254,37 @@ TEST(atapi_cdrom_reports_unit_attention_then_reads) {
     CHECK_EQ(load_be<u32>(toc.data() + 16), 100u);
 }
 
+TEST(atapi_cdrom_removal_lock_lasts_until_a_hardware_reset) {
+    DiskImage img;
+    CHECK(img.open(make_image("uv-cd.iso", 100, 2048), true));
+    Rig r;
+    AtapiCdrom cd(r.sched, 1e6);
+    r.ch.attach(0, &cd);
+    cd.insert(&img);
+    r.packet({0x03, 0, 0, 0, 18, 0});  // clears the unit attention
+    r.read_all();
+    r.packet({0x1E, 0, 0, 0, 1, 0});  // PREVENT MEDIUM REMOVAL
+    CHECK(cd.locked());
+    r.packet({0x1B, 0, 0, 0, 2, 0});  // eject: refused
+    CHECK_EQ(r.reg(7) & 0x01, 0x01u);
+    // A software reset leaves the lock.
+    r.ch.write_control(2, ata::kSrst);
+    r.ch.write_control(2, 0);
+    r.wait();
+    CHECK(cd.locked());
+    // A hardware reset ends it, and the next command reports the reset.
+    r.ch.reset();
+    CHECK(!cd.locked());
+    r.packet({0x00});
+    CHECK_EQ(r.reg(7) & 0x01, 0x01u);
+    r.packet({0x03, 0, 0, 0, 18, 0});
+    std::vector<u8> sense = r.read_all();
+    CHECK_EQ(sense[2], 0x06u);
+    CHECK_EQ(sense[12], 0x29u);
+    r.packet({0x1B, 0, 0, 0, 2, 0});  // eject
+    CHECK_EQ(r.reg(7) & 0x01, 0x00u);
+}
+
 TEST(atapi_cdrom_read_cd_builds_raw_sectors_and_dma_reads) {
     DiskImage img;
     CHECK(img.open(make_image("uv-cd2.iso", 20, 2048), true));

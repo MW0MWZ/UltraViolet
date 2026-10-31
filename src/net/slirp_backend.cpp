@@ -80,7 +80,7 @@ public:
         inet_pton(AF_INET, "10.0.2.2", &cfg.vhost);
         inet_pton(AF_INET, "10.0.2.15", &cfg.vdhcp_start);
         inet_pton(AF_INET, "10.0.2.3", &cfg.vnameserver);
-        cfg.vhostname = "IRIS";
+        cfg.vhostname = "UltraViolet";  // the name DHCP gives the guest
         // Filled in place, once: what is not set stays null (including, with
         // libslirp 4.9, the deprecated descriptor callbacks, which a copy of
         // the struct would touch).

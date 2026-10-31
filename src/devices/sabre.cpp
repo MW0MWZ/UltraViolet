@@ -6,6 +6,7 @@
 
 #include "core/endian.h"
 #include "core/log.h"
+#include "core/text.h"
 
 namespace uv {
 
@@ -537,6 +538,20 @@ bool Sabre::dma_write(u32 dvma, const u8* data, std::size_t length) {
         length -= chunk;
     }
     return true;
+}
+
+void Sabre::describe(std::string& out) const {
+    static const char* const kState[] = {"idle", "received", "?", "pending"};
+    appendf(out, "sabre: interrupt sources asserted or not idle (ino: level, clear state, IMAP):");
+    bool any = false;
+    for (unsigned ino = 0; ino < kNumIno; ++ino) {
+        if (!level_[ino] && state_[ino] == kStateIdle) continue;
+        const u64 map = ino < 0x20 ? pci_imap_[ino >> 2] : obio_imap_[(ino - 0x20) & 31];
+        appendf(out, " %02x: %s %s %llx;", ino, level_[ino] ? "high" : "low", kState[state_[ino] & 3],
+                static_cast<unsigned long long>(map));
+        any = true;
+    }
+    appendf(out, "%s%s\n", any ? "" : " none", retry_timer_.active() ? " (retry timer running)" : "");
 }
 
 }  // namespace uv

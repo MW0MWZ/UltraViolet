@@ -319,6 +319,71 @@ TEST(cpu_dtlb_entry_replaced_stops_translating_even_after_use) {
     CHECK_EQ(r.cpu.trap_type(1), tt::kFastDataAccessMmuMiss);
 }
 
+TEST(cpu_dtlb_translations_already_used_hold_only_in_their_context) {
+    // A page of context 5, used: it translates after the primary context
+    // goes to 6 and back to 5, and misses with 6.
+    Rig r;
+    r.cpu.set_reg(g1, 0x40000000 | 5);
+    r.cpu.set_reg(g2, tte::V | tte::CP | tte::P | tte::W | 0x4000);
+    r.cpu.set_reg(g3, 0x30);
+    r.cpu.set_reg(o0, 0x08);
+    r.cpu.set_reg(o1, 5);
+    r.cpu.set_reg(o2, 6);
+    r.exec({STXA(g1, g3, g0, asi::DMMU), STXA(g2, g0, g0, asi::DTLB_DATA_IN), STXA(o1, o0, g0, asi::DMMU)});
+    dmmu_on(r);
+    r.cpu.set_reg(g5, 0x40000000);
+    r.exec({LDX(g6, g5, 0), LDX(g6, g5, 8)});  // (remembered now)
+    r.exec({STXA(o2, o0, g0, asi::DMMU), STXA(o1, o0, g0, asi::DMMU), LDX(g6, g5, 0)});
+    CHECK_EQ(r.cpu.tl(), 0u);  // (6 and back to 5: translates)
+    r.exec({STXA(o2, o0, g0, asi::DMMU)});
+    r.exec({LDX(g6, g5, 0)}, 1);
+    CHECK_EQ(r.cpu.trap_type(1), tt::kFastDataAccessMmuMiss);
+}
+
+TEST(cpu_dtlb_contexts_switched_back_and_forth_keep_their_own_translations) {
+    // One virtual page, mapped to 0x4000 in context 5 and to 0x6000 in
+    // context 6, read in each in turn by a loop run often enough to be
+    // translated: each read gets its own context's page.
+    Rig r;
+    r.bus.write(0x4000, u64{0x55});
+    r.bus.write(0x6000, u64{0x66});
+    for (const auto& [ctx, pa] : {std::pair<u64, u64>{5, 0x4000}, {6, 0x6000}}) {
+        r.cpu.set_reg(g1, 0x40000000 | ctx);
+        r.cpu.set_reg(g2, tte::V | tte::CP | tte::P | tte::W | pa);
+        r.cpu.set_reg(g3, 0x30);
+        r.exec({STXA(g1, g3, g0, asi::DMMU), STXA(g2, g0, g0, asi::DTLB_DATA_IN)});
+    }
+    dmmu_on(r);
+    r.cpu.set_reg(o0, 0x08);  // the primary context register
+    r.cpu.set_reg(o1, 5);
+    r.cpu.set_reg(o2, 6);
+    r.cpu.set_reg(g5, 0x40000000);
+    r.put(Rig::kCode, {MOVi(g1, 200), STXA(o1, o0, g0, asi::DMMU), LDX(g3, g5, 0), ADD(g6, g6, g3), STXA(o2, o0, g0, asi::DMMU),
+                       LDX(g3, g5, 0), ADD(g7, g7, g3), SUBcci(g1, g1, 1), BPcc(cNE, kXcc, -7), NOP, Bicc(cA, 0), NOP});
+    r.run_at(Rig::kCode, 200 * 9 + 20);
+    CHECK_EQ(r.cpu.reg(g1), 0u);
+    CHECK_EQ(r.cpu.reg(g6), 200u * 0x55);
+    CHECK_EQ(r.cpu.reg(g7), 200u * 0x66);
+}
+
+TEST(cpu_dtlb_entry_written_by_data_access_replaces_the_one_there) {
+    // Page A in entry 0, used; a TLB data access write puts page B in entry
+    // 0: A misses and B translates.
+    Rig r;
+    dmmu_map(r, 0x40000000, 0x4000);
+    dmmu_on(r);
+    r.cpu.set_reg(g5, 0x40000000);
+    r.exec({LDX(g6, g5, 0), LDX(g6, g5, 8)});  // (remembered now)
+    r.cpu.set_reg(g1, 0x60000000);
+    r.cpu.set_reg(g2, tte::V | tte::CP | tte::P | tte::W | 0x6000);
+    r.cpu.set_reg(g3, 0x30);
+    r.cpu.set_reg(g7, 0xBEEF);
+    r.exec({STXA(g1, g3, g0, asi::DMMU), STXA(g2, g0, g0, asi::DTLB_DATA_ACCESS), STX(g7, g1, 0)});
+    CHECK_EQ(r.load64(0x6000), 0xBEEFu);
+    r.exec({LDX(g6, g5, 0)}, 1);
+    CHECK_EQ(r.cpu.trap_type(1), tt::kFastDataAccessMmuMiss);
+}
+
 TEST(cpu_dtlb_used_bits_count_accesses_after_they_are_cleared) {
     // All 64 entries used; the next insert clears the used bits and takes
     // entry 0. Entries 0 and 1 are then used (1 a page used before the
@@ -336,6 +401,37 @@ TEST(cpu_dtlb_used_bits_count_accesses_after_they_are_cleared) {
     r.exec({LDX(g6, g5, 0)});
     r.cpu.set_reg(g5, 0x50002000);
     r.exec({LDX(g6, g5, 0)});
+    dmmu_map(r, 0x72000000, 0x8000);
+    CHECK_EQ(r.cpu.dmmu().tlb[2].tag, 0x72000000u);
+    CHECK_EQ(r.cpu.dmmu().tlb[1].tag, 0x50002000u);
+}
+
+TEST(cpu_dtlb_used_bits_count_accesses_by_translated_code) {
+    // As above, with page 1 read after the bits are cleared only by a loop
+    // translated before (reads made through its fast translations count):
+    // the insert after must still take entry 2, not 1.
+    constexpr u64 kLoop = 0x3000;  // (a code page the tests' exec() leaves alone)
+    Rig r;
+    for (u64 k = 0; k < 64; ++k) dmmu_map(r, 0x50000000 + 0x2000 * k, 0x6000);
+    dmmu_on(r);
+    // (Entered at the loop itself, whose block is translated: the reads are
+    // all its own. The sum stored makes it no polling loop, which would be
+    // run at once outside the translation.)
+    r.put(kLoop, {LDX(g6, g5, 0), ADD(g7, g7, g6), STX(g7, g5, 8), SUBcci(g1, g1, 1), BPcc(cNE, kXcc, -4), NOP, Bicc(cA, 0), NOP});
+    r.cpu.set_reg(g5, 0x50002000);
+    r.cpu.set_reg(g1, 200);
+    r.run_at(kLoop, 200 * 6 + 20);  // (translated now)
+    for (u64 k = 0; k < 64; ++k) {
+        r.cpu.set_reg(g5, 0x50000000 + 0x2000 * k);
+        r.exec({LDX(g6, g5, 0)});
+    }
+    dmmu_map(r, 0x70000000, 0x8000);
+    CHECK_EQ(r.cpu.dmmu().tlb[0].tag, 0x70000000u);
+    r.cpu.set_reg(g5, 0x70000000);
+    r.exec({LDX(g6, g5, 0)});  // (entry 0 used)
+    r.cpu.set_reg(g5, 0x50002000);
+    r.cpu.set_reg(g1, 200);
+    r.run_at(kLoop, 200 * 6 + 20);
     dmmu_map(r, 0x72000000, 0x8000);
     CHECK_EQ(r.cpu.dmmu().tlb[2].tag, 0x72000000u);
     CHECK_EQ(r.cpu.dmmu().tlb[1].tag, 0x50002000u);
@@ -501,6 +597,20 @@ TEST(cpu_tick_compare_sets_softint_tick_int) {
     Rig r;
     r.exec({WRPR(prTICK, g0, g0), WRASRi(23, g0, 10)});  // TICK = 0, TICK_CMPR = 10
     for (int i = 0; i < 12; ++i) {
+        r.put(Rig::kCode, {NOP});
+        r.run_at(Rig::kCode, 1);
+    }
+    CHECK(r.cpu.softint() & 1);
+}
+
+TEST(cpu_tick_compare_survives_a_change_of_charge_per_step) {
+    // The charge changes between every two instructions (as the pacer may
+    // between slices), including just as TICK reaches TICK_CMPR: the
+    // interrupt still comes.
+    Rig r;
+    r.exec({WRPR(prTICK, g0, g0), WRASRi(23, g0, 10)});  // TICK = 0, TICK_CMPR = 10
+    for (int i = 0; i < 12; ++i) {
+        r.cpu.set_cycles_per_step(i % 2 ? 1.0 : 1.5);
         r.put(Rig::kCode, {NOP});
         r.run_at(Rig::kCode, 1);
     }
