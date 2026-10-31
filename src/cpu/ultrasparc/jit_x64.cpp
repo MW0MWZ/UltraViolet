@@ -296,6 +296,24 @@ bool UltraSparc::jit_compile(Block& b) {
                   offsetof(FetchEntry, host) == 16);
     // Jumps to the translation in r8 for the block at rdx if its Block
     // (rcx) is for the same mode and fits in the budget; else to `no`.
+    // rax = a block's host address, rcx = the first slot of its set: rcx =
+    // the way holding it and r8 = its translation, or out through `no`.
+    auto find_way = [&](std::vector<std::size_t>& no) {
+        std::vector<std::size_t> hit;
+        for (unsigned w = 0; w < kBlockWays; ++w) {
+            const s32 d = static_cast<s32>(w * sizeof(Block));
+            e.alu(Alu::Cmp, rax, Mem{rcx, d + static_cast<s32>(offsetof(Block, host))});
+            const std::size_t next = e.jcc(Cond::Ne);
+            if (d) e.alu_imm(Alu::Add, rcx, d);
+            hit.push_back(e.jmp());
+            e.bind(next);
+        }
+        no.push_back(e.jmp());
+        for (std::size_t site : hit) e.bind(site);
+        e.mov(r8, Mem{rcx, static_cast<s32>(offsetof(Block, code))});
+        e.test(r8, r8);
+        no.push_back(e.jcc(Cond::E));
+    };
     auto enter = [&](std::vector<std::size_t>& no) {
         e.cmp8_imm(Mem{rcx, static_cast<s32>(offsetof(Block, jit_mode))}, mode);
         no.push_back(e.jcc(Cond::Ne));
@@ -343,17 +361,13 @@ bool UltraSparc::jit_compile(Block& b) {
         e.alu_imm(Alu::And, rcx, 0x1FFF, false);
         e.alu(Alu::Add, rax, rcx);
         e.bind(found);
-        e.mov(rcx, rax);  // its slot
+        e.mov(rcx, rax);  // its set
         e.shift_imm(Shift::Shr, rcx, 2, true);
-        e.alu_imm(Alu::And, rcx, (1 << kBlockBits) - 1, false);
-        e.imul_imm(rcx, rcx, static_cast<s32>(sizeof(Block)));
+        e.alu_imm(Alu::And, rcx, (1 << kBlockSetBits) - 1, false);
+        e.imul_imm(rcx, rcx, static_cast<s32>(kBlockWays * sizeof(Block)));
         e.mov_imm64(r8, reinterpret_cast<u64>(blocks_.data()));
         e.alu(Alu::Add, rcx, r8);
-        e.alu(Alu::Cmp, rax, Mem{rcx, static_cast<s32>(offsetof(Block, host))});
-        no.push_back(e.jcc(Cond::Ne));
-        e.mov(r8, Mem{rcx, static_cast<s32>(offsetof(Block, code))});
-        e.test(r8, r8);
-        no.push_back(e.jcc(Cond::E));
+        find_way(no);
         enter(no);
         for (std::size_t site : no) e.bind(site);
         store_pc_npc_from(rdx);
@@ -401,13 +415,9 @@ bool UltraSparc::jit_compile(Block& b) {
             e.jmp_to(body);
         } else {
             const u8* host = b.host + delta;
-            e.mov_imm64(rcx, reinterpret_cast<u64>(&blocks_[block_index(host)]));
+            e.mov_imm64(rcx, reinterpret_cast<u64>(&blocks_[block_set(host)]));
             e.mov_imm64(rax, reinterpret_cast<u64>(host));
-            e.alu(Alu::Cmp, rax, Mem{rcx, static_cast<s32>(offsetof(Block, host))});
-            no.push_back(e.jcc(Cond::Ne));
-            e.mov(r8, Mem{rcx, static_cast<s32>(offsetof(Block, code))});
-            e.test(r8, r8);
-            no.push_back(e.jcc(Cond::E));
+            find_way(no);
             pc_plus(rdx, delta);
             enter(no);
         }
@@ -1183,7 +1193,7 @@ bool UltraSparc::jit_compile(Block& b) {
         e.alu_imm(Alu::And, rdx, kFastEntries - 1, false);
         e.shift_imm(Shift::Shl, rdx, 5, false);
         e.alu(Alu::Add, rdx, kCpu);
-        e.alu(Alu::Or, rcx, at(fast_key_));
+        e.alu(Alu::Or, rcx, at(fast_key_[cls]));
         e.alu(Alu::Cmp, rcx, Mem{rdx, table});
         slow.push_back(e.jcc(Cond::Ne));
         e.test8_imm(Mem{rdx, table + 24}, perm);
@@ -1862,6 +1872,23 @@ bool UltraSparc::jit_compile(Block& b) {
             store_reg(rd, rax);
             return true;
         }
+        if (op3 == 0x32 && rd == 8 && priv && !dynamic) {  // WRPR %pil
+            // A lower PIL may let a level interrupt in (one SOFTINT
+            // asks for): then out, for run_blocks() to take it before the
+            // next instruction. (Interrupt vectors do not depend on PIL.)
+            self = false;
+            load_reg(rax, rs1);
+            load_op2(rcx, insn);
+            e.alu(Alu::Xor, rax, rcx);
+            e.alu_imm(Alu::And, rax, 15, false);
+            e.mov(at(pil_), rax, false);
+            e.alu_imm(Alu::Cmp, at(softint_), 0);
+            const std::size_t none = e.jcc(Cond::E);
+            store_pc_npc(4 * static_cast<s64>(i) + 4);
+            leave(i + 1);
+            e.bind(none);
+            return true;
+        }
         if (op3 == 0x2A && priv && rs1 != 4) {  // RDPR (the trap registers need TL > 0)
             static_assert(sizeof(TrapLevel) == 32);
             const bool trap_level = rs1 <= 3;
@@ -2140,8 +2167,9 @@ bool UltraSparc::jit_compile(Block& b) {
     if (!code) {
         // The buffer is full: start again with an empty one, the stubs
         // first, and translate the block again for its new place.
-        for (Block& other : blocks_) other.code = nullptr;
+        for (Block& other : blocks_) other.code = nullptr, other.runs = 0;
         jit_buf_->clear();
+        ++jit_flushes_;
         jit_stub_dyn_ = jit_stub_seq_ = nullptr;
         if (!jit_make_stubs() || jit_buf_->next() == base) return false;  // (nothing more can be done)
         return jit_compile(b);

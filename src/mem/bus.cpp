@@ -39,7 +39,8 @@ Bus::Region& Bus::region_for(u8* host, u64 size) {
     for (auto& r : regions_)
         if (host >= r->host && host + size <= r->host + r->size) return *r;
     const u64 pages = (size + (u64{1} << kCodePageShift) - 1) >> kCodePageShift;
-    auto r = std::make_unique<Region>(Region{host, size, std::make_unique<u8[]>(pages)});
+    const u64 lines = (size + (u64{1} << kCodeLineShift) - 1) >> kCodeLineShift;
+    auto r = std::make_unique<Region>(Region{host, size, std::make_unique<u8[]>(pages), std::make_unique<u8[]>(lines)});
     regions_.push_back(std::move(r));
     return *regions_.back();
 }
@@ -59,6 +60,31 @@ u8* Bus::code_flag(const u8* host) const {
     return r ? r->code.get() + ((host - r->host) >> kCodePageShift) : nullptr;
 }
 
+void Bus::mark_code(const u8* host, std::size_t size) {
+    const Region* r = find_region(host);
+    if (!r || size == 0) return;
+    const u64 off = static_cast<u64>(host - r->host);
+    r->code[off >> kCodePageShift] = 1;
+    for (u64 l = off >> kCodeLineShift; l <= (off + size - 1) >> kCodeLineShift; ++l) r->lines[l] = 1;
+}
+
+bool Bus::code_lines(const u8* host, std::size_t size) const {
+    const Region* r = find_region(host);
+    if (!r || size == 0) return false;
+    const u64 off = static_cast<u64>(host - r->host);
+    for (u64 l = off >> kCodeLineShift; l <= (off + size - 1) >> kCodeLineShift; ++l)
+        if (r->lines[l]) return true;
+    return false;
+}
+
+void Bus::clear_code(const u8* host_page) {
+    const Region* r = find_region(host_page);
+    if (!r) return;
+    const u64 off = static_cast<u64>(host_page - r->host) & ~((u64{1} << kCodePageShift) - 1);
+    r->code[off >> kCodePageShift] = 0;
+    std::memset(r->lines.get() + (off >> kCodeLineShift), 0, std::size_t{1} << (kCodePageShift - kCodeLineShift));
+}
+
 bool Bus::write_block(u64 paddr, const u8* data, std::size_t length) {
     constexpr u64 kCodeMask = (u64{1} << kCodePageShift) - 1;
     ++dma_writes_;
@@ -70,7 +96,7 @@ bool Bus::write_block(u64 paddr, const u8* data, std::size_t length) {
         const std::size_t chunk = static_cast<std::size_t>(std::min<u64>(length, kCodeMask + 1 - (in_page & kCodeMask)));
         u8* const h = p.host + in_page;
         std::memcpy(h, data, chunk);
-        if (p.code[in_page >> kCodePageShift]) code_written(h - (in_page & kCodeMask));
+        if (p.code[in_page >> kCodePageShift]) code_written(h - (in_page & kCodeMask), h, chunk);
         paddr += chunk;
         data += chunk;
         length -= chunk;

@@ -116,14 +116,17 @@ bool UltraSparc::asi_restricted_check(u8 a) {
 TlbEntry* UltraSparc::tlb_lookup(MmuRegs& mmu, u64 va, unsigned context) {
     const u64 page = va >> 13;
     SoftTlbEntry& s = soft_tlb_[&mmu == &dmmu_][page & (kSoftTlbSize - 1)];
-    if (s.gen == soft_gen_ && s.va_page == page && s.context == context) return s.entry;
+    if (s.gen == tlb_gen_ && s.va_page == page && s.context == context && s.epoch == s.entry->epoch) {
+        s.entry->used = true;
+        return s.entry;
+    }
     for (TlbEntry& e : mmu.tlb) {
         if (!(e.data & tte::V)) continue;
         const unsigned shift = tte::page_shift(tte::size(e.data));
         if (((e.tag ^ va) >> shift) != 0) continue;
         if (!(e.data & tte::G) && (e.tag & 0x1FFF) != context) continue;
         e.used = true;
-        s = {page, context, soft_gen_, &e};
+        s = {page, context, tlb_gen_, e.epoch, &e};
         return &e;
     }
     return nullptr;
@@ -223,6 +226,7 @@ bool UltraSparc::translate_data(u64 va, u8 a, AccessKind kind, unsigned size, Ac
         a == asi::PHYS_BYPASS_EC_E_L) {
         out.pa = va & Bus::kAddressMask;
         out.side_effect = a == asi::PHYS_BYPASS_EC_E || a == asi::PHYS_BYPASS_EC_E_L;
+        out.writable = true;
         if (armed && watched(out.pa, size, kind, true)) {
             take_trap(tt::kPaWatchpoint);
             return false;
@@ -271,6 +275,7 @@ bool UltraSparc::translate_data(u64 va, u8 a, AccessKind kind, unsigned size, Ac
     if (!(lsu_control_ & kLsuDm)) {
         out.pa = va & Bus::kAddressMask;
         out.side_effect = (out.pa >> 40) & 1;  // I/O space is uncached, with side effects
+        out.writable = !nonfaulting;
         if (armed && watched(out.pa, size, kind, true)) {  // (no VA watchpoint without the D-MMU)
             take_trap(tt::kPaWatchpoint);
             return false;
@@ -315,6 +320,7 @@ bool UltraSparc::translate_data(u64 va, u8 a, AccessKind kind, unsigned size, Ac
     const u64 offset_mask = (u64{1} << tte::page_shift(tte::size(d))) - 1;
     out.pa = ((d & tte::kPaMask) & ~offset_mask) | (va & offset_mask);
     out.side_effect = d & tte::E;
+    out.writable = (d & tte::W) && !nonfaulting;
     if (d & tte::IE) out.little = !out.little;
     if (armed && watched(out.pa, size, kind, true)) {
         take_trap(tt::kPaWatchpoint);
@@ -425,17 +431,21 @@ void UltraSparc::fast_fill(u64 va, u8 a, const Access& acc, AccessKind kind) {
     const int mode = fast_class(a);
     if (mode < 0 || acc.little != asi_is_little(a)) return;  // (TTE.IE)
     constexpr u64 kPage = 0x1FFF;
-    const bool write = kind != AccessKind::Load;
-    u8* const host = write ? bus_.host_write_ptr(acc.pa & ~kPage) : bus_.host_read_ptr(acc.pa & ~kPage);
+    // A load on a page a store may also use (writable memory, TTE.W) gives
+    // the store the entry too: its first store then need not come here.
+    u8* const writable = kind != AccessKind::Load || acc.writable ? bus_.host_write_ptr(acc.pa & ~kPage) : nullptr;
+    const u8* const code = writable ? bus_.code_flag(writable) : nullptr;
+    if (kind != AccessKind::Load && !code) return;
+    const bool write = code != nullptr;
+    u8* const host = write ? writable : bus_.host_read_ptr(acc.pa & ~kPage);
     if (!host) return;
-    const u8* const code = write ? bus_.code_flag(host) : nullptr;
-    if (write && !code) return;
     FastEntry& f = fast_[mode][(va >> 13) & (kFastEntries - 1)];
-    const u64 key = (va >> 13) | fast_key_;
+    const u64 key = (va >> 13) | fast_key_[mode];
     const s64 addend = static_cast<s64>(reinterpret_cast<uintptr_t>(host) - (va & ~kPage));
     if (f.key != key || f.addend != addend || (f.perms & kFastDev)) f = FastEntry{key, addend, nullptr, 0};
     if (write) f.code = code;
-    f.perms |= kind == AccessKind::Load ? kFastRead : kind == AccessKind::Store ? kFastWrite : kFastRead | kFastWrite | kFastAtomic;
+    f.perms |= kind == AccessKind::Load ? (write ? kFastRead | kFastWrite : kFastRead)
+               : kind == AccessKind::Store ? kFastWrite : kFastRead | kFastWrite | kFastAtomic;
 }
 
 bool UltraSparc::fast_device(u64 va, u8 a, AccessKind kind, Access& acc) const {
@@ -443,7 +453,7 @@ bool UltraSparc::fast_device(u64 va, u8 a, AccessKind kind, Access& acc) const {
     const int mode = fast_class(a);  // (none for no-fault loads, which fault on side effects)
     if (mode < 0) return false;
     const FastEntry& f = fast_[mode][(va >> 13) & (kFastEntries - 1)];
-    if (f.key != ((va >> 13) | fast_key_) || !(f.perms & (kind == AccessKind::Load ? kFastDevRead : kFastDevWrite))) return false;
+    if (f.key != ((va >> 13) | fast_key_[mode]) || !(f.perms & (kind == AccessKind::Load ? kFastDevRead : kFastDevWrite))) return false;
     acc.pa = static_cast<u64>(static_cast<s64>(va) + f.addend);
     acc.little = asi_is_little(a);
     acc.side_effect = f.perms & kFastDevSide;
@@ -456,7 +466,7 @@ void UltraSparc::fast_fill_device(u64 va, u8 a, const Access& acc, AccessKind ki
     if (mode < 0 || acc.little != asi_is_little(a)) return;  // (TTE.IE)
     constexpr u64 kPage = 0x1FFF;
     FastEntry& f = fast_[mode][(va >> 13) & (kFastEntries - 1)];
-    const u64 key = (va >> 13) | fast_key_;
+    const u64 key = (va >> 13) | fast_key_[mode];
     const s64 addend = static_cast<s64>((acc.pa & ~kPage) - (va & ~kPage));
     if (f.key != key || f.addend != addend || !(f.perms & kFastDev)) f = FastEntry{key, addend, nullptr, 0};
     f.perms |= static_cast<u8>((kind == AccessKind::Load ? kFastDevRead : kFastDevWrite) | (acc.side_effect ? kFastDevSide : 0));
@@ -616,11 +626,13 @@ void UltraSparc::tlb_data_in(MmuRegs& mmu, u64 data) {
             }
     }
     if (!slot) {
-        // Every entry used: clear the used bits, and the translations made
-        // from the entries (hits through those do not set the bits again).
+        // Every entry used: clear the used bits, and the fast translations
+        // made from the entries (hits through those do not set the bits
+        // again; soft TLB hits do).
         for (TlbEntry& e : mmu.tlb)
             if (!(e.data & tte::L)) e.used = false;
-        flush_soft_tlb();
+        if (&mmu == &dmmu_) flush_fast_translations(kFastData, false);
+        else flush_fast_translations(0, true);
         for (TlbEntry& e : mmu.tlb)
             if (!(e.data & tte::L)) {
                 slot = &e;
@@ -635,13 +647,12 @@ void UltraSparc::tlb_data_in(MmuRegs& mmu, u64 data) {
     attention_ = true;
 }
 
-void UltraSparc::forget_translations(MmuRegs& mmu, const TlbEntry& e) {
+void UltraSparc::forget_translations(MmuRegs& mmu, TlbEntry& e) {
     const bool data_side = &mmu == &dmmu_;
     const unsigned shift = tte::page_shift(tte::size(e.data));
     const u64 first = (e.tag >> shift) << (shift - 13), count = u64{1} << (shift - 13);  // in 8 KiB pages
     auto in_range = [&](u64 page) { return page - first < count; };
-    for (SoftTlbEntry& s : soft_tlb_[data_side])
-        if (s.entry == &e) s.gen = 0;
+    ++e.epoch;  // (its soft TLB hits)
     if (data_side) {
         for (unsigned c = 0; c < kFastClasses; ++c) {
             if (c == 5) continue;  // (physical: no TLB)
@@ -705,13 +716,14 @@ void UltraSparc::mmu_write(bool data_side, u64 va, u64 value) {
         case 0x08:
             if (data_side) {
                 primary_context_ = value & 0x1FFF;
-                flush_soft_tlb();
+                fast_context_changed(kFastPrimary);  // (the soft TLB's keys hold the context)
+                flush_fetch_cache();
             }
             break;
         case 0x10:
             if (data_side) {
                 secondary_context_ = value & 0x1FFF;
-                flush_soft_tlb();
+                fast_context_changed(kFastSecondary);  // (the soft TLB's keys hold the context)
             }
             break;
         case 0x18: m.sfsr = value & 0xFF7FFF; break;
@@ -853,10 +865,10 @@ bool UltraSparc::internal_asi_write(u8 a, u64 va, unsigned size, u64 value) {
         case asi::DTLB_DATA_ACCESS: {
             MmuRegs& m = a == asi::ITLB_DATA_ACCESS ? immu_ : dmmu_;
             TlbEntry& e = m.tlb[(va >> 3) & 63];
+            if (e.data & tte::V) forget_translations(m, e);  // (what was made from the entry it replaces)
             e.tag = m.tag_access;
             e.data = value;
             e.used = false;
-            flush_soft_tlb();
             return true;
         }
         case asi::IMMU_DEMAP: tlb_demap(immu_, va); return true;

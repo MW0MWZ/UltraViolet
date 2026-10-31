@@ -7,6 +7,7 @@
 
 #include "core/int128.h"
 #include "core/log.h"
+#include "core/text.h"
 
 namespace uv {
 
@@ -466,6 +467,25 @@ void Ultra5_10::run(u64 instructions) {
                                                    false, cpu_.delay_cycles() + cpu_.idle_cycles()));
         }
     }
+}
+
+std::string Ultra5_10::describe() const {
+    static const char* const kMode[] = {"cycle", "realtime", "max", "free"};
+    std::string out;
+    const double hz = opt_.cpu_hz;
+    appendf(out, "machine: %.0f MHz, %u MB, timing %s, %.4f cycles a step, %.3f s behind the wall clock\n", hz / 1e6,
+            opt_.ram_mb, kMode[static_cast<int>(pacer_.mode())], pacer_.cycles_per_instruction(), pacer_.lag());
+    const u64 next = sched_.next_event(), now = sched_.now();
+    if (next == Scheduler::kNever)
+        appendf(out, "events: none pending\n");
+    else
+        appendf(out, "events: next in %.6f s\n", next > now ? static_cast<double>(next - now) / hz : 0.0);
+    appendf(out, "activity: disk %llu, cd-rom %llu, network %llu\n", static_cast<unsigned long long>(disk_image_.accesses()),
+            static_cast<unsigned long long>(cd_image_.accesses()), static_cast<unsigned long long>(hme_.frames()));
+    cpu_.describe(out, hz);
+    sabre_.describe(out);
+    ide_.describe(out);
+    return out;
 }
 
 }  // namespace uv

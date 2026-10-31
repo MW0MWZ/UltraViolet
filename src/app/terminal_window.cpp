@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cfloat>
 
+#include "app/window_icon.h"
 #include "backends/imgui_impl_sdl3.h"
 #include "backends/imgui_impl_sdlrenderer3.h"
 #include "imgui.h"
@@ -68,6 +69,7 @@ void TerminalWindow::open() {
         return;
     }
     window_ = SDL_CreateWindow(title_.c_str(), 640, 400, SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    set_window_icon(window_);
     renderer_ = window_ ? SDL_CreateRenderer(window_, nullptr) : nullptr;
     if (!renderer_) {
         if (window_) SDL_DestroyWindow(window_);

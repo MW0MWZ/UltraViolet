@@ -26,6 +26,8 @@ public:
 
     void reset() override;
     AtaChannel& channel(unsigned n) { return n ? ch1_ : ch0_; }
+    // The controller and both channels, for a diagnostic report.
+    void describe(std::string& out) const;
 
     u32 config_read(u8 reg, unsigned size) override;
     void config_write(u8 reg, unsigned size, u32 value) override;

@@ -29,6 +29,8 @@ public:
     const u8* next() const { return exec_ + ((used_ + kAlign - 1) & ~(kAlign - 1)); }
     // Discards all code; addresses returned earlier become invalid.
     void clear() { used_ = 0; }
+    std::size_t used() const { return used_; }
+    std::size_t size() const { return size_; }
 
 private:
     static constexpr std::size_t kAlign = 16;

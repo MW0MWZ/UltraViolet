@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Andy Taylor
 #include "devices/cmd646.h"
 
+#include "core/text.h"
+
 namespace uv {
 
 namespace {
@@ -224,6 +226,15 @@ bool Cmd646::io_write(u32 addr, unsigned size, u32 value) {
         }
     }
     return pci::Function::io_write(addr, size, value);
+}
+
+void Cmd646::describe(std::string& out) const {
+    appendf(out, "ide (cmd646): command %04x, CNTRL %02x, interrupt status %02x, MRDMODE %02x, BMIDECSR %02x, lines %d %d\n",
+            cfg16(pci::kCommand), cfg8(kCntrl), intr_, mrdmode_, bmidecsr_, level_[0], level_[1]);
+    for (unsigned ch = 0; ch < 2; ++ch) {
+        appendf(out, " channel %u%s:\n", ch, enabled(ch) ? "" : " (disabled)");
+        (ch ? ch1_ : ch0_).describe(out);
+    }
 }
 
 }  // namespace uv

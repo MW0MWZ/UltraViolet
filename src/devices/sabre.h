@@ -20,6 +20,7 @@
 #include <array>
 #include <functional>
 #include <map>
+#include <string>
 
 #include "core/scheduler.h"
 #include "devices/pci.h"
@@ -49,6 +50,8 @@ public:
     // Interrupt input `ino` (0x00-0x1F: PCI slots, slot << 2 | INTx; 0x20 and
     // up: on-board devices) at level `asserted`.
     void set_interrupt(unsigned ino, bool asserted);
+    // Interrupt sources asserted or not idle, for a diagnostic report.
+    void describe(std::string& out) const;
 
     // Bus-master DMA from PCI: DVMA address through the IOMMU to memory.
     bool dma_read(u32 dvma, u8* data, std::size_t length);

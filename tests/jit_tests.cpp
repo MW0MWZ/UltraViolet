@@ -165,6 +165,26 @@ TEST(jit_sees_a_store_into_code_it_has_translated) {
     });
 }
 
+TEST(stores_beside_decoded_code_keep_it) {
+    // A loop whose stores go to its own 4 KiB page, past the code: the code
+    // stays decoded (and translated). A store into the code's own lines (a
+    // NOP over the NOP in the spin's delay slot) drops it.
+    for (const bool into_code : {false, true}) {
+        Rig r;
+        const u32 loop[] = {MOVi(g1, 200), STW(g2, o4, 0), SUBcci(g1, g1, 1), BPcc(cNE, kXcc, -2), NOP, Bicc(cA, 0), NOP};
+        for (std::size_t i = 0; i < std::size(loop); ++i) r.bus.write(Rig::kCode + 4 * i, loop[i]);
+        r.cpu.set_reg(g2, NOP);
+        r.cpu.set_reg(o4, Rig::kCode + (into_code ? 4 * 6 : 0x800));
+        r.run_at(Rig::kCode, 2000);
+        CHECK_EQ(r.cpu.reg(g1), 0u);
+        u32 v = 0;
+        CHECK(r.bus.read(r.cpu.reg(o4), v));
+        CHECK_EQ(v, NOP);
+        if (into_code) CHECK(r.cpu.code_invalidations() > 0);
+        else CHECK_EQ(r.cpu.code_invalidations(), 0u);
+    }
+}
+
 TEST(jit_calls_and_register_windows_match_the_interpreter) {
     // The return lands on code that uses the caller's window at once (the
     // routine's last instruction, the RESTORE, changes it).
@@ -342,6 +362,37 @@ TEST(jit_carries_multiplies_divides_and_tagged_arithmetic_match_the_interpreter)
         r.put(Rig::kTba + (tt::kTagOverflow << 5), {ADDi(i5, i5, 0x20), DONE});
         r.put(Rig::kTba + ((tt::kTrapInstruction + 0x10) << 5), {ADDi(i5, i5, 0x400), DONE});
     }, pstate::PRIV | pstate::PEF, 500, 4096);
+}
+
+TEST(jit_pil_writes_match_the_interpreter) {
+    // PIL up to 15 and read back; on one pass SOFTINT asks for level 5
+    // while it is masked; PIL down to 0 lets it in at once, before the
+    // next instruction (which adds the handler's count so far to %l4).
+    const std::vector<u32> body = {
+        WRPRi(prPIL, g0, 15), RDPR(o1, prPIL), ADD(l3, l3, o1),
+        SUBcci(g0, g1, 10), BPcc(cNE, kXcc, 3), NOP, WRASRi(20, g0, 1 << 5),
+        ADDi(l5, l5, 1), WRPRi(prPIL, g0, 0), ADD(l4, l4, l6), RDPR(o2, prPIL), ADD(l3, l3, o2)};
+    check_against_interpreter(body, 64, [](Rig& r) {
+        r.put(Rig::kTba + ((tt::kInterruptLevel1 + 4) << 5), {WRASRi(21, g0, 1 << 5), ADDi(l6, l6, 1), RETRY});
+    }, pstate::PRIV | pstate::PEF | pstate::IE);
+}
+
+TEST(jit_translates_blocks_again_after_the_buffer_is_emptied) {
+    // 96 blocks run round and round with room for only some of their
+    // translations: each time the buffer is emptied, the blocks are
+    // translated again once they have run often enough, rather than staying
+    // in the interpreter (each could be translated at most twice otherwise).
+    constexpr int kBlocks = 96, kPasses = 400;
+    Rig r;
+    r.cpu.set_jit(true, 16384);
+    std::vector<u32> code = {MOVi(g1, kPasses)};
+    for (int k = 0; k < kBlocks; ++k) code.insert(code.end(), {ADDi(l0, l0, k + 1), Bicc(cA, 2), NOP});
+    code.insert(code.end(), {SUBcci(g1, g1, 1), BPcc(cNE, kXcc, -(kBlocks * 3 + 1)), NOP, Bicc(cA, 0), NOP});
+    for (std::size_t i = 0; i < code.size(); ++i) r.bus.write(Rig::kCode + 4 * i, code[i]);
+    r.run_at(Rig::kCode, kPasses * (kBlocks * 3 + 3) + 10);
+    CHECK_EQ(r.cpu.reg(g1), 0u);
+    CHECK_EQ(r.cpu.reg(l0), u64{kPasses} * kBlocks * (kBlocks + 1) / 2);
+    if (UltraSparc::jit_available()) CHECK(r.cpu.jit_compiles() > 3 * kBlocks);
 }
 
 TEST(jit_return_matches_the_interpreter) {

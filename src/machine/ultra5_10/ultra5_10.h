@@ -158,6 +158,10 @@ public:
     void set_timing(Pacer::Mode mode);
     void set_fast_disk(bool fast);
     std::string disc() const { return cd_image_.is_open() ? cd_image_.path() : std::string(); }
+    // A diagnostic report: the timing, the CPU, pending interrupts and the
+    // IDE controller, as they are now (for a guest that has stopped making
+    // progress). Call with the machine stopped.
+    std::string describe() const;
     Mach64& graphics() { return mach64_; }
     Cs4231& audio() { return audio_; }
     // Where the audio's playback goes (16-bit stereo frames at a rate).

@@ -27,6 +27,7 @@ public:
                std::string revision = "1.0");
     const char* name() const override { return "atapi-cdrom"; }
     bool packet_device() const override { return true; }
+    void describe_more(std::string& out) const override;
 
     // Puts a disc in the drive and closes the tray (nullptr: empty). The
     // guest sees a medium change.
@@ -45,6 +46,7 @@ protected:
     void transfer_done(bool dma, bool to_host) override;
     void before_drq(bool to_host, std::size_t length) override;
     void reset_state() override;
+    void hardware_reset() override;
     u8 reset_status() const override { return 0; }
 
 private:
