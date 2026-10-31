@@ -735,6 +735,8 @@ TEST(ns16550_receive_interrupt_follows_the_fifo_trigger_and_timeout) {
 }
 
 TEST(sab82532_transmit_fifo_fills_in_order_at_any_address) {
+    // Written in order at any XFIFO address; after XF, XPR at once (the
+    // other 32-byte pool is free), ALLS when the last has gone out.
     Scheduler s;
     u64 now = 0;
     s.set_clock([&] { return now; });
@@ -745,10 +747,14 @@ TEST(sab82532_transmit_fifo_fills_in_order_at_any_address) {
     bool irq = false;
     se.set_irq_sink([&](bool on) { irq = on; });
     u64 v = 0;
-    se.read(0x3B, 1, v);  // clear the reset XPR/ALLS
-    se.write(0x3B, 1, 0xFE);  // IMR1: XPR only
+    se.read(0x3B, 1, v);
+    CHECK_EQ(v, 0u);  // (nothing after reset)
+    se.write(0x3B, 1, 0xDE);  // IMR1: XPR and ALLS
     for (char c : std::string("abc")) se.write(0x00, 1, static_cast<u8>(c));  // all to offset 0, as Solaris does
     se.write(0x20, 1, 0x08);  // CMDR: XF
+    CHECK(irq);
+    se.read(0x3B, 1, v);
+    CHECK_EQ(v, 0x01u);  // XPR
     CHECK(!irq);
     for (int i = 0; i < 10; ++i) {  // each character is 10 bit times
         now += 11;
@@ -757,8 +763,58 @@ TEST(sab82532_transmit_fifo_fills_in_order_at_any_address) {
     CHECK(out == "abc");
     CHECK(irq);
     se.read(0x3B, 1, v);
-    CHECK_EQ(v, 0x01u);  // XPR; ALLS is masked, so not shown (IPC:VIS clear)
-    CHECK(!irq);
+    CHECK_EQ(v, 0x20u);  // ALLS
+}
+
+TEST(sab82532_xpr_comes_as_a_pool_frees_and_a_reset_gives_xpr_and_alls) {
+    // 40 bytes: the second pool is busy until no more than 32 are left.
+    // XRES gives XPR and ALLS (the transmitter idle, nothing left), even in
+    // the middle of sending.
+    Scheduler s;
+    u64 now = 0;
+    s.set_clock([&] { return now; });
+    SerialLine a, b;
+    std::string out;
+    a.transmit = [&](u8 c) { out.push_back(static_cast<char>(c)); };
+    Sab82532 se(s, a, b, Sab82532::kClockHz / 16.0);
+    u64 v = 0;
+    se.write(0x3B, 1, 0xDE);
+    for (int k = 0; k < 32; ++k) se.write(0x00, 1, 'x');
+    se.write(0x20, 1, 0x08);
+    se.read(0x3B, 1, v);
+    CHECK_EQ(v, 0x01u);  // XPR: 32 stored, a pool free
+    se.read(0x20, 1, v);
+    CHECK(v & 0x40);     // STAR.XFW
+    for (int k = 0; k < 8; ++k) se.write(0x00, 1, 'y');
+    se.write(0x20, 1, 0x08);
+    se.read(0x3B, 1, v);
+    CHECK_EQ(v, 0u);     // 40 stored: no pool free yet
+    se.read(0x20, 1, v);
+    CHECK(!(v & 0x40));
+    for (int i = 0; i < 8 && out.size() < 8; ++i) {
+        now += 11;
+        s.run_due(now);
+    }
+    CHECK_EQ(out.size(), 8u);
+    se.read(0x3B, 1, v);
+    CHECK_EQ(v, 0x01u);  // 32 left: XPR
+    for (int i = 0; i < 40 && out.size() < 40; ++i) {  // (all sent: ALLS, then a reset)
+        now += 11;
+        s.run_due(now);
+    }
+    CHECK_EQ(out.size(), 40u);
+    se.write(0x20, 1, 0x01);  // CMDR: XRES
+    se.read(0x3B, 1, v);
+    CHECK_EQ(v, 0x21u);  // XPR and ALLS (as on an Ultra 10)
+    for (int k = 0; k < 8; ++k) se.write(0x00, 1, 'z');
+    se.write(0x20, 1, 0x08);
+    se.read(0x3B, 1, v);  // (XPR)
+    se.write(0x20, 1, 0x01);  // XRES in the middle of sending
+    se.read(0x3B, 1, v);
+    CHECK_EQ(v, 0x21u);  // XPR, and ALLS: nothing is left to send
+    now += 1000;
+    s.run_due(now);
+    CHECK_EQ(out.size(), 40u);  // (the rest was cleared)
 }
 
 TEST(sab82532_masked_statuses_stay_hidden_and_stored_unless_ipc_vis) {
@@ -1029,13 +1085,25 @@ TEST(m48t59_says_how_long_a_read_holds) {
 
 // The SAB82532 says how long a read holds: the status register always; an
 // interrupt status register not while it has bits a read would clear.
+TEST(sab82532_shows_its_version_and_a_carrier) {
+    // VSTR: version 3.2 (VN 0010), CD active (1): the line always has a
+    // terminal on it.
+    Scheduler s;
+    SerialLine a, b;
+    Sab82532 se(s, a, b, Sab82532::kClockHz / 16.0);
+    u64 v = 0;
+    se.read(0x34, 1, v);
+    CHECK_EQ(v, 0x82u);
+}
+
 TEST(sab82532_says_how_long_a_read_holds) {
     Scheduler s;
     u64 now = 0;
     s.set_clock([&] { return now; });
     SerialLine a, b;
     Sab82532 se(s, a, b, Sab82532::kClockHz / 16.0);
-    CHECK_EQ(se.stable_until(0x3B, 1), Device::kForever);  // the reset XPR/ALLS, masked: a read clears nothing
+    se.write(0x20, 1, 0x01);                               // CMDR: XRES (XPR follows)
+    CHECK_EQ(se.stable_until(0x3B, 1), Device::kForever);  // XPR masked: a read clears nothing
     se.write(0x3B, 1, 0xFE);                               // IMR1: XPR shown
     CHECK_EQ(se.stable_until(0x3B, 1), 0u);
     u64 v = 0;

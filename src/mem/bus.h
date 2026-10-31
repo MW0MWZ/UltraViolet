@@ -97,11 +97,13 @@ public:
 
     // Code tracking for the CPU's decoded-block cache. Host-backed memory has
     // one flag per 4 KiB ("decoded code was taken from here"), shared by all
-    // physical aliases of the same host memory. Any write to a flagged page,
+    // physical aliases of the same host memory, and under it one per 64-byte
+    // line (which lines that code came from). Any write to a flagged page,
     // by the CPU or a device, calls the handler with the host address of the
-    // start of that 4 KiB page so cached code can be dropped.
-    static constexpr unsigned kCodePageShift = 12;
-    using CodeWriteHandler = std::function<void(const u8* host_page)>;
+    // start of that 4 KiB page and of the bytes written; the handler drops
+    // cached code if a line written holds some.
+    static constexpr unsigned kCodePageShift = 12, kCodeLineShift = 6;
+    using CodeWriteHandler = std::function<void(const u8* host_page, const u8* host, std::size_t size)>;
     void set_code_write_handler(CodeWriteHandler handler) { code_write_handler_ = std::move(handler); }
     // Declares a block of host memory that will be mapped (in pieces, or more
     // than once). Optional, but it guarantees every mapping of it shares one
@@ -109,8 +111,15 @@ public:
     void add_host_region(u8* host, u64 size) { region_for(host, size); }
     // Flag byte for the 4 KiB page holding `host` (host-backed memory only).
     u8* code_flag(const u8* host) const;
-    void code_written(const u8* page) const {
-        if (code_write_handler_) code_write_handler_(page);
+    // Marks [host, host + size) as decoded code: its page's flag and its
+    // lines' (all within one 4 KiB page, in host-backed memory).
+    void mark_code(const u8* host, std::size_t size);
+    // Whether any line of [host, host + size) holds decoded code.
+    bool code_lines(const u8* host, std::size_t size) const;
+    // Clears the flags of the 4 KiB page holding `host_page` and its lines.
+    void clear_code(const u8* host_page);
+    void code_written(const u8* page, const u8* host, std::size_t size) const {
+        if (code_write_handler_) code_write_handler_(page, host, size);
     }
     // Device DMA into memory: copies and invalidates cached code it overwrites.
     // Returns false if any of it is not writable host memory.
@@ -156,7 +165,7 @@ public:
                 u8* const h = p.host + (paddr & kPageMask);
                 store_be<T>(h, value);
                 if (UV_UNLIKELY(p.code[(paddr & kPageMask) >> kCodePageShift]))
-                    code_written(h - (paddr & ((u64{1} << kCodePageShift) - 1)));
+                    code_written(h - (paddr & ((u64{1} << kCodePageShift) - 1)), h, sizeof(T));
                 return true;
             }
         }
@@ -177,7 +186,8 @@ private:
     struct Region {
         u8* host;
         u64 size;
-        std::unique_ptr<u8[]> code;
+        std::unique_ptr<u8[]> code;   // a flag per 4 KiB
+        std::unique_ptr<u8[]> lines;  // a flag per 64 bytes
     };
 
     UV_FORCEINLINE const Page& page(u64 paddr) const {

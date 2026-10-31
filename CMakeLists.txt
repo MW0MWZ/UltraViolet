@@ -115,6 +115,11 @@ endif()
 add_executable(ultraviolet src/app/main.cpp)
 target_link_libraries(ultraviolet PRIVATE uv_app uv_warnings)
 target_compile_definitions(ultraviolet PRIVATE UV_VERSION="${UV_VERSION}")
+if(WIN32)
+  # The program's icon in Explorer and the taskbar.
+  enable_language(RC)
+  target_sources(ultraviolet PRIVATE src/app/ultraviolet.rc)
+endif()
 
 option(UV_WITH_SDL3 "Build the SDL3 display window" ON)
 if(UV_WITH_SDL3)
@@ -138,7 +143,19 @@ if(UV_WITH_SDL3)
       src/app/gui.cpp
       src/app/host_audio.cpp
       src/app/terminal_window.cpp
+      src/app/window_icon.cpp
     )
+    # The windows' icon: graphics/UltraViolet_icon_128.rgba (128x128, RGBA)
+    # as a C array.
+    set(UV_WINDOW_ICON ${CMAKE_CURRENT_SOURCE_DIR}/graphics/UltraViolet_icon_128.rgba)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${UV_WINDOW_ICON})
+    file(READ ${UV_WINDOW_ICON} UV_ICON_HEX HEX)
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," UV_ICON_BYTES "${UV_ICON_HEX}")
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/generated/window_icon_rgba.h
+      "// Generated from graphics/UltraViolet_icon_128.rgba.\n#pragma once\n"
+      "constexpr int kWindowIconSize = 128;\n"
+      "constexpr unsigned char kWindowIconRgba[] = {${UV_ICON_BYTES}};\n")
+    target_include_directories(ultraviolet PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_compile_definitions(ultraviolet PRIVATE UV_HAVE_SDL3=1)
     target_link_libraries(ultraviolet PRIVATE uv_imgui SDL3::SDL3)
 

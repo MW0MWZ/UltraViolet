@@ -9,8 +9,10 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <ctime>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -23,6 +25,7 @@
 #include "app/session.h"
 #include "app/terminal.h"
 #include "app/terminal_window.h"
+#include "app/window_icon.h"
 #include "backends/imgui_impl_sdl3.h"
 #include "backends/imgui_impl_sdlrenderer3.h"
 #include "core/log.h"
@@ -119,6 +122,7 @@ private:
         status_text_ = std::move(text);
         status_until_ns_ = SDL_GetTicksNS() + 4000000000ull;
     }
+    void save_report();
     void message(std::string text) {
         message_ = std::move(text);
         open_message_ = true;
@@ -295,6 +299,7 @@ int Gui::run() {
     }
     window_ = SDL_CreateWindow(kAppName, static_cast<int>(w), static_cast<int>(h),
                                SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    set_window_icon(window_);
     renderer_ = window_ ? SDL_CreateRenderer(window_, nullptr) : nullptr;
     if (!renderer_) {
         UV_LOG(Error, "display", "cannot create window: %s", SDL_GetError());
@@ -1123,6 +1128,9 @@ std::vector<MenuEntry> Gui::menus() {
 
     std::vector<E> help;
     help.push_back(E::item("Keyboard and Mouse", [this] { keys_open_ = true; }));
+    help.push_back(E::item("Save Diagnostic Report", [this] { save_report(); }, m != nullptr)
+                       .tip("Saves the machine's state (CPU, interrupts, timers, IDE) to a text file in the UltraViolet "
+                            "folder, for reporting a system that has stopped making progress"));
     help.push_back(E::item(std::string("About ") + kAppName, [this] { about_open_ = true; }).as(E::Role::About));
 
     return {E::submenu("Machine", std::move(machine)), E::submenu("Media", std::move(media)),
@@ -1370,23 +1378,20 @@ void Gui::draw_settings() {
     ImGui::BeginChild("##tabs", ImVec2(0, -footer));
     if (ImGui::BeginTabBar("##settings")) {
         if (ImGui::BeginTabItem("Machine")) {
-            label("Processor clock");
-            ImGui::SetNextItemWidth(160 * scale_);
-            char clock[32];
-            std::snprintf(clock, sizeof clock, "%.0f MHz", edit_.cpu_mhz);
-            if (ImGui::BeginCombo("##mhz", clock)) {
-                for (double mhz : cpu_clocks()) {
-                    std::snprintf(clock, sizeof clock, "%.0f MHz", mhz);
-                    if (ImGui::Selectable(clock, edit_.cpu_mhz == mhz)) edit_.cpu_mhz = mhz;
-                }
-                ImGui::EndCombo();
-            }
-            label("E-cache");
-            ImGui::SetNextItemWidth(160 * scale_);
-            auto kib = [](unsigned k) { return k >= 1024 ? std::to_string(k / 1024) + " MiB" : std::to_string(k) + " KiB"; };
-            if (ImGui::BeginCombo("##ecache", kib(edit_.ecache_kb).c_str())) {
-                for (unsigned k : ecache_sizes())
-                    if (ImGui::Selectable(kib(k).c_str(), edit_.ecache_kb == k)) edit_.ecache_kb = k;
+            label("Processor");
+            ImGui::SetNextItemWidth(220 * scale_);
+            // The modules Sun shipped: a clock and its E-cache together.
+            auto module_name = [](double mhz, unsigned ecache_kb) {
+                char text[48];
+                std::snprintf(text, sizeof text, "%.0f MHz, %u %s E-cache", mhz, ecache_kb >= 1024 ? ecache_kb / 1024 : ecache_kb,
+                              ecache_kb >= 1024 ? "MiB" : "KiB");
+                return std::string(text);
+            };
+            if (ImGui::BeginCombo("##cpu", module_name(edit_.cpu_mhz, edit_.ecache_kb).c_str())) {
+                for (const CpuModule& m : cpu_modules())
+                    if (ImGui::Selectable(module_name(m.mhz, m.ecache_kb).c_str(),
+                                          edit_.cpu_mhz == m.mhz && edit_.ecache_kb == m.ecache_kb))
+                        edit_.cpu_mhz = m.mhz, edit_.ecache_kb = m.ecache_kb;
                 ImGui::EndCombo();
             }
             label("Memory");
@@ -1742,6 +1747,27 @@ void Gui::draw_popups() {
 }
 
 // --- Files -------------------------------------------------------------------
+
+void Gui::save_report() {
+    auto* m = session_.machine();
+    if (!m) return;
+    std::string folder = user_data_folder();
+    if (folder.empty()) folder = ".";
+    const std::time_t t = std::time(nullptr);
+    char stamp[32];
+    std::strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", std::localtime(&t));
+    const std::string path = (std::filesystem::path(folder) / (std::string("report-") + stamp + ".txt")).string();
+    std::ofstream f(path);
+    f << kAppName << " " << UV_VERSION << ", " << SDL_GetPlatform() << ", "
+#if defined(__aarch64__) || defined(_M_ARM64)
+      << "AArch64"
+#else
+      << "x86-64"
+#endif
+      << ", " << stamp << "\n" << m->describe();
+    if (f) status("Diagnostic report saved: " + path);
+    else message("The diagnostic report could not be saved to " + path);
+}
 
 void Gui::choose(Pick what, const std::string& current) {
     // With nothing chosen yet, start in the matching folder of the user's

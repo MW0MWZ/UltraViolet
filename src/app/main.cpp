@@ -72,8 +72,9 @@ void usage() {
         "  --cdrom FILE     CD image in the drive (secondary master); give it more than once\n"
         "                   for a set of discs (Ctrl+Alt+E in the window, or SIGUSR1, moves on)\n"
         "  --ram MB         memory size (default 256)\n"
-        "  --cpu-mhz MHZ    processor clock (default 440)\n"
-        "  --ecache-kb KB   E-cache size: 256, 512, 1024 or 2048 (default 2048)\n"
+        "  --cpu-mhz MHZ    processor module by clock: 270, 300, 333, 360, 400 or 440\n"
+        "                   (default 440); its E-cache goes with it\n"
+        "  --ecache-kb KB   E-cache, for 360 MHz, which came with 256 or 2048 (default)\n"
         "  --console WHERE  screen (the on-board graphics, a Sun keyboard and mouse, in the\n"
         "                   window; the default) or ttya (no keyboard: OpenBoot and Solaris\n"
         "                   take the first serial port; the default with --headless)\n"
@@ -293,6 +294,7 @@ int main(int argc, char** argv) {
     std::string screenshot, settings_file;
     u64 max = ~u64{0}, disk_mb = 0;
     bool trace = false, headless = false, foreground = false, log_given = false, console_given = false;
+    bool cpu_given = false, ecache_given = false;
 #if defined(SIGPIPE)
     // A write to a connection the far end has closed (a forwarded port's
     // client going away) is an error to handle, not the end of the machine.
@@ -341,6 +343,8 @@ int main(int argc, char** argv) {
             }
             if (key == "log") app::apply_log_level(value), log_given = true;
             if (key == "console") console_given = true;
+            if (key == "cpu_mhz") cpu_given = true;
+            if (key == "ecache_kb") ecache_given = true;
         } else if (!std::strcmp(a, "--settings")) {
             settings_file = next();
             if (!app::load_settings(settings_file, settings, error)) {
@@ -381,6 +385,9 @@ int main(int argc, char** argv) {
 #endif
     // Without a window, the console is ttya unless asked otherwise.
     if (headless && !console_given) settings.console = "ttya";
+    // A clock alone names its module: its E-cache goes with it.
+    if (cpu_given && !ecache_given)
+        if (const unsigned kb = app::default_ecache_kb(settings.cpu_mhz)) settings.ecache_kb = kb;
     {
         std::string error;
         if (!app::check_hardware(settings, error)) {

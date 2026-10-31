@@ -12,6 +12,7 @@
 
 #include "core/endian.h"
 #include "core/log.h"
+#include "core/text.h"
 #include "cpu/ultrasparc/jit_loops.h"
 #include "jit/exec_buffer.h"
 
@@ -76,7 +77,8 @@ bool rcond_holds(unsigned rcond, u64 v, bool& valid) {
 UltraSparc::UltraSparc(Bus& bus, const Options& options)
     : bus_(bus), opt_(options), ecache_data_(options.ecache_bytes / 8), ecache_tag_(options.ecache_bytes / 64) {
     blocks_.resize(std::size_t{1} << kBlockBits);
-    bus_.set_code_write_handler([this](const u8* page) { code_written(page); });
+    block_victim_.resize(std::size_t{1} << kBlockSetBits);
+    bus_.set_code_write_handler([this](const u8* page, const u8* host, std::size_t size) { code_written(page, host, size); });
     bus_.set_remap_handler([this] { flush_blocks(); });
     set_jit(true);
     reset();
@@ -187,7 +189,12 @@ void UltraSparc::set_cycles_per_step(double cpi) {
     time_base_ = cycles();
     step_base_ = cycles_;
     cpi_fx_ = std::max<u64>(1, static_cast<u64>(cpi * 65536.0 + 0.5));
-    update_tick_interrupt();
+    // A match still ahead moves with the new rate. One already reached (a
+    // run can end on the very step) stays, to be taken at the next step:
+    // worked out again, TICK_CMPR would be behind TICK and the interrupt
+    // lost, with nothing to bring it back (the guest waits for it before
+    // setting the next).
+    if (tick_match_ == ~u64{0} || tick_match_ > cycles_) update_tick_interrupt();
 }
 
 void UltraSparc::set_delay_cycles_per_step(double cpi) {
@@ -512,6 +519,36 @@ u64 UltraSparc::skip_idle(u64 until, u64 max_steps) {
     return steps;
 }
 
+void UltraSparc::describe(std::string& out, double hz) const {
+    using ull = unsigned long long;
+    const u64 now = cycles();
+    auto secs = [&](u64 c) { return static_cast<double>(c) / hz; };
+    appendf(out, "cpu: pc %016llx npc %016llx tl %u pil %u pstate %03x%s\n", static_cast<ull>(pc_), static_cast<ull>(npc_), tl_, pil_,
+            pstate_, halted_ ? " halted" : "");
+    if (tl_)
+        appendf(out, "     trap level %u: tt %03x tpc %016llx\n", tl_, trap_[tl_].tt, static_cast<ull>(trap_[tl_].tpc));
+    appendf(out, "     instructions %llu, guest time %.3f s, %.4f cycles a step\n", static_cast<ull>(instret_), secs(now),
+            static_cast<double>(cpi_fx_) / 65536.0);
+    appendf(out, "     softint %05llx, interrupt receive %llx\n", static_cast<ull>(softint_), static_cast<ull>(intr_receive_));
+    const u64 t = tick() & ~(u64{1} << 63), cmp = tick_cmpr_ & ~(u64{1} << 63);
+    appendf(out, "     tick %016llx tick_cmpr %016llx (%s, %s)\n", static_cast<ull>(tick()), static_cast<ull>(tick_cmpr_),
+            tick_cmpr_ >> 63 ? "disabled" : cmp > t ? "ahead" : "behind TICK",
+            tick_match_ == ~u64{0} ? "no match pending" : tick_match_ <= cycles_ ? "match due" : "match pending");
+    appendf(out, "     interrupts taken (count, seconds since the last):");
+    for (unsigned k = 1; k < 16; ++k)
+        if (intr_count_[k]) appendf(out, " L%u %llu %.2f", k, static_cast<ull>(intr_count_[k]), secs(now - intr_last_[k]));
+    if (intr_count_[0]) appendf(out, " vector %llu %.2f", static_cast<ull>(intr_count_[0]), secs(now - intr_last_[0]));
+    appendf(out, "\n     idle skipping %s, idle instructions %llu, delay steps %llu\n", idle_skip_ ? "on" : "off",
+            static_cast<ull>(idle_instructions_), static_cast<ull>(delay_steps_));
+    if (jit_buf_)
+        appendf(out, "     jit: %llu translations, buffer %zu of %zu KB, emptied %llu times\n", static_cast<ull>(jit_compiles_),
+                jit_buf_->used() >> 10, jit_buf_->size() >> 10, static_cast<ull>(jit_flushes_));
+    else
+        appendf(out, "     jit: off\n");
+    appendf(out, "     blocks decoded %llu (%llu in place of another), code pages written to %llu\n", static_cast<ull>(block_decodes_),
+            static_cast<ull>(block_evictions_), static_cast<ull>(code_invalidations_));
+}
+
 u64 UltraSparc::steps_until(u64 when) const {
     if (when <= cycles()) return 1;
     // The first step whose time reaches `when`, counted from the base.
@@ -608,6 +645,11 @@ void UltraSparc::take_trap(unsigned type) {
     t.tpc = pc_;
     t.tnpc = npc_;
     t.tt = type;
+    if (type == tt::kInterruptVector || (type >= 0x41 && type <= 0x4F)) {
+        const unsigned k = type == tt::kInterruptVector ? 0 : type - 0x40;
+        ++intr_count_[k];
+        intr_last_[k] = cycles();
+    }
 
     u16 ps;
     if (reset || tl_ == kMaxTl) {
@@ -721,7 +763,7 @@ void UltraSparc::run_blocks(u64 instructions) {
             if (!trapped_) ++instret_;
             continue;
         }
-        Block& b = blocks_[block_index(host)];
+        Block& b = block_for(host);
         if (b.host != host) decode_block(b, host, pa);
         if (b.code) {
             // The translation runs the whole block, so it must fit in what
@@ -791,6 +833,8 @@ void UltraSparc::decode_block(Block& b, const u8* host, u64 pa) {
             break;
         }
     }
+    ++block_decodes_;
+    if (b.host && b.host != host) ++block_evictions_;
     b.host = host;
     b.length = n;
     b.code = nullptr;
@@ -813,20 +857,30 @@ void UltraSparc::decode_block(Block& b, const u8* host, u64 pa) {
             u32 code[kPage];
             for (int i = 0; i < kPage - first; ++i) code[i] = load_be<u32>(host - 4 * back + 4 * i);
             const PollCycle c = poll_cycle(code, 0, kPage - first);
-            if (c.count && c.last_start == back) b.loop = 3u << 30 | static_cast<u32>(back) << 16 | block_index(host);
+            if (c.count && c.last_start == back) {
+                b.loop = 3u << 30 | static_cast<u32>(back) << 16 | static_cast<u32>(&b - blocks_.data());
+                bus_.mark_code(host - 4 * back, 4 * static_cast<std::size_t>(kPage - first));  // (all it read)
+            }
         }
     }
-    if (u8* const flag = bus_.code_flag(host)) *flag = 1;
+    bus_.mark_code(host, 4 * std::size_t{n});
 }
 
-void UltraSparc::code_written(const u8* page) {
+// A write to a 4 KiB page that decoded code came from: if it reached a
+// line that code came from, every block from the page is dropped (and the
+// page's flags cleared). Data sharing a page with code, as programs and
+// kernel modules have, is written without losing the code.
+void UltraSparc::code_written(const u8* page, const u8* host, std::size_t size) {
+    if (!bus_.code_lines(host, size)) return;
     constexpr std::size_t kPage = std::size_t{1} << Bus::kCodePageShift;
     for (std::size_t off = 0; off < kPage; off += 4) {
-        Block& b = blocks_[block_index(page + off)];
-        if (b.host >= page && b.host < page + kPage) b.host = nullptr, b.code = nullptr;
+        Block* const ways = &blocks_[block_set(page + off)];
+        for (unsigned w = 0; w < kBlockWays; ++w)
+            if (ways[w].host == page + off) ways[w].host = nullptr, ways[w].code = nullptr;
     }
-    if (u8* const flag = bus_.code_flag(page)) *flag = 0;
+    bus_.clear_code(page);
     attention_ = true;
+    ++code_invalidations_;
 }
 
 // Host memory was remapped: decoded blocks and cached fetch translations

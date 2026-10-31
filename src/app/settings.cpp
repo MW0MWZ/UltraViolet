@@ -34,14 +34,18 @@ std::vector<unsigned> ram_sizes() {
     return sizes;
 }
 
-const std::vector<double>& cpu_clocks() {
-    static const std::vector<double> clocks = {270, 300, 333, 360, 400, 440};
-    return clocks;
+const std::vector<CpuModule>& cpu_modules() {
+    static const std::vector<CpuModule> modules = {{270, 256}, {300, 512}, {333, 2048}, {360, 256},
+                                                   {360, 2048}, {400, 2048}, {440, 2048}};
+    return modules;
 }
 
-const std::vector<unsigned>& ecache_sizes() {
-    static const std::vector<unsigned> sizes = {256, 512, 1024, 2048};
-    return sizes;
+unsigned default_ecache_kb(double mhz) {
+    for (const CpuModule& m : cpu_modules())
+        if (m.mhz == mhz && m.ecache_kb == 2048) return m.ecache_kb;
+    for (const CpuModule& m : cpu_modules())
+        if (m.mhz == mhz) return m.ecache_kb;
+    return 0;
 }
 
 bool check_hardware(const Settings& s, std::string& error) {
@@ -53,12 +57,15 @@ bool check_hardware(const Settings& s, std::string& error) {
                 " MiB (four banks of 32 to 256 MiB, each a power of two); it takes " + list;
         return false;
     }
-    const auto& caches = ecache_sizes();
-    if (std::find(caches.begin(), caches.end(), s.ecache_kb) == caches.end()) {
-        error = "the E-cache is 256, 512, 1024 or 2048 KiB";
-        return false;
-    }
-    return true;
+    for (const CpuModule& m : cpu_modules())
+        if (m.mhz == s.cpu_mhz && m.ecache_kb == s.ecache_kb) return true;
+    std::string list;
+    for (const CpuModule& m : cpu_modules())
+        list += (list.empty() ? "" : ", ") + std::to_string(static_cast<unsigned>(m.mhz)) + " MHz with " +
+                (m.ecache_kb >= 1024 ? std::to_string(m.ecache_kb / 1024) + " MiB" : std::to_string(m.ecache_kb) + " KiB");
+    error = "no Ultra 5/10 processor module ran at " + std::to_string(static_cast<unsigned>(s.cpu_mhz)) + " MHz with " +
+            std::to_string(s.ecache_kb) + " KiB of E-cache; Sun shipped " + list;
+    return false;
 }
 
 u8 keyboard_layout(const std::string& name) {

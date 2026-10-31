@@ -54,10 +54,17 @@ struct Settings {
 // The memory sizes (MiB) the four banks hold (each a power of two, 256 MiB
 // at most, filled largest first).
 std::vector<unsigned> ram_sizes();
-// Processor clocks the Ultra 5 and 10 shipped with, and E-cache sizes.
-const std::vector<double>& cpu_clocks();
-const std::vector<unsigned>& ecache_sizes();
-// Whether the memory size is one the banks hold; false with a message.
+// The processor modules the Ultra 5 and 10 shipped with: clock and E-cache.
+struct CpuModule {
+    double mhz;
+    unsigned ecache_kb;
+};
+const std::vector<CpuModule>& cpu_modules();
+// The E-cache of the first module at `mhz` (360 MHz came with 256 KiB or
+// 2 MiB: 2 MiB), or 0 if none runs at it.
+unsigned default_ecache_kb(double mhz);
+// Whether the memory size is one the banks hold and the clock and E-cache a
+// module Sun shipped; false with a message.
 bool check_hardware(const Settings& s, std::string& error);
 u8 keyboard_layout(const std::string& name);  // us, uk or a number
 

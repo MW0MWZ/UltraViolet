@@ -51,6 +51,27 @@ void wait_ms(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)
 
 }  // namespace
 
+TEST(settings_take_only_processor_modules_sun_shipped) {
+    // A clock and E-cache together, as the modules came; a clock alone
+    // names its module's E-cache (360 MHz came with both: 2 MiB).
+    app::Settings s;
+    std::string error;
+    for (const app::CpuModule& m : app::cpu_modules()) {
+        s.cpu_mhz = m.mhz, s.ecache_kb = m.ecache_kb;
+        CHECK(app::check_hardware(s, error));
+    }
+    s.cpu_mhz = 440, s.ecache_kb = 256;  // (no 440 MHz module had 256 KiB)
+    CHECK(!app::check_hardware(s, error));
+    CHECK(error.find("270 MHz with 256 KiB") != std::string::npos);
+    s.cpu_mhz = 500, s.ecache_kb = 2048;
+    CHECK(!app::check_hardware(s, error));
+    CHECK_EQ(app::default_ecache_kb(270), 256u);
+    CHECK_EQ(app::default_ecache_kb(300), 512u);
+    CHECK_EQ(app::default_ecache_kb(360), 2048u);
+    CHECK_EQ(app::default_ecache_kb(440), 2048u);
+    CHECK_EQ(app::default_ecache_kb(500), 0u);
+}
+
 TEST(session_thread_runs_the_machine_and_a_hold_stops_it) {
     app::Session session(loop_settings());
     std::string error;
@@ -85,7 +106,8 @@ TEST(session_thread_runs_the_machine_and_a_hold_stops_it) {
 TEST(session_hold_is_had_while_the_machine_waits_for_the_wall_clock) {
     app::Settings s = loop_settings();
     s.timing = Pacer::Mode::Cycle;  // a cycle an instruction, waiting when ahead
-    s.cpu_mhz = 10;                 // far slower than the host: mostly waiting
+    s.cpu_mhz = 270;                // the slowest module, slower than the host: mostly waiting
+    s.ecache_kb = 256;
     app::Session session(s);
     std::string error;
     {

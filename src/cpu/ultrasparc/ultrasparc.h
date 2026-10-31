@@ -80,6 +80,7 @@ struct TlbEntry {
     u64 tag = 0;   // VA[63:13] << 13 | context
     u64 data = 0;  // TTE data (bit 63 valid)
     bool used = false;
+    u32 epoch = 0;  // (not the hardware's) counts the entry's replacements and demaps; see SoftTlbEntry
 };
 
 namespace tte {
@@ -146,6 +147,16 @@ public:
     void set_jit(bool enabled, std::size_t buffer = kJitBuffer);
     bool jit_enabled() const { return jit_buf_ != nullptr; }
     u64 jit_compiles() const { return jit_compiles_; }
+    // Writes to code pages that dropped the decoded code there.
+    u64 code_invalidations() const { return code_invalidations_; }
+    // Blocks decoded, and of those how many took the place of another block.
+    u64 block_decodes() const { return block_decodes_; }
+    u64 block_evictions() const { return block_evictions_; }
+    // The CPU's state for a diagnostic report: registers that say where it
+    // is and what it waits for, TICK and TICK_CMPR, the interrupts taken at
+    // each level and when the last came, and the recompiler's counts.
+    // `hz`: guest cycles a second, for the times.
+    void describe(std::string& out, double hz) const;
     // Validation: every translated block that does all its work itself is
     // also run by execute() from the same state, and the CPU halts on the
     // first difference (halt_reason() says where).
@@ -287,12 +298,15 @@ private:
         u64 pa = 0;
         bool little = false;  // the access is little-endian (ASI, CLE or TTE.IE)
         bool side_effect = false;
+        bool writable = false;  // a store through the same ASI would pass the MMU too (TTE.W, or no TTE)
     };
     enum class AccessKind : u8 { Load, Store, Atomic, Fetch };
 
-    // Decoded blocks, by the host address of their first instruction. A
-    // block lies within one 4 KiB code page (and so within one I-MMU page).
-    static constexpr unsigned kBlockBits = 16;
+    // Decoded blocks, by the host address of their first instruction, in
+    // sets of kBlockWays (a block goes in any way of its set, and stays in
+    // that way until replaced). A block lies within one 4 KiB code page (and
+    // so within one I-MMU page).
+    static constexpr unsigned kBlockBits = 16, kBlockWays = 4, kBlockSetBits = kBlockBits - 2;
     static constexpr unsigned kMaxBlockLength = 32;
     // Translated block: runs the block from its first instruction at `pc`,
     // and may go on into other translated blocks of the same page while
@@ -352,6 +366,9 @@ private:
     const void* jit_stub_dyn_ = nullptr;
     bool jit_make_stubs();
     u64 jit_compiles_ = 0;
+    u64 jit_flushes_ = 0;  // times the buffer filled and was emptied
+    u64 code_invalidations_ = 0;
+    u64 block_decodes_ = 0, block_evictions_ = 0;
     bool jit_check_ = false;
     u32 jit_run_checked(Block& b);
     void run_blocks(u64 instructions);
@@ -370,10 +387,22 @@ private:
     static constexpr unsigned kFetchEntries = 256;
     std::array<FetchEntry, kFetchEntries> fetch_cache_{};
     u16 fetch_mode() const { return static_cast<u16>((pstate_ & (pstate::RED | pstate::PRIV)) | (tl_ > 0 ? 0x8000 : 0)); }
-    static unsigned block_index(const u8* host) {
-        return static_cast<unsigned>(reinterpret_cast<uintptr_t>(host) >> 2) & ((1u << kBlockBits) - 1);
+    // The first slot of the set for a block starting at `host`.
+    static unsigned block_set(const u8* host) {
+        return (static_cast<unsigned>(reinterpret_cast<uintptr_t>(host) >> 2) & ((1u << kBlockSetBits) - 1)) * kBlockWays;
     }
-    void code_written(const u8* page);
+    // The block starting at `host`, or the way of its set to decode it into
+    // (an empty one, or each in turn).
+    Block& block_for(const u8* host) {
+        const unsigned set = block_set(host);
+        Block* const ways = &blocks_[set];
+        for (unsigned w = 0; w < kBlockWays; ++w)
+            if (ways[w].host == host) return ways[w];
+        for (unsigned w = 0; w < kBlockWays; ++w)
+            if (!ways[w].host) return ways[w];
+        return ways[block_victim_[set / kBlockWays]++ % kBlockWays];
+    }
+    void code_written(const u8* page, const u8* host, std::size_t size);
     void flush_blocks();
 
     // execution
@@ -435,16 +464,41 @@ private:
     // Before a valid TLB entry is replaced or demapped: drops what was made
     // from it (its soft TLB entries, and the fast data translations or
     // fetch cache entries in its virtual range).
-    void forget_translations(MmuRegs& mmu, const TlbEntry& e);
+    void forget_translations(MmuRegs& mmu, TlbEntry& e);
+    // Drops every cached translation.
     void flush_soft_tlb() {
-        // (The fast tables' keys hold the low 13 bits of the generation,
-        // never 0: when those wrap, the tables are emptied.)
-        if ((++soft_gen_ & 0x1FFF) == 0) {
-            ++soft_gen_;
-            for (auto& table : fast_) table.fill(FastEntry{});
+        if (++tlb_gen_ == 0) {  // (wrapped: no old entry may match again)
+            for (auto& side : soft_tlb_) side.fill(SoftTlbEntry{});
+            tlb_gen_ = 1;
         }
-        fast_key_ = u64{soft_gen_ & 0x1FFF} << 51;
+        flush_fast_translations(kFastAll, true);
+    }
+    // Drops the fast data translations of the classes in `classes` (bit n:
+    // fast_class() n) and, with `fetch`, the fetch cache (TLB use bits were
+    // cleared: accesses must go through tlb_lookup() again).
+    static constexpr unsigned kFastAll = 0x3F, kFastData = 0x1F, kFastPrimary = 0x03, kFastSecondary = 0x18;
+    void flush_fast_translations(unsigned classes, bool fetch) {
+        for (unsigned c = 0; c < kFastClasses; ++c) {
+            if (!(classes >> c & 1)) continue;
+            fast_recent_[c].n = 0;
+            fast_switch(c);
+        }
+        if (fetch) flush_fetch_cache();
         attention_ = true;
+    }
+    // The context of the classes in `classes` changed (primary: 0 and 1;
+    // secondary: 3 and 4): each table goes back to the generation it last
+    // had in that context, so its entries made then serve again.
+    void fast_context_changed(unsigned classes) {
+        for (unsigned c = 0; c < kFastClasses; ++c)
+            if (classes >> c & 1) fast_switch(c);
+        attention_ = true;
+    }
+    void flush_fetch_cache() {
+        if (++soft_gen_ == 0) {  // (wrapped: no old entry may match again)
+            for (FetchEntry& f : fetch_cache_) f.gen = 0;
+            soft_gen_ = 1;
+        }
     }
     // Fast data translations for translated code's loads and stores, by
     // 8 KiB virtual page, one table for each way a memory ASI translates
@@ -458,7 +512,7 @@ private:
     // are kFastDevRead and kFastDevWrite (kFastDevSide: side effects),
     // which translated code does not take for its own.
     struct FastEntry {
-        u64 key = 0;               // (va >> 13) | fast_key_
+        u64 key = 0;               // (va >> 13) | fast_key_[its class]
         s64 addend = 0;            // host address - va
         const u8* code = nullptr;  // the code flags of the page's two 4 KiB halves
         u8 perms = 0;              // kFastRead, kFastWrite, kFastAtomic: what execute() has done there
@@ -467,7 +521,51 @@ private:
     static constexpr u8 kFastDevRead = 8, kFastDevWrite = 16, kFastDevSide = 32, kFastDev = kFastDevRead | kFastDevWrite;
     static constexpr unsigned kFastEntries = 512, kFastClasses = 6;
     std::array<std::array<FastEntry, kFastEntries>, kFastClasses> fast_{};
-    u64 fast_key_ = u64{1} << 51;
+    // Each table's generation, in its keys' bits 63:51 (see
+    // flush_fast_translations()).
+    std::array<u64, kFastClasses> fast_key_ = [] {
+        std::array<u64, kFastClasses> k{};
+        k.fill(u64{1} << 51);
+        return k;
+    }();
+    std::array<u32, kFastClasses> fast_gen_ = [] {
+        std::array<u32, kFastClasses> g{};
+        g.fill(1);
+        return g;
+    }();
+    // Each table's generations in its recent contexts (since its last
+    // flush): an entry's generation says which context it was made in.
+    struct FastRecent {
+        std::array<u16, 8> context{}, gen{};
+        u8 n = 0, next = 0;
+    };
+    std::array<FastRecent, kFastClasses> fast_recent_{};
+    unsigned fast_context(unsigned c) const {
+        return c <= 1 ? static_cast<unsigned>(primary_context_) : c == 3 || c == 4 ? static_cast<unsigned>(secondary_context_) : 0;
+    }
+    // Table `c`'s key for its context now: the generation it had there, or
+    // a new one.
+    void fast_switch(unsigned c) {
+        FastRecent& r = fast_recent_[c];
+        const unsigned ctx = fast_context(c);
+        for (unsigned k = 0; k < r.n; ++k)
+            if (r.context[k] == ctx) {
+                fast_key_[c] = u64{r.gen[k]} << 51;
+                return;
+            }
+        // (A table's keys hold the low 13 bits of a generation, never 0:
+        // when those wrap, the table is emptied and its contexts forgotten.)
+        if ((++fast_gen_[c] & 0x1FFF) == 0) {
+            ++fast_gen_[c];
+            fast_[c].fill(FastEntry{});
+            r.n = 0;
+        }
+        const u16 gen = static_cast<u16>(fast_gen_[c] & 0x1FFF);
+        const unsigned slot = r.n < r.context.size() ? r.n++ : r.next++ % r.context.size();
+        r.context[slot] = static_cast<u16>(ctx);
+        r.gen[slot] = gen;
+        fast_key_[c] = u64{gen} << 51;
+    }
     // The table for a memory ASI used now: 0 primary context with user
     // permissions (P, PL in user code; AIUP, AIUPL), 1 primary with
     // privileged (P, PL in privileged code), 2 nucleus (N, NL), 3 secondary
@@ -572,6 +670,9 @@ private:
 
     u64 lsu_control_ = 0, estate_error_en_ = 0, afsr_ = 0, afar_ = 0, upa_config_ = 0;
     u64 intr_receive_ = 0;            // bit 5 busy
+    // Interrupt traps taken (for describe()): [0] interrupt vectors, [1..15]
+    // the levels; how many, and the guest time of the last.
+    std::array<u64, 16> intr_count_{}, intr_last_{};
     std::array<u64, 3> intr_data_{};  // UDB interrupt receive data 0..2
     std::array<u64, 3> intr_dispatch_data_{};
     // UDB error (VA 0x00 high, 0x18 low; write one to clear) and control
@@ -580,18 +681,22 @@ private:
 
     MmuRegs immu_, dmmu_;
     // Soft TLB: recent hits of each TLB by 8 KiB virtual page and context,
-    // so most translations skip the 64-entry search. A TLB entry replaced or
-    // demapped drops what was made from it (forget_translations()); other
-    // changes to the TLBs, the contexts or the LSU control register start a
-    // new generation.
+    // so most translations skip the 64-entry search. A hit holds only while
+    // its TLB entry has not been replaced or demapped since (the entry's
+    // epoch), and while the TLB as a whole has not been rewritten
+    // (tlb_gen_: diagnostic writes, the LSU control register). Context
+    // changes need nothing here (the context is part of the key).
     struct SoftTlbEntry {
         u64 va_page = ~u64{0};
         unsigned context = 0;
-        u32 gen = 0;
+        u32 gen = 0, epoch = 0;
         TlbEntry* entry = nullptr;
     };
     static constexpr unsigned kSoftTlbSize = 1024;
     std::array<std::array<SoftTlbEntry, kSoftTlbSize>, 2> soft_tlb_{};
+    u32 tlb_gen_ = 1;
+    // The generation of the fetch cache, which knows neither the context
+    // nor the TLB entry its translations came from.
     u32 soft_gen_ = 1;
     u64 primary_context_ = 0, secondary_context_ = 0;
     u64 sfar_ = 0, va_watch_ = 0, pa_watch_ = 0;
@@ -631,6 +736,7 @@ private:
     bool stop_ = false;  // see stop_run()
     bool block_cache_ = true;
     std::vector<Block> blocks_;
+    std::vector<u8> block_victim_;  // per set: the way to replace next
 
     // Idle loops (see set_idle_skip): the state an idle loop must come back
     // to, at the place watched (a block about to start), with what had been

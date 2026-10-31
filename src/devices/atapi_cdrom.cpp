@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "core/log.h"
+#include "core/text.h"
 #include "storage/disk_image.h"
 
 namespace uv {
@@ -123,6 +124,14 @@ void AtapiCdrom::reset_state() {
     AtaDevice::reset_state();
     signature();
     packet_cmd_ = false;
+}
+
+// A power-on or hardware reset ends any prevention of medium removal
+// (PREVENT ALLOW MEDIUM REMOVAL: it lasts until allowed again or a hard
+// reset), and the next command reports the reset as a unit attention.
+void AtapiCdrom::hardware_reset() {
+    prevent_ = false;
+    unit_attention_ = 0x29;
 }
 
 void AtapiCdrom::before_drq(bool to_host, std::size_t length) {
@@ -627,6 +636,12 @@ void AtapiCdrom::packet() {
             UV_LOG(Debug, "atapi", "packet command %02x not supported", op);
             return check_condition(kIllegalRequest, 0x20);  // invalid command operation code
     }
+}
+
+void AtapiCdrom::describe_more(std::string& out) const {
+    appendf(out, "    packet %02x (lba %u), sense %x/%02x/%02x, %s%s, last block read %u\n", cdb_[0],
+            static_cast<unsigned>(cdb_[2] << 24 | cdb_[3] << 16 | cdb_[4] << 8 | cdb_[5]), sense_key_, asc_, ascq_,
+            media_ ? "medium in" : "no medium", tray_open_ ? ", tray open" : "", cur_lba_);
 }
 
 }  // namespace uv

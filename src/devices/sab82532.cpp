@@ -15,6 +15,7 @@ constexpr u8 kCmdRmc = 0x80, kCmdRres = 0x40, kCmdRfrd = 0x20, kCmdXf = 0x08, kC
 constexpr u8 kIsr0Tcd = 0x80, kIsr0Time = 0x40, kIsr0Rpf = 0x01;
 constexpr u8 kIsr1Brk = 0x80, kIsr1Brkt = 0x40, kIsr1Alls = 0x20, kIsr1Xpr = 0x01;
 constexpr double kBreakSeconds = 0.25;
+constexpr std::size_t kPool = 32;  // bytes in each of the XFIFO's two pools
 // RFC
 constexpr u8 kRfcRfdf = 0x10, kRfcTcde = 0x01;
 // Register offsets within a channel
@@ -24,7 +25,7 @@ constexpr unsigned kStar = 0x20, kCmdr = 0x20, kMode = 0x22, kTimr = 0x23, kXon 
                    kRccr = 0x33, kVstr = 0x34, kBgr = 0x34, kTic = 0x35, kMxn = 0x36, kMxf = 0x37, kGis = 0x38,
                    kIva = 0x38, kIpc = 0x39, kIsr0 = 0x3A, kImr0 = 0x3A, kIsr1 = 0x3B, kImr1 = 0x3B, kPvr = 0x3C,
                    kPis = 0x3D, kPim = 0x3D, kPcr = 0x3E, kCcr4 = 0x3F;
-constexpr u8 kVersion = 0x02;  // VSTR: version 3.2, carrier present (CD = 0)
+constexpr u8 kVersion = 0x82;  // VSTR: version 3.2, CD active (1: a terminal is always on the line)
 constexpr u8 kIpcVis = 0x80;   // IPC: masked interrupt statuses visible
 }  // namespace
 
@@ -43,8 +44,7 @@ void Sab82532::Channel::reset() {
     xoff = 0x13;
     ccr0 = ccr1 = ccr2 = ccr3 = ccr4 = bgr = tic = mxn = mxf = 0;
     tsax = tsar = xccr = rccr = xbcl = xbch = 0;
-    isr0 = 0;
-    isr1 = kIsr1Xpr | kIsr1Alls;
+    isr0 = isr1 = 0;  // (reset value 00H)
     imr0 = imr1 = 0xFF;
     in_break = false;
     tic_busy = false;
@@ -70,17 +70,20 @@ void Sab82532::Channel::start_tx() {
     if (!tx_timer.active() && !sending.empty()) tx_timer.schedule_in(char_cycles());
 }
 
+// The XFIFO is two 32-byte pools: XPR as one comes free (no more than 32
+// bytes left in it), ALLS when the last character has gone out on TxD.
 void Sab82532::Channel::tx_tick() {
     if (sending.empty()) return;
     const u8 b = sending.front();
     sending.pop_front();
     if (line.transmit) line.transmit(b);
+    if (tic_busy && tic_at-- == 0) tic_busy = false;  // (the TIC character has gone)
     if (!sending.empty()) {
+        if (sending.size() == kPool) isr1 |= kIsr1Xpr;
         tx_timer.schedule_in(char_cycles());
-        return;
+    } else {
+        isr1 |= kIsr1Alls;
     }
-    tic_busy = false;
-    isr1 |= kIsr1Xpr | kIsr1Alls;
     chip.update_irq();
 }
 
@@ -133,9 +136,15 @@ void Sab82532::Channel::release_for_read(bool timeout) {
 
 void Sab82532::Channel::command(u8 cmd) {
     if (cmd & kCmdXres) {
+        // The XFIFO is cleared (a character sent by TIC ends too: STAR.TEC
+        // clears) and XPR follows (the manual); the transmitter is then idle
+        // with nothing left, which is ALLS's condition, so ALLS follows too
+        // (NetBSD's driver, reopening the console in the middle of output,
+        // waits for it; an Ultra 10's ttyb read ISR1 21 after XRES).
         sending.clear();
         tx_timer.cancel();
         xcount = 0;
+        tic_busy = false;
         isr1 |= kIsr1Xpr | kIsr1Alls;
     }
     if (cmd & kCmdRres) {
@@ -160,9 +169,8 @@ void Sab82532::Channel::command(u8 cmd) {
     if (cmd & kCmdXf) {
         for (unsigned i = 0; i < xcount; ++i) sending.push_back(xfifo[i]);
         xcount = 0;
-        isr1 &= static_cast<u8>(~(kIsr1Xpr | kIsr1Alls));
+        if (sending.size() <= kPool) isr1 |= kIsr1Xpr;  // the other pool is free
         start_tx();
-        if (sending.empty()) isr1 |= kIsr1Xpr | kIsr1Alls;
     }
     chip.update_irq();
 }
@@ -182,7 +190,7 @@ bool Sab82532::Channel::read(unsigned reg, u8& v) {
     switch (reg) {
         case kStar: {
             v = kStarCts;
-            if (xcount < 32 && sending.empty()) v |= kStarXfw;
+            if (xcount < kPool && sending.size() <= kPool) v |= kStarXfw;  // a pool free
             if (!rx.empty()) v |= kStarRfne;
             if (tic_busy) v |= kStarTec;
             (void)kStarCec;  // commands complete at once
@@ -248,9 +256,12 @@ void Sab82532::Channel::write(unsigned reg, u8 v) {
         case kRccr: rccr = v; break;
         case kBgr: bgr = v; break;
         case kTic:
+            // After the character going out now, if any (Flow Control for
+            // Received Data): XFIFO data waits behind it.
             tic = v;
             tic_busy = true;
-            sending.push_front(v);
+            tic_at = tx_timer.active() && !sending.empty() ? 1 : 0;
+            sending.insert(sending.begin() + static_cast<std::ptrdiff_t>(tic_at), v);
             start_tx();
             break;
         case kMxn: mxn = v; break;

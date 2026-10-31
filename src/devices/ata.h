@@ -47,10 +47,17 @@ public:
 
     virtual const char* name() const = 0;
     virtual bool packet_device() const { return false; }
+    // The device's state for a diagnostic report.
+    void describe(std::string& out) const;
+    // What the device adds to it (a packet device: the packet).
+    virtual void describe_more(std::string&) const {}
 
     // Power-on or hardware reset: the device is ready at once with its
     // signature in the task file.
     void hard_reset();
+    // What a hardware reset clears beyond the task file (not a software
+    // reset or DEVICE RESET).
+    virtual void hardware_reset() {}
 
     // Fast: the device acts on commands and packets within a couple of
     // microseconds instead of a real drive's delays (an emulator's choice,
@@ -146,6 +153,8 @@ private:
     u8 feature_[2]{}, count_[2]{}, lba_lo_[2]{}, lba_mid_[2]{}, lba_hi_[2]{};
     u8 device_ = 0, status_ = 0, error_ = 0;
     bool irq_ = false;
+    u8 last_command_ = 0;  // (for describe())
+    u64 last_command_at_ = 0, commands_ = 0;
 };
 
 // One ATA channel: two device positions, the register decode, INTRQ, and
@@ -171,6 +180,8 @@ public:
     // address); bytes 1 and 3 belong to the controller.
     u8 bm_read(unsigned reg) const;
     void bm_write(unsigned reg, u8 value);
+    // The channel and its devices, for a diagnostic report.
+    void describe(std::string& out) const;
 
     // INTRQ of the selected device (gated by nIEN), and the controller's
     // memory access for DMA.

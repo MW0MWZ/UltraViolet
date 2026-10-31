@@ -7,6 +7,7 @@
 
 #include "core/endian.h"
 #include "core/log.h"
+#include "core/text.h"
 #include "storage/disk_image.h"
 
 namespace uv {
@@ -56,6 +57,7 @@ void AtaDevice::hard_reset() {
     status_ = reset_status();
     error_ = 0x01;  // diagnostic code: no error
     irq_ = false;
+    hardware_reset();
 }
 
 void AtaDevice::reset_state() {
@@ -119,6 +121,9 @@ void AtaDevice::command(u8 cmd) {
     if ((status_ & kBsy) && !(packet_device() && cmd == 0x08)) return;
     irq_ = false;
     error_ = 0;
+    last_command_ = cmd;
+    last_command_at_ = sched_.now();
+    ++commands_;
     after(kCommandUs, [this, cmd] { execute(cmd); });
 }
 
@@ -752,6 +757,28 @@ void AtaDisk::transfer_done(bool dma, bool to_host) {
         set_count(0);
     }
     AtaDevice::transfer_done(dma, to_host);
+}
+
+void AtaDevice::describe(std::string& out) const {
+    static const char* const kPhase[] = {"idle", "busy", "PIO in", "PIO out", "DMA in", "DMA out"};
+    const double secs = static_cast<double>(sched_.now() - last_command_at_) / cpu_hz_;
+    appendf(out, "  %u %s: %s, status %02x error %02x%s, %llu commands, the last %02x %.2f s ago\n", unit_, name(),
+            kPhase[static_cast<int>(phase_)], status_, error_, irq_ ? ", INTRQ" : "", static_cast<unsigned long long>(commands_),
+            last_command_, secs);
+    if (timer_.active())
+        appendf(out, "    timer due in %.6f s\n", static_cast<double>(timer_.when() - sched_.now()) / cpu_hz_);
+    if (phase_ != Phase::Idle && phase_ != Phase::Busy)
+        appendf(out, "    data: %zu of %zu bytes in the buffer taken, %llu more to come\n", buf_pos_, buf_.size(),
+                static_cast<unsigned long long>(remaining_));
+    describe_more(out);
+}
+
+void AtaChannel::describe(std::string& out) const {
+    appendf(out, "  INTRQ %s, device control %02x, device %u selected; bus master: command %02x status %02x PRD %08x%s\n",
+            line_ ? "asserted" : "clear", control_, select_, bm_cmd_, bm_status_, bm_prd_,
+            bm_timer_.active() ? ", transfer under way" : "");
+    for (const AtaDevice* d : dev_)
+        if (d) d->describe(out);
 }
 
 }  // namespace uv

@@ -283,6 +283,24 @@ bool UltraSparc::jit_compile(Block& b) {
                   offsetof(FetchEntry, host) == 16);
     // Jumps to the translation in x8 for the block at x2 if its Block (x5)
     // is for the same mode and fits in the budget; else to `no`.
+    // x3 = a block's host address, x5 = the first slot of its set: x5 = the
+    // way holding it and x8 = its translation, or out through `no`.
+    auto find_way = [&](std::vector<Site>& no) {
+        std::vector<Site> hit;
+        for (unsigned w = 0; w < kBlockWays; ++w) {
+            const s64 d = static_cast<s64>(w * sizeof(Block));
+            e.ldr(x6, x5, d + static_cast<s64>(offsetof(Block, host)));
+            e.cmp(x6, x3);
+            const Site next = e.b(Cond::Ne);
+            if (d) e.add_imm(x5, x5, d);
+            hit.push_back(e.b());
+            e.bind(next);
+        }
+        no.push_back(e.b());
+        for (const Site& site : hit) e.bind(site);
+        e.ldr(x8, x5, static_cast<s64>(offsetof(Block, code)));
+        no.push_back(e.cbz(x8));
+    };
     auto enter = [&](std::vector<Site>& no) {
         e.ldr(x6, x5, static_cast<s64>(offsetof(Block, jit_mode)), 1);
         e.cmp_imm(x6, mode, false);
@@ -334,15 +352,11 @@ bool UltraSparc::jit_compile(Block& b) {
         e.and_imm(x6, x2, 0x1FFF);
         e.add(x3, x3, x6);
         e.bind(found);
-        e.ubfx(x5, x3, 2, kBlockBits);  // its slot
-        e.mov_imm(x6, sizeof(Block));
+        e.ubfx(x5, x3, 2, kBlockSetBits);  // its set
+        e.mov_imm(x6, kBlockWays * sizeof(Block));
         e.load_constant(x7, reinterpret_cast<u64>(blocks_.data()));
         e.madd(x5, x5, x6, x7);
-        e.ldr(x6, x5, static_cast<s64>(offsetof(Block, host)));
-        e.cmp(x6, x3);
-        no.push_back(e.b(Cond::Ne));
-        e.ldr(x8, x5, static_cast<s64>(offsetof(Block, code)));
-        no.push_back(e.cbz(x8));
+        find_way(no);
         enter(no);
         for (const Site& site : no) e.bind(site);
         store_pc_npc_from(x2);
@@ -391,13 +405,9 @@ bool UltraSparc::jit_compile(Block& b) {
             e.b_to(body);
         } else {
             const u8* host = b.host + delta;
-            e.load_constant(x5, reinterpret_cast<u64>(&blocks_[block_index(host)]));
+            e.load_constant(x5, reinterpret_cast<u64>(&blocks_[block_set(host)]));
             e.load_constant(x3, reinterpret_cast<u64>(host));
-            e.ldr(x6, x5, static_cast<s64>(offsetof(Block, host)));
-            e.cmp(x6, x3);
-            no.push_back(e.b(Cond::Ne));
-            e.ldr(x8, x5, static_cast<s64>(offsetof(Block, code)));
-            no.push_back(e.cbz(x8));
+            find_way(no);
             pc_plus(x2, delta);
             enter(no);
         }
@@ -1123,7 +1133,7 @@ bool UltraSparc::jit_compile(Block& b) {
         e.and_imm(x2, x1, kFastEntries - 1);
         e.add(x2, kCpu, x2, true, Shift::Lsl, 5);
         e.add_imm(x2, x2, off(fast_[cls][0]));
-        e.ldr(x3, kCpu, off(fast_key_));
+        e.ldr(x3, kCpu, off(fast_key_[cls]));
         e.orr(x1, x1, x3);
         e.ldr(x3, x2, 0);
         e.cmp(x1, x3);
@@ -1762,6 +1772,23 @@ bool UltraSparc::jit_compile(Block& b) {
             store_reg(rd, x0);
             return true;
         }
+        if (op3 == 0x32 && rd == 8 && priv && !dynamic) {  // WRPR %pil
+            // A lower PIL may let a level interrupt in (one SOFTINT
+            // asks for): then out, for run_blocks() to take it before the
+            // next instruction. (Interrupt vectors do not depend on PIL.)
+            self = false;
+            load_reg(x0, rs1);
+            load_op2(x1, insn);
+            e.eor(x0, x0, x1);
+            e.and_imm(x0, x0, 15);
+            e.str(x0, kCpu, off(pil_), 4);
+            e.ldr(x1, kCpu, off(softint_));
+            const Site none = e.cbz(x1);
+            store_pc_npc(4 * static_cast<s64>(i) + 4);
+            leave(i + 1);
+            e.bind(none);
+            return true;
+        }
         if (op3 == 0x2A && priv && rs1 != 4) {  // RDPR (the trap registers need TL > 0)
             static_assert(sizeof(TrapLevel) == 32);
             const bool trap_level = rs1 <= 3;
@@ -2035,8 +2062,9 @@ bool UltraSparc::jit_compile(Block& b) {
     if (!code) {
         // The buffer is full: start again with an empty one, the stubs
         // first, and translate the block again for its new place.
-        for (Block& other : blocks_) other.code = nullptr;
+        for (Block& other : blocks_) other.code = nullptr, other.runs = 0;
         jit_buf_->clear();
+        ++jit_flushes_;
         jit_stub_dyn_ = jit_stub_seq_ = nullptr;
         if (!jit_make_stubs() || jit_buf_->next() == base) return false;  // (nothing more can be done)
         return jit_compile(b);
