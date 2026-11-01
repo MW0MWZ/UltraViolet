@@ -12,6 +12,7 @@ namespace uv {
 RioEbus::RioEbus() : pci::Function(0x108E, 0x1000, 0x01, 0x068000, 0x80) {
     define_bar(0, kBar0Size, false, kResetBar0);
     define_bar(1, kBar1Size, false, kResetBar1);
+    define_rom(16u << 20);  // as a real Ultra 10 sizes it
     set_cfg16(pci::kCommand, pci::kCmdMemory);
     set_cfg16(pci::kStatus, 0x0280);  // medium DEVSEL, fast back-to-back
     set_cfg8(pci::kMinGrant, 0x0A);

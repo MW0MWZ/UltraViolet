@@ -777,3 +777,28 @@ TEST(cpu_device_accesses_reuse_their_translation_only_where_it_holds) {
     CHECK_EQ(r.cpu.reg(o2), 0x00110000u);
     CHECK_EQ(dev.reads, 12u);
 }
+
+// A no-fault-only page: a normal load takes data_access_exception (FT NFO);
+// a store takes fast_data_access_protection when the page is not writable
+// (NetBSD's V|NFO entries for missing pages, whose stores go to its
+// protection handler), data_access_exception when it is.
+TEST(cpu_stores_to_a_no_fault_only_page_fault_by_its_write_permission) {
+    Rig r;
+    dmmu_map_tte(r, 0x40004000, tte::V | tte::NFO);
+    dmmu_map_tte(r, 0x40006000, tte::V | tte::NFO | tte::W | tte::CP | 0x6000);
+    dmmu_on(r);
+    auto run = [&](u32 insn) {
+        r.cpu.set_tl(0);
+        r.cpu.set_pstate(pstate::PRIV | pstate::PEF);
+        r.exec({insn}, 1);
+        return r.cpu.trap_type(1);
+    };
+    constexpr u64 kFtNfo = u64{0x10} << 7;
+    r.cpu.set_reg(g5, 0x40004000);
+    r.cpu.set_reg(g6, 0x40006000);
+    CHECK_EQ(run(LDUW(o1, g5, 8)), tt::kDataAccessException);
+    CHECK((r.cpu.dmmu().sfsr & kFtNfo) != 0);
+    CHECK_EQ(run(STW(g7, g5, 8)), tt::kFastDataAccessProtection);
+    CHECK_EQ(run(STW(g7, g6, 8)), tt::kDataAccessException);
+    CHECK((r.cpu.dmmu().sfsr & kFtNfo) != 0);
+}

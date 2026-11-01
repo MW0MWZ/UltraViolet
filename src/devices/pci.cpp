@@ -272,17 +272,34 @@ bool Bridge::forwards_io(u32 addr) const {
     return addr >= base && addr <= limit;
 }
 
+bool Bridge::master_abort(unsigned size, u64& value) {
+    set_cfg16(kSecStatus, static_cast<u16>(cfg16(kSecStatus) | 0x2000));  // received master abort
+    if (cfg16(kBridgeControl) & 0x0020) return false;                     // master-abort mode: signalled
+    value = size >= 8 ? ~u64{0} : (u64{1} << (8 * size)) - 1;
+    return true;
+}
+
 bool Bridge::mem_read(u32 addr, unsigned size, u64& value) {
-    return forwards_mem(addr) && secondary_.mem_read(addr, size, value);
+    if (!forwards_mem(addr)) return false;
+    return secondary_.mem_read(addr, size, value) || master_abort(size, value);
 }
 bool Bridge::mem_write(u32 addr, unsigned size, u64 value) {
-    return forwards_mem(addr) && secondary_.mem_write(addr, size, value);
+    if (!forwards_mem(addr)) return false;
+    u64 discard;
+    return secondary_.mem_write(addr, size, value) || master_abort(size, discard);
 }
 bool Bridge::io_read(u32 addr, unsigned size, u32& value) {
-    return forwards_io(addr) && secondary_.io_read(addr, size, value);
+    if (!forwards_io(addr)) return false;
+    if (secondary_.io_read(addr, size, value)) return true;
+    u64 v;
+    if (!master_abort(size, v)) return false;
+    value = static_cast<u32>(v);
+    return true;
 }
 bool Bridge::io_write(u32 addr, unsigned size, u32 value) {
-    return forwards_io(addr) && secondary_.io_write(addr, size, value);
+    if (!forwards_io(addr)) return false;
+    u64 discard;
+    return secondary_.io_write(addr, size, value) || master_abort(size, discard);
 }
 
 }  // namespace uv::pci

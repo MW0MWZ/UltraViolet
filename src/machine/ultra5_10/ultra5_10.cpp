@@ -36,16 +36,21 @@ constexpr u32 kEbusNvram = 0x000000, kEbusAudio = 0x200000, kEbusSuperIo = 0x300
               kEbusSmartCard = 0x500000, kEbusPll = 0x504000, kEbusEcppDma = 0x700000,
               kEbusAudioPlayDma = 0x702000, kEbusAudioRecDma = 0x704000, kEbusFloppyDma = 0x706000,
               kEbusFloppyAux = 0x720000, kEbusAudioAux = 0x722000, kEbusPower = 0x724000;
-// The auxio node's registers, a word each: the system LED (bit 0), then
-// four whose bits the BSDs name (PCI slot modes, clock frequency, SCSI
-// oscillator, temperature sensor) and that nothing here acts on.
+// The auxio node's registers, a word each: the system LED (bit 0 of the
+// first byte, all of it that takes writes), then four whose bits the BSDs
+// name (PCI slot modes, clock frequency, SCSI oscillator, temperature
+// sensor) and that nothing here acts on; their first bytes as a real Ultra 10
+// reads them, the rest 0.
 constexpr u32 kEbusAuxio[] = {0x726000, 0x728000, 0x72A000, 0x72C000, 0x72F000};
+constexpr u8 kAuxioValue[] = {0x00, 0xFF, 0x07, 0x01, 0x06};
 
 constexpr double kPciHz = 66.0e6;      // the APB's primary bus clock, which its tick register counts
 constexpr double kSuperIoUartHz = 1843200.0;
+constexpr u32 kSuperIoWindow = 0x10000;  // its chip selects' ISA addresses (0x2000 floppy ... 0x8000 keyboard)
 constexpr u8 kSuperIoSid = 0x90;       // SuperIO identification register value, as a real Ultra 5/10 reads
 constexpr u8 kMachineType = 0x80;      // IDPROM machine type: sun4u
 constexpr unsigned kNvramIdprom = 0x1FD8;  // the IDPROM in the NVRAM (the configuration below it)
+constexpr unsigned kNvramConfigEnd = 0x1CD8;  // the end of what OpenBoot's checksum covers
 
 }  // namespace
 
@@ -54,7 +59,7 @@ Ultra5_10::Ultra5_10(const Options& options)
       pacer_(options.timing, options.cpu_hz, options.host_clock),
       ram_(static_cast<std::size_t>(options.ram_mb) << 20),
       cpu_(bus_, cpu_options(options)),
-      sabre_(bus_, sched_, options.cpu_hz, [this](u64 inr) { return cpu_.deliver_interrupt_vector(inr, 0, 0); }),
+      sabre_(bus_, sched_, [this](u64 inr) { return cpu_.deliver_interrupt_vector(inr, 0, 0); }),
       simba_b_(false, [this] { return pci_ticks(); }),
       simba_a_(true, [this] { return pci_ticks(); }),
       flash_(options.prom, 0x01, 0xD5, 0x10000),
@@ -88,27 +93,46 @@ Ultra5_10::Ultra5_10(const Options& options)
     cpu_.set_delay_cycles_per_step(pacer_.delay_cycles_per_instruction());
 
     bus_.add_host_region(ram_.get(), ram_.size());
-    u64 placed = 0;
-    static constexpr unsigned kFillOrder[kBanks] = {0, 2, 1, 3};
-    for (unsigned b : kFillOrder) {
-        const u64 window = b * kBankWindow;
-        u64 size = std::min<u64>(ram_.size() - placed, kBankWindow);
-        while (size & (size - 1)) size &= size - 1;  // a bank is a power of two
-        if (size == 0) {
-            bus_.map_device(window, kBankWindow, &empty_bank_);
-            continue;
+    // The two DIMM groups' pairs (bytes), then their sides: group 0's bottom
+    // and top at banks 0 and 2, group 1's at 1 and 3.
+    u64 pair[2] = {};
+    const u64 total = ram_.size(), mib = u64{1} << 20;
+    if (total >= 1024 * mib) {
+        pair[0] = pair[1] = 512 * mib;
+    } else if (total == 512 * mib) {
+        pair[0] = pair[1] = 256 * mib;
+    } else {
+        for (u64& p : pair) {
+            u64 size = std::min<u64>(total - (pair[0] + pair[1]), 256 * mib);
+            while (size & (size - 1)) size &= size - 1;
+            p = size;
         }
-        for (u64 off = 0; off < kBankWindow; off += size) bus_.map_ram(window + off, size, ram_.get() + placed);
-        placed += size;
+    }
+    u64 placed = 0;
+    for (unsigned g = 0; g < 2; ++g) {
+        const u64 side = std::min(pair[g], kBankWindow);
+        for (unsigned top = 0; top < 2 && placed + side <= total && side && pair[g] > top * side; ++top) {
+            banks_[g + 2 * top] = {ram_.get() + placed, side, side == 32 * mib ? 10u : 11u};  // (16 MiB DIMMs: 10-bit)
+            placed += side;
+        }
     }
     if (placed < ram_.size())
         UV_LOG(Warn, "ultra5_10", "%llu MiB of memory left unused (banks are powers of two)",
                static_cast<unsigned long long>((ram_.size() - placed) >> 20));
+    map_memory(false);  // Mem_Control0 at power-on: 10-bit columns
+    sabre_.on_mem_control0 = [this](u64 v) {
+        // The column mode as written with refresh on. (Software turns refresh
+        // off, with the rest 0, to change the register, then writes the new
+        // value, running from the I-cache in between; with no caches here
+        // those instructions come from memory, decoded as before.)
+        if ((v & Sabre::kMc0RefEnable) && ((v & Sabre::kMc0Col11) != 0) != col11_) map_memory(!col11_);
+    };
     sabre_.map();
 
     // PCI topology: the APB's function 0 is bus B, function 1 bus A.
     sabre_.root().attach(1, 0, &simba_b_);
     sabre_.root().attach(1, 1, &simba_a_);
+    Simba::pair(simba_a_, simba_b_);
     simba_a_.secondary().attach(1, 0, &ebus_);
     simba_a_.secondary().attach(1, 1, &hme_);  // the RIO's Ethernet
     simba_a_.secondary().attach(2, 0, &mach64_);  // the on-board graphics
@@ -130,7 +154,10 @@ Ultra5_10::Ultra5_10(const Options& options)
     block("audio-aux", kEbusAudioAux, 4);  // bit 0: the codec's power-down (polarity unknown)
     ebus_.add(kEbusFloppy, 8, &fdc_);
     block("floppy-aux", kEbusFloppyAux, 4);  // bit 0: density sense
-    block("ecpp", kEbusParallel, 8);
+    // The parallel port in compatible mode, nothing connected (PC87332):
+    // data, the status register (read-only; 0x7F as a real Ultra 10's), the
+    // control register (bits 7:5 read 1).
+    block("ecpp", kEbusParallel, 8)->fix({0x00, 0x7F, 0xE0}, {0xFF, 0x00, 0x1F});
     block("smartcard", kEbusSmartCard, 0x100);
     block("pll", kEbusPll, 0x100);
     ebus_.add(kEbusEcppDma, EbusDma::kSize, &ecpp_dma_, false);
@@ -138,9 +165,13 @@ Ultra5_10::Ultra5_10(const Options& options)
     ebus_.add(kEbusAudioRecDma, EbusDma::kSize, &audio_rec_dma_, false);
     ebus_.add(kEbusFloppyDma, EbusDma::kSize, &fd_dma_, false);
     ebus_.add(kEbusPower, PowerControl::kSize, &power_);
+    // (Last: what the SuperIO's chip selects leave undecoded floats.)
+    ebus_.add(kEbusSuperIo, kSuperIoWindow, &superio_float_);
     auxio_led_ = block("auxio", kEbusAuxio[0], 4);
-    for (unsigned i = 1; i < std::size(kEbusAuxio); ++i) block("auxio", kEbusAuxio[i], 4);
+    auxio_led_->fix({kAuxioValue[0]}, {0x01, 0, 0, 0});
+    for (unsigned i = 1; i < std::size(kEbusAuxio); ++i) block("auxio", kEbusAuxio[i], 4)->fix({kAuxioValue[i]}, {0, 0, 0, 0});
 
+    su_kbd_.set_scratch(0x30);  // what a real Ultra 10 reads (no software writes it)
     su_kbd_.set_irq_sink([this](bool a) { sabre_.set_interrupt(kInoKeyboard, a); });
     su_mouse_.set_irq_sink([this](bool a) { sabre_.set_interrupt(kInoMouse, a); });
     se_.set_irq_sink([this](bool a) { sabre_.set_interrupt(kInoSerial, a); });
@@ -201,6 +232,7 @@ Ultra5_10::Ultra5_10(const Options& options)
         if (prom_map_size_ && pa - prom_pa_ < prom_map_size_) flash_.write(pa - prom_pa_, size, value);
     });
     flash_.on_mode_change = [this] { update_prom_mapping(); };
+    flash_.set_write_enabled(options.flash_write_enable);
     ebus_.on_config_write = [this] { update_prom_mapping(); };
     simba_a_.on_config_write = [this] { update_prom_mapping(); };
     update_prom_mapping();
@@ -225,10 +257,11 @@ void Ultra5_10::save_nvram() {
     if (!opt_.nvram_path.empty() && nvram_.dirty()) nvram_.save(opt_.nvram_path);
 }
 
-void Ultra5_10::reset() {
+void Ultra5_10::reset(bool power_on) {
     switched_off_ = false;
     power_.reset();
-    sabre_.reset(true);
+    sabre_.reset(power_on);
+    if (power_on) map_memory(false);  // Mem_Control0's power-on value: 10-bit columns
     update_prom_mapping();
     superio_.reset();
     su_kbd_.reset();
@@ -253,45 +286,104 @@ bool Ultra5_10::nvram_blank() const {
     return std::all_of(p, p + kNvramIdprom + 16, [](u8 b) { return b == 0; });
 }
 
-// A new NVRAM, as a machine that has been set up before: OpenBoot 3.31's
-// configuration defaults, with the boot from the disk alone (not the
-// network after it: a machine with nothing to boot stops at ok), auto-boot on, diagnostics at their least and the diagnostic
-// switch off; a checksum OpenBoot accepts; an IDPROM with a Sun Ethernet
-// address and host ID.
+// A new NVRAM, as a machine that has been set up before: the pattern a
+// real Ultra 10's part holds wherever OpenBoot has not written (a real Ultra 10:
+// 0x55, 0x00, 0xAA and 0xFF, 64 bytes each, over and over), OpenBoot
+// 3.31's configuration defaults as it writes them over it, then the boot
+// from the disk alone (not the network after it: a machine with nothing to
+// boot stops at ok), the diagnostics at their least and the diagnostic
+// switch off, as setenv writes them; a checksum OpenBoot accepts; an
+// IDPROM with a Sun Ethernet address and host ID.
 //
 // OpenBoot keeps its variables at fixed places: byte 0 a checksum (0x17
-// XOR every byte from 0x0C up to the IDPROM), byte 1 diag-switch? (0 or
-// 0xFF), byte 2 diag-level (0x20 min, 0x40 max, 0x80 menus), byte 0x0B the
-// power-cycle count; strings as a length then the text; flags 0 or 0xFF.
+// XOR every byte from 0x0C to 0x1CD7), byte 1 diag-switch? (0 or 0xFF),
+// byte 2 diag-level (0x20 min, 0x40 max, 0x80 menus), byte 0x0B the
+// power-cycle count; strings as a length, the text and a 0; flags 0 or
+// 0xFF. Above 0x1CD8, outside the checksum, are its own records, which
+// it writes as it boots.
+// DRAM geometry: 16 bytes per column, the bank's columns as its DRAMs have
+// them, the rest of its address in the rows.
+void Ultra5_10::map_memory(bool col11) {
+    col11_ = col11;
+    const unsigned drive = col11 ? 11 : 10;
+    const u64 decoded = col11 ? kBankWindow : kBankWindow / 2;  // the pair's share of the window
+    for (unsigned b = 0; b < kBanks; ++b) {
+        const u64 window = b * kBankWindow;
+        const Bank& bank = banks_[b];
+        if (decoded < kBankWindow) bus_.map_device(window + decoded, kBankWindow - decoded, &empty_bank_);  // pairs 1 and 3
+        if (!bank.size) {
+            bus_.map_device(window, decoded, &empty_bank_);
+        } else if (bank.cols == drive) {
+            // Rows and columns in address order: the bank, repeated.
+            for (u64 off = 0; off < decoded; off += std::min(bank.size, decoded))
+                bus_.map_ram(window + off, std::min(bank.size, decoded), bank.host);
+        } else {
+            MismatchedBank& m = mismatched_[b];
+            m.host = bank.host, m.size = bank.size, m.drive_cols = drive, m.dram_cols = bank.cols;
+            bus_.map_device(window, decoded, &m);
+        }
+    }
+}
+
+u64 Ultra5_10::MismatchedBank::cell(u64 offset) const {
+    const u64 col = (offset >> 4) & ((u64{1} << drive_cols) - 1), row = offset >> (4 + drive_cols);
+    // A wider column the DRAM ignores the top bit of; a narrower one leaves
+    // the DRAM's top column bit 0.
+    const u64 dcol = col & ((u64{1} << dram_cols) - 1);
+    const u64 rows = size >> (4 + dram_cols);
+    return (((row & (rows - 1)) << dram_cols | dcol) << 4) | (offset & 15);
+}
+
+bool Ultra5_10::MismatchedBank::read(u64 offset, unsigned n, u64& value) {
+    value = 0;
+    for (unsigned i = 0; i < n; ++i) value = value << 8 | host[cell(offset + i)];
+    return true;
+}
+
+bool Ultra5_10::MismatchedBank::write(u64 offset, unsigned n, u64 value) {
+    for (unsigned i = 0; i < n; ++i) host[cell(offset + i)] = static_cast<u8>(value >> (8 * (n - 1 - i)));
+    return true;
+}
+
 void Ultra5_10::write_new_nvram() {
     u8* p = nvram_.data();
-    std::fill(p, p + kNvramIdprom, u8{0});
-    // OpenBoot 3.31's defaults, as it writes them to a blank NVRAM.
+    static constexpr u8 kFill[4] = {0x55, 0x00, 0xAA, 0xFF};
+    for (unsigned i = 0; i < kNvramIdprom; ++i) p[i] = kFill[(i >> 6) & 3];
+    // OpenBoot 3.31's defaults, as it writes them (found by letting it set
+    // them over the pattern): runs of zeros, then the values.
+    static const struct {
+        unsigned at, size;
+    } kZeros[] = {{0x001, 3}, {0x010, 8}, {0x0B7, 0x89}, {0x180, 0xC0}, {0x280, 0x4A}, {0x3CC, 2}, {0x5D2, 1},
+                  {0x6A8, 0x98}, {0x780, 0xB2}};
+    for (const auto& z : kZeros) std::fill(p + z.at, p + z.at + z.size, u8{0});
     static const struct {
         unsigned at;
         std::vector<u8> bytes;
     } kDefaults[] = {
+        {0x001, {0xFF, 0x40}},                                 // diag-switch? true, diag-level max
         {0x2C3, {0x22, 0x00, 0x00, 0x00, 0x50, 0xFF, 0x00}},  // (numbers and flags: 34 rows, 80 columns, ...)
-        {0x44E, {0x03, 'n', 'e', 't'}},                        // diag-device
-        {0x5D3, {0xFF, 0x04, 'b', 'o', 'o', 't'}},             // auto-boot? true, boot-command
-        {0x618, {0x40, 0x00, 0x08, 'k', 'e', 'y', 'b', 'o', 'a', 'r', 'd'}},  // input-device
-        {0x63C, {0x06, 's', 'c', 'r', 'e', 'e', 'n'}},                        // output-device
-        {0x65F, {0x05, '1', ',', '2', ',', '3'}},                             // pcib-probe-list
-        {0x671, {0x07, '1', ',', '2', ',', '3', ',', '4'}},                   // pcia-probe-list
-        {0x683, {0x0C, '9', '6', '0', '0', ',', '8', ',', 'n', ',', '1', ',', '-'}},  // ttyb-mode
-        {0x695, {0x0C, '9', '6', '0', '0', ',', '8', ',', 'n', ',', '1', ',', '-'}},  // ttya-mode
+        {0x2CA, {0x08, 'd', 'i', 's', 'k', ' ', 'n', 'e', 't', 0x00}},  // boot-device
+        {0x44E, {0x03, 'n', 'e', 't'}},                                  // diag-device
+        {0x5D3, {0xFF, 0x04, 'b', 'o', 'o', 't', 0x00}},                 // auto-boot? true, boot-command
+        {0x616, {0x00, 0x00, 0x40, 0x00, 0x08, 'k', 'e', 'y', 'b', 'o', 'a', 'r', 'd', 0x00}},  // input-device
+        {0x63C, {0x06, 's', 'c', 'r', 'e', 'e', 'n', 0x00}},                                  // output-device
+        {0x65F, {0x05, '1', ',', '2', ',', '3', 0x00}},                                       // pcib-probe-list
+        {0x671, {0x07, '1', ',', '2', ',', '3', ',', '4', 0x00}},                             // pcia-probe-list
+        {0x683, {0x0C, '9', '6', '0', '0', ',', '8', ',', 'n', ',', '1', ',', '-', 0x00}},    // ttyb-mode
+        {0x695, {0x0C, '9', '6', '0', '0', ',', '8', ',', 'n', ',', '1', ',', '-', 0x00}},    // ttya-mode
         {0x6A7, {0xFF, 0x00, 0xFF}},  // (the serial ports' flags)
         {0x832, {0x07, 0xFF}},
     };
     for (const auto& d : kDefaults) std::copy(d.bytes.begin(), d.bytes.end(), p + d.at);
-    // The starting point: boot from the disk (boot cdrom from ok installs).
+    // The starting point, as setenv leaves it: boot from the disk (boot
+    // cdrom from ok installs; the rest of the old value stays behind the 0).
     static const char kBootDevice[] = "disk";
     p[0x2CA] = sizeof kBootDevice - 1;
-    std::copy(kBootDevice, kBootDevice + sizeof kBootDevice - 1, p + 0x2CB);
+    std::copy(kBootDevice, kBootDevice + sizeof kBootDevice, p + 0x2CB);
     p[1] = 0x00;  // diag-switch? false
     p[2] = 0x20;  // diag-level min
     u8 sum = 0x17;
-    for (unsigned i = 0x0C; i < kNvramIdprom; ++i) sum ^= p[i];
+    for (unsigned i = 0x0C; i < kNvramConfigEnd; ++i) sum ^= p[i];
     p[0] = sum;
 
     std::array<u8, 6> mac{0x08, 0x00, 0x20, 0, 0, 0};
@@ -433,7 +525,7 @@ void Ultra5_10::run(u64 instructions) {
         if (soft_reset_ != SoftReset::None) {
             const SoftReset r = soft_reset_;
             soft_reset_ = SoftReset::None;
-            if (r == SoftReset::Por) reset();
+            if (r == SoftReset::Por) reset(false);
             else cpu_.externally_initiated_reset();
         }
         // An idle loop: round it at once up to the next event (with the

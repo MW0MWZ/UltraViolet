@@ -15,7 +15,7 @@ primary host; macOS and Windows builds are planned from the start.
 
 ## Status
 
-UltraViolet is at the very beginning. In place so far:
+UltraViolet is at an early stage, but runs real operating systems. In place so far:
 
 - **Ultra 5/10 machine:** the original OpenBoot PROM (3.31) runs its power-on
   sequence to the `ok` prompt on the serial console (ttya): it probes memory
@@ -30,9 +30,13 @@ UltraViolet is at the very beginning. In place so far:
   CS4231 audio codec, the front-panel power button, and a Sun Type 5
   keyboard and mouse. OpenBoot finds them as its `disk`,
   `cdrom`, `net`, `screen` and `keyboard`, and takes the screen and
-  keyboard as its console; `boot cdrom` boots Solaris 8 from its install
-  media to the installer's first question, and the network passes
-  OpenBoot's `test net` and gets an address by `boot net:dhcp`.
+  keyboard as its console, and the network passes OpenBoot's `test net` and
+  gets an address by `boot net:dhcp`.
+- **Guests:** Solaris 8 and Solaris 9 install from their media and run the
+  CDE desktop on the Rage Pro, and Solaris 10 its GNOME desktop in 24-bit
+  colour. NetBSD/sparc64 (8.1 and 11.0) and
+  Debian GNU/Linux 9 (sparc64, Linux 4.15) install to disk and boot to a
+  login, with networking.
 - **UltraSPARC IIi interpreter:** the SPARC V9 integer unit with register
   windows, trap levels and the global register sets, the I- and D-MMU with
   their TLBs and TSB pointers, the internal ASIs, TICK and interrupts, the
@@ -42,8 +46,7 @@ UltraViolet is at the very beginning. In place so far:
   host pacing, logging, guest memory, the x86-64 and AArch64 code emitters for
   the JIT, and user-mode (libslirp) and TAP networking.
 
-Next come installing Solaris to disk and running its desktop (X on the
-Rage Pro's drawing engine); see
+Next come OpenBSD and the rest of the Rage Pro's drawing engine; see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Building

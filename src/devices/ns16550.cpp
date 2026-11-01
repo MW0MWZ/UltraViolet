@@ -25,7 +25,7 @@ void Ns16550::reset() {
     tx_fifo_.clear();
     tx_timer_.cancel();
     rx_timer_.cancel();
-    ier_ = lcr_ = mcr_ = scr_ = fcr_ = 0;
+    ier_ = lcr_ = mcr_ = fcr_ = 0;  // (a master reset leaves the scratch register alone)
     lsr_ = kLsrThre | kLsrTemt;
     msr_ = msr_inputs_;
     divisor_ = 12;

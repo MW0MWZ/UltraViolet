@@ -23,10 +23,12 @@ using namespace uv;
 
 namespace {
 
-// A machine with a flash image whose first bytes are recognisable.
+// A machine with a flash image whose first bytes are recognisable, and two
+// 16 MiB DIMMs: 10-bit columns, as the memory controller decodes at
+// power-on, so memory is plain from the start.
 Ultra5_10::Options small_options() {
     Ultra5_10::Options o;
-    o.ram_mb = 64;
+    o.ram_mb = 32;
     o.prom.assign(1u << 20, 0);
     o.prom[0] = 0x4F;
     o.prom[1] = 0x42;
@@ -162,7 +164,7 @@ TEST(pci_decoding_follows_every_configuration_change) {
     CHECK(bus_read(root, 0x90000010) == ~0ull);
     bridge.config_write(pci::kMemBase, 4, 0x90009000);
     b.set_bar(0, 0x90004000);
-    CHECK(bus_read(root, 0x90000010) == ~0ull);
+    CHECK(bus_read(root, 0x90000010) == 0xFFFFFFFFull);  // forwarded, unclaimed: a master abort's all ones
     CHECK(bus_read(root, 0x90004010) == 0x02000010);
     // Writes reach the function the reads do.
     CHECK(root.mem_write(0x80002020, 1, 0x5A) && a.last_write == 0x205A);
@@ -260,35 +262,43 @@ TEST(machine_soft_resets_come_after_the_store_that_asks_for_them) {
         CHECK_EQ(m.cpu().reg(g5), 0u);
         CHECK(!m.cpu().halted());
         if (vector != 0x20) continue;
-        m.run(100);  // round again, and again
-        CHECK_EQ(m.cpu().reg(g5), 0u);
-        CHECK(!m.cpu().halted());
+        // Round again: SOFT_POR is still set (the reason for the reset), so
+        // storing it again is not setting it, and the code runs on.
+        CHECK_EQ(m.sabre().reg(0xF020), 0x40000000u);
+        m.run(std::size(code));
+        CHECK_EQ(m.cpu().reg(g5), 1u);
     }
 }
 
 // A device the processor gives work to in the middle of a run acts when
-// it is due, not when the run ends: the count of Sabre's timer 0, set to
-// go back to zero at its limit (8 us after the store), read 4500 steps on,
-// is the same whether the machine runs in one go or a step at a time.
+// it is due, not when the run ends: the same whether the machine runs in
+// one go or a step at a time.
 TEST(machine_events_scheduled_by_a_store_come_on_time) {
+    // A character sent on ttya: XPR at once, ALLS when it has gone out (10
+    // bits at the reset rate, about 5.4 us), whether run whole or a step at
+    // a time.
     using namespace uv::test::sparc;
     Ultra5_10::Options o = small_options();
     const u32 code[] = {
-        MOVi(g1, 0x1FE),
+        MOVi(g1, 0x1FF),
         SLLXi(g1, g1, 32),
-        SETHI(g3, 0x1C00),
-        OR(g1, g1, g3),  // timer 0's count, 0x1FE00001C00
-        ADDi(g4, g1, 8),  // and its limit
-        SETHI(g2, 0x40000000),
-        ORi(g2, g2, 8),  // back to zero at 8 us
-        STXA(g0, g1, g0, 0x14),
-        STXA(g2, g4, g0, 0x14),
+        SETHI(g3, 0xF1400000),
+        OR(g1, g1, g3),  // the SAB82532's channel A, 0x1FFF1400000
+        ADDi(g4, g1, 0x3B),
+        MOVi(g2, 0xDE),
+        STBA(g2, g4, g0, 0x15),  // IMR1: XPR and ALLS
+        MOVi(g2, 0x41),
+        STBA(g2, g1, g0, 0x15),  // into the XFIFO
+        ADDi(g3, g1, 0x20),
+        MOVi(g2, 0x08),
+        STBA(g2, g3, g0, 0x15),  // CMDR: XF
+        LDUBA(g5, g4, g0, 0x15),  // ISR1
         SETHI(l0, 1024),
         ADDi(l0, l0, 476),  // 1500 times round, 4500 steps
         SUBcci(l0, l0, 1),
         Bicc(cNE, -1),
         NOP,
-        LDXA(g5, g1, g0, 0x14),
+        LDUBA(g6, g4, g0, 0x15),
         Bicc(cA, 0),
         NOP,
     };
@@ -299,9 +309,54 @@ TEST(machine_events_scheduled_by_a_store_come_on_time) {
     for (u64 i = 0; i < kRun; ++i) stepped.run(1);
     CHECK_EQ(whole.cpu().pc(), stepped.cpu().pc());
     CHECK_EQ(whole.cpu().reg(l0), 0u);
-    CHECK_EQ(whole.cpu().reg(g5), stepped.cpu().reg(g5));
-    // (4500 steps at 440 MHz, about 10 us, less the 8 us before it went back)
-    CHECK_EQ(whole.cpu().reg(g5), 2u);
+    CHECK_EQ(whole.cpu().reg(g5), 0x01u);  // XPR
+    CHECK_EQ(stepped.cpu().reg(g5), 0x01u);
+    CHECK_EQ(whole.cpu().reg(g6), 0x20u);  // ALLS
+    CHECK_EQ(stepped.cpu().reg(g6), 0x20u);
+}
+
+// The flash PROM behind JP2: as shipped (pins 1-2) it sees no write, not
+// even the autoselect sequence (a real Ultra 10 read 4F 42 after AA/55/90);
+// with JP2 on Enable it identifies itself and programs.
+TEST(flash_prom_takes_writes_only_with_jp2_on_enable) {
+    constexpr u64 kFlash = 0x1FFF0000000ull;
+    auto command = [](Ultra5_10& m, u8 c) {
+        m.bus().write(kFlash + 0x5555, u8{0xAA});
+        m.bus().write(kFlash + 0x2AAA, u8{0x55});
+        m.bus().write(kFlash + 0x5555, c);
+    };
+    auto rd = [](Ultra5_10& m, u64 off) {
+        u8 v = 0;
+        m.bus().read(kFlash + off, v);
+        return unsigned{v};
+    };
+    {
+        Ultra5_10 m(small_options());
+        command(m, 0x90);
+        CHECK_EQ(rd(m, 0), 0x4Fu);
+        CHECK_EQ(rd(m, 1), 0x42u);
+        command(m, 0xA0);
+        m.bus().write(kFlash + 0x100, u8{0x00});
+        CHECK_EQ(m.prom_image()[0x100], 0u);
+        m.prom_image()[0x101] = 0xFF;
+        command(m, 0xA0);
+        m.bus().write(kFlash + 0x101, u8{0x12});
+        CHECK_EQ(m.prom_image()[0x101], 0xFFu);
+    }
+    Ultra5_10::Options o = small_options();
+    o.flash_write_enable = true;
+    Ultra5_10 m(o);
+    cfg_write32(m, cfg(0, 1, 1, 0x18), 0x00010100);  // bus A as bus 1
+    cfg_write32(m, cfg(1, 1, 0, 4), 0x00000002);     // the EBus's memory decode, as OpenBoot sets it
+    command(m, 0x90);
+    CHECK_EQ(rd(m, 0), 0x01u);  // AMD
+    CHECK_EQ(rd(m, 1), 0xD5u);  // Am29F080
+    m.bus().write(kFlash, u8{0xF0});
+    CHECK_EQ(rd(m, 0), 0x4Fu);
+    m.prom_image()[0x101] = 0xFF;
+    command(m, 0xA0);
+    m.bus().write(kFlash + 0x101, u8{0x12});
+    CHECK_EQ(m.prom_image()[0x101], 0x12u);
 }
 
 TEST(machine_boot_prom_and_nvram_are_reachable_at_power_on) {
@@ -382,14 +437,102 @@ TEST(simba_has_no_base_and_limit_registers_and_resets_its_maps_as_the_apb_manual
     CHECK_EQ(cfg_read32(m, cfg(0, 1, 0, 0xDC)) >> 16, 0u);
 }
 
-TEST(machine_memory_banks_mirror_and_empty_banks_read_zero) {
-    Ultra5_10 m(small_options());  // 64 MiB in bank 0
-    CHECK(m.bus().write(0x100ull, u64{0x1122334455667788ull}));
+TEST(simba_implementation_registers_and_aliases_read_as_on_real_hardware) {
+    Ultra5_10 m(small_options());
+    for (unsigned fn : {0u, 1u}) {
+        CHECK_EQ(cfg_read32(m, cfg(0, 1, fn, 0x0C)), 0x00812810u);  // header 81, latency 28, cache line 10
+        CHECK_EQ(cfg_read32(m, cfg(0, 1, fn, 0x18)) >> 24, 0x28u);   // secondary latency
+        CHECK_EQ(cfg_read32(m, cfg(0, 1, fn, 0x1C)) >> 16, 0x0280u); // secondary status
+        CHECK_EQ(cfg_read32(m, cfg(0, 1, fn, 0xB8)), 0xFFFFFFFFu);   // INT ACK: nobody answers
+        CHECK_EQ(cfg_read32(m, cfg(0, 1, fn, 0xE0)), 0u);
+        CHECK_EQ(cfg_read32(m, cfg(0, 1, fn, 0xE4)), 1u);            // ARBITER_EN, 2:1 clocking
+    }
+    // What OpenBoot writes, and what the real machine reads back at ok.
+    cfg_write32(m, cfg(0, 1, 0, 0x0C), 0x00005010u);  // latency 50 through function 0 only
+    cfg_write32(m, cfg(0, 1, 1, 0xE0), 0xFFFFFFFFu);
+    cfg_write32(m, cfg(0, 1, 1, 0xE4), 0xFFFFFFFFu);
+    CHECK_EQ(cfg_read32(m, cfg(0, 1, 1, 0xE0)), 0x003F010Fu);
+    CHECK_EQ(cfg_read32(m, cfg(0, 1, 1, 0xE4)), 1u);
+    cfg_write32(m, cfg(0, 1, 1, 0xE0), 0x0000010Fu);
+    for (unsigned fn : {0u, 1u}) CHECK_EQ(cfg_read32(m, cfg(0, 1, fn, 0x0C)), 0x00815010u);  // aliased
+    CHECK_EQ(cfg_read32(m, cfg(0, 1, 1, 0x3C)), 0x00020000u);  // ERRINT_EN is the bridge control's SERR# enable
+    CHECK_EQ(cfg_read32(m, cfg(0, 1, 0, 0x3C)), 0u);           // (per bus)
+    cfg_write32(m, cfg(0, 1, 1, 0x3C), 0u);
+    CHECK_EQ(cfg_read32(m, cfg(0, 1, 1, 0xE0)), 0x0000000Fu);
+    // The primary command and the primary master retry limit are one
+    // register; the tick too.
+    cfg_write32(m, cfg(0, 1, 1, 0x04), 0x00000147u);
+    CHECK_EQ(cfg_read32(m, cfg(0, 1, 0, 0x04)), 0x02A00147u);
+    cfg_write32(m, cfg(0, 1, 0, 0xC0), 0x123456u);
+    CHECK_EQ(cfg_read32(m, cfg(0, 1, 1, 0xC0)), 0x56u);
+    cfg_write32(m, cfg(0, 1, 0, 0xB0), 0x1000);
+    const u32 a = cfg_read32(m, cfg(0, 1, 0, 0xB0)), b = cfg_read32(m, cfg(0, 1, 1, 0xB0));
+    CHECK(a >= 0x1000 && b >= a && b - a < 0x10);
+    // Error addresses read-only; the diagnostics' parity inverts only.
+    cfg_write32(m, cfg(0, 1, 1, 0xD0), 0xFFFFFFFFu);
+    CHECK_EQ(cfg_read32(m, cfg(0, 1, 1, 0xD0)), 0u);
+    cfg_write32(m, cfg(0, 1, 1, 0xF8), 0xFFFFFFFFu);
+    CHECK_EQ(cfg_read32(m, cfg(0, 1, 1, 0xF8)), 0x77u);
+}
+
+TEST(onboard_expansion_rom_bars_size_as_on_real_hardware) {
+    Ultra5_10 m(small_options());
+    cfg_write32(m, cfg(0, 1, 1, 0x18), 0x00010100);  // bus A as bus 1
+    const struct { unsigned dev, fn; u32 sized; } roms[] = {
+        {1, 0, 0xFF000001u},  // EBus: 16 MiB
+        {1, 1, 0xFF000001u},  // HME: 16 MiB
+        {2, 0, 0xFFFE0001u},  // Rage Pro: 128 KiB
+    };
+    for (const auto& r : roms) {
+        CHECK_EQ(cfg_read32(m, cfg(1, r.dev, r.fn, 0x30)), 0u);
+        cfg_write32(m, cfg(1, r.dev, r.fn, 0x30), 0xFFFFFFFFu);
+        CHECK_EQ(cfg_read32(m, cfg(1, r.dev, r.fn, 0x30)), r.sized);
+    }
+    cfg_write32(m, cfg(1, 2, 0, 0x30), 0xE1020000u);  // where OpenBoot puts it, disabled
+    CHECK_EQ(cfg_read32(m, cfg(1, 2, 0, 0x30)), 0xE1020000u);
+}
+
+// Memory as the IIi's controller decodes it (IIi manual chapter 7). At
+// power-on Mem_Control0 has 10-bit columns: PA[28:27] select the pair, the
+// window above a pair's 128 MiB (pairs 1 and 3) is empty, a smaller bank
+// repeats, an empty one reads zero. 256 MiB DIMMs have 11-bit column DRAMs:
+// in 10-bit mode a row's top half is out of reach (column bit 10 is 0, so
+// PA 0x4010 is row 1, column 1, which 11-bit mode puts at 0x8010); in
+// 11-bit mode, set with refresh on, PA[28] selects the pair and the whole
+// 256 MiB is there.
+TEST(machine_memory_follows_the_controllers_column_mode) {
+    {
+        Ultra5_10 m(small_options());  // two 16 MiB DIMMs: 32 MiB, 10-bit columns
+        CHECK(m.bus().write(0x100ull, u64{0x1122334455667788ull}));
+        u64 v = 0;
+        CHECK(m.bus().read(0x2000100ull, v));  // 32 MiB higher: the same DIMMs
+        CHECK_EQ(v, 0x1122334455667788ull);
+        CHECK(m.bus().read(0x8000100ull, v));  // pair 1: nothing there
+        CHECK_EQ(v, 0u);
+        CHECK(m.bus().read(0x20000100ull, v));  // the top side: 16 MiB DIMMs have none
+        CHECK_EQ(v, 0u);
+    }
+    Ultra5_10::Options o = small_options();
+    o.ram_mb = 1024;  // four 256 MiB DIMMs
+    Ultra5_10 m(o);
+    auto& b = m.bus();
+    CHECK(b.write(0x4010ull, u64{0xA5A5A5A5A5A5A5A5ull}));
+    CHECK(b.write(0x30000100ull, u64{0x3333333333333333ull}));  // group 1's top side
     u64 v = 0;
-    CHECK(m.bus().read(0x4000100ull, v));  // 64 MiB higher: the same DIMMs
-    CHECK_EQ(v, 0x1122334455667788ull);
-    CHECK(m.bus().read(0x20000100ull, v));  // bank 2: empty
+    CHECK(b.read(0x08000100ull, v));
     CHECK_EQ(v, 0u);
+    b.write(Sabre::kRegsBase + 0xF010, u64{0x153D});  // 11-bit columns with refresh off: not yet
+    CHECK(b.read(0x4010ull, v));
+    CHECK_EQ(v, 0xA5A5A5A5A5A5A5A5ull);
+    b.write(Sabre::kRegsBase + 0xF010, u64{0x8000153D});  // and on
+    CHECK(b.read(0x8010ull, v));
+    CHECK_EQ(v, 0xA5A5A5A5A5A5A5A5ull);
+    CHECK(b.write(0x08000100ull, u64{0x0123456789ABCDEFull}));  // now the bank's upper half
+    CHECK(b.read(0x08000100ull, v));
+    CHECK_EQ(v, 0x0123456789ABCDEFull);
+    CHECK(b.read(0x30000100ull, v));  // (row 0, column 0x10 in either mode)
+    CHECK_EQ(v, 0x3333333333333333ull);
+    CHECK(m.bus().host_read_ptr(0x08000100ull) != nullptr);  // plain memory again, as fast
 }
 
 TEST(machine_simba_tick_counts_at_the_pci_clock) {
@@ -427,9 +570,10 @@ TEST(machine_ebus_audio_auxio_and_power_button_answer_where_openboot_puts_them) 
     CHECK(m.bus().write(ebus + 0x200000, u8{12}));
     CHECK(m.bus().read(ebus + 0x200004, b));
     CHECK_EQ(b, 0x8Au);
-    // The auxio registers (the system LED in the first), and the floppy's
-    // and audio's auxiliary registers, read back what was written.
-    for (u64 at : {0x726000ull, 0x728000ull, 0x72A000ull, 0x72C000ull, 0x72F000ull, 0x720000ull, 0x722000ull}) {
+    // The system LED's auxio register, and the floppy's and audio's
+    // auxiliary registers, read back what was written (the other auxio
+    // registers are fixed: ebus_registers_read_as_on_real_hardware_at_power_on).
+    for (u64 at : {0x726000ull, 0x720000ull, 0x722000ull}) {
         u32 v = 0;
         CHECK(m.bus().write(ebus + at, byteswap(u32{0x01})));
         CHECK(m.bus().read(ebus + at, v));
@@ -464,6 +608,7 @@ TEST(sabre_logs_pio_writes_and_their_master_aborts_not_reads) {
     auto& b = m.bus();
     constexpr u64 nowhere = Sabre::kMemBase + 0x90000000ull;  // no device decodes it
     auto status = [&] { return cfg_read32(m, cfg(0, 0, 0, 4)) >> 16; };
+    cfg_write32(m, cfg(0, 1, 1, 0xDC), 0xEF000000u);  // bus A forwards all but 0x80000000 up
     // A PIO write that completes: its address and byte mask, no error.
     CHECK(b.write(0x1FFF1400020ull, u8{0x01}));  // the SAB82532's command register
     CHECK_EQ(m.sabre().reg(0x2018), 0x1FFF1400020ull);
@@ -492,6 +637,95 @@ TEST(sabre_logs_pio_writes_and_their_master_aborts_not_reads) {
     CHECK_EQ(m.sabre().reg(0x2018), nowhere + 4);
     b.write(Sabre::kRegsBase + 0x2010, ~u64{0});  // the error bits clear when written with 1
     CHECK_EQ(m.sabre().reg(0x2010) >> 56, 0u);
+}
+
+TEST(a_cycle_nothing_claims_behind_simba_reads_all_ones_and_is_noted_there) {
+    // As on a real Ultra 10: a read of nothing behind Simba B completes with all
+    // ones and sets its secondary status's received master abort (0280 to
+    // 2280); the Sabre's error registers stay clear and no trap is taken.
+    Ultra5_10 m(small_options());
+    auto& b = m.bus();
+    constexpr u64 nowhere = Sabre::kMemBase + 0x90000000ull;
+    auto sec_status = [&] { return cfg_read32(m, cfg(0, 1, 1, 0x1C)) >> 16; };
+    cfg_write32(m, cfg(0, 1, 1, 0xDC), 0xFF000000u);  // bus A forwards all of memory space
+    cfg_write32(m, cfg(0, 1, 1, 4), 0x00000006u);     // memory decode, bus master
+    u32 v = 0;
+    CHECK(b.read(nowhere, v));
+    CHECK_EQ(v, 0xFFFFFFFFu);
+    CHECK(sec_status() & 0x2000);
+    CHECK_EQ(m.sabre().reg(0x2010) >> 56, 0u);
+    CHECK(!(cfg_read32(m, cfg(0, 0, 0, 4)) >> 16 & 0x2000));  // the Sabre saw a completed read
+    u64 d = 0;
+    CHECK(b.read(nowhere + 8, d));
+    CHECK_EQ(d, ~u64{0});
+    // A write goes nowhere and completes.
+    CHECK(b.write(nowhere, u32{0x12345678}));
+    CHECK_EQ(m.sabre().reg(0x2010) >> 56, 0u);  // (its byte mask logged, no error)
+    cfg_write32(m, cfg(0, 1, 1, 0x1C), 0x20000000u);  // cleared by writing 1
+    CHECK(!(sec_status() & 0x2000));
+    // With master-abort mode set the abort goes on to the processor.
+    cfg_write32(m, cfg(0, 1, 1, 0x3C), 0x00200000u);
+    CHECK(!b.read(nowhere, v));
+    CHECK(sec_status() & 0x2000);
+}
+
+TEST(sabre_reserved_registers_read_as_a_real_ultra_10_does) {
+    // 0x1A00 and 0x1C00-0x1C18 are reserved on the IIi (no retry timer or
+    // timer/counters, the Psycho's): 0x7C0 on a real Ultra 10, writes no effect.
+    Ultra5_10 m(small_options());
+    auto& b = m.bus();
+    for (u32 o : {0x1A00u, 0x1C00u, 0x1C08u, 0x1C10u, 0x1C18u}) {
+        CHECK(b.write(Sabre::kRegsBase + o, u64{0xC000000000001234ull}));
+        u64 v = 0;
+        CHECK(b.read(Sabre::kRegsBase + o, v));
+        CHECK_EQ(v, 0x7C0u);
+    }
+}
+
+// The memory controller's registers: their power-on values (IIi manual),
+// FFB_Config's fixed Oneread, 0xF008 as a real Ultra 10 reads it, the writable
+// bits; a SOFT_POR (OpenBoot's reset-all) leaves Mem_Control0/1 alone and
+// itself as the reason, a power-on reset initialises them; only setting
+// SOFT_POR resets.
+TEST(sabre_memory_controller_registers_and_what_resets_them) {
+    Ultra5_10 m(small_options());
+    auto& b = m.bus();
+    auto rd = [&](u32 o) {
+        u64 v = 0;
+        b.read(Sabre::kRegsBase + o, v);
+        return v;
+    };
+    CHECK_EQ(rd(0xF000), 0x01004000u);
+    CHECK_EQ(rd(0xF008), 0x4242424200001232ull);
+    CHECK_EQ(rd(0xF010), 0x00000F30u);
+    CHECK_EQ(rd(0xF018), 0x004A2950u);
+    CHECK_EQ(rd(0xF020) >> 31, 1u);  // POR
+    b.write(Sabre::kRegsBase + 0xF000, ~u64{0});
+    CHECK_EQ(rd(0xF000), 0x0F004000u);
+    b.write(Sabre::kRegsBase + 0xF010, ~u64{0});
+    CHECK_EQ(rd(0xF010), 0x9E001FFFu);
+    b.write(Sabre::kRegsBase + 0xF010, u64{0x90001570});  // what OpenBoot sets on a real Ultra 10
+    b.write(Sabre::kRegsBase + 0xF018, u64{0x4C4EBF9D});
+    b.write(Sabre::kRegsBase + 0xF000, u64{0x07000000});
+    b.write(Sabre::kRegsBase + 0xF020, u64{0x80000000});  // POR seen: cleared
+    int resets = 0;
+    m.sabre().on_soft_reset = [&](bool) { ++resets; };
+    b.write(Sabre::kRegsBase + 0xF020, u64{0x40000000});  // SOFT_POR set: a reset
+    CHECK_EQ(resets, 1);
+    m.sabre().reset(false);
+    CHECK_EQ(rd(0xF010), 0x90001570u);
+    CHECK_EQ(rd(0xF018), 0x4C4EBF9Du);
+    CHECK_EQ(rd(0xF000), 0x01004000u);  // (FFB_Config resets with the rest)
+    CHECK_EQ(rd(0xF020), 0x40000000u);  // SOFT_POR the reason, still set
+    b.write(Sabre::kRegsBase + 0xF020, u64{0x40000000});  // written back as read: no new reset
+    CHECK_EQ(resets, 1);
+    b.write(Sabre::kRegsBase + 0xF020, u64{0});
+    CHECK_EQ(rd(0xF020), 0u);
+    b.write(Sabre::kRegsBase + 0xF020, u64{0x40000000});  // set again: a reset
+    CHECK_EQ(resets, 2);
+    m.sabre().reset(true);
+    CHECK_EQ(rd(0xF010), 0x00000F30u);
+    CHECK_EQ(rd(0xF018), 0x004A2950u);
 }
 
 TEST(sabre_dma_answers_only_its_target_space_and_logs_translation_errors) {
@@ -1046,6 +1280,56 @@ TEST(fdc82077_reset_reports_four_drives_and_version) {
     CHECK(!irq);
     f.write(5, 1, 0x10);  // version
     CHECK_EQ(rd(5), 0x90u);
+    // PC-AT mode, as a real Ultra 10's: no status registers A and B, DIR's low
+    // bits floating; TDR's media sense over the tape select.
+    CHECK_EQ(rd(0), 0x76u);
+    CHECK_EQ(rd(1), 0x76u);
+    CHECK_EQ(rd(7), 0x76u);
+    CHECK_EQ(rd(3), 0x70u);
+    f.write(3, 1, 0x03);
+    CHECK_EQ(rd(3), 0x73u);
+}
+
+// The EBus devices' registers at ok on a real Ultra 10 (none of them written by
+// OpenBoot, or written as OpenBoot writes them), read the same way.
+TEST(ebus_registers_read_as_on_real_hardware_at_power_on) {
+    Ultra5_10 m(small_options());
+    auto& b = m.bus();
+    constexpr u64 kEbus = 0x1FFF1000000ull;
+    auto rd8 = [&](u32 off) {
+        u8 v = 0;
+        CHECK(b.read(kEbus + off, v));
+        return unsigned{v};
+    };
+    auto rd32 = [&](u32 off) {
+        u32 v = 0;
+        CHECK(b.read(kEbus + off, v));
+        return v;
+    };
+    for (u32 dma : {0x700000u, 0x702000u, 0x704000u, 0x706000u}) {
+        CHECK_EQ(rd32(dma), 0xC0u);  // CSR (little-endian): the device ID
+        CHECK_EQ(rd32(dma + 4), 0u);
+        CHECK_EQ(rd32(dma + 8), 0u);
+    }
+    CHECK_EQ(rd32(0x724000), 0u);  // power
+    CHECK(b.write(kEbus + 0x726000, u32{0xFFFFFFFF}));  // as OpenBoot writes it
+    const u32 auxio[] = {0x01000000, 0xFF000000, 0x07000000, 0x01000000, 0x06000000};
+    const u32 at[] = {0x726000, 0x728000, 0x72A000, 0x72C000, 0x72F000};
+    for (unsigned i = 0; i < 5; ++i) {
+        CHECK(b.write(kEbus + at[i] + 4 * 0, i ? u32{0} : u32{0xFFFFFFFF}));
+        CHECK_EQ(rd32(at[i]), auxio[i]);
+    }
+    CHECK_EQ(rd8(0x3083FF), 0x30u);  // keyboard UART scratch
+    CHECK_EQ(rd8(0x3062FF), 0x00u);  // mouse UART scratch
+    CHECK_EQ(rd8(0x3043BD), 0x7Fu);  // parallel status
+    CHECK_EQ(rd8(0x3043BE), 0xE0u);  // parallel control
+    CHECK(b.write(kEbus + 0x3043BE, u8{0xFF}));
+    CHECK_EQ(rd8(0x3043BE), 0xFFu);
+    CHECK(b.write(kEbus + 0x3043BE, u8{0x00}));
+    CHECK_EQ(rd8(0x3043BE), 0xE0u);  // bit 5 write-only in compatible mode
+    for (u32 off : {0x3047BCu, 0x3047BDu, 0x3047BEu, 0x300398u, 0x300399u, 0x3023F0u, 0x3023F1u, 0x3023F7u})
+        CHECK_EQ(rd8(off), 0x76u);  // undecoded: the floating data lines
+    CHECK_EQ(rd8(0x3023F3), 0x70u);  // floppy TDR
 }
 
 // Through Sabre, the PCI bus and the EBus, devices say how long a read
@@ -1113,15 +1397,15 @@ TEST(sab82532_says_how_long_a_read_holds) {
     CHECK_EQ(se.stable_until(0x00, 1), Device::kForever);  // RFIFO, empty
 }
 
-// A new NVRAM is a machine set up before: OpenBoot's configuration with
-// the boot from the disk alone, auto-boot on, the least diagnostics and
+// A new NVRAM is a machine set up before: a real part's pattern under
+// OpenBoot's configuration with the boot from the disk alone, auto-boot on, the least diagnostics and
 // the diagnostic switch off, under a checksum OpenBoot accepts; a Sun
 // Ethernet address (random unless given) and a host ID with the same last
 // three bytes. A blank (all-zero) image is taken as new as well.
 TEST(ultra5_10_new_nvram_is_a_sane_starting_point) {
     auto checksum_ok = [](const u8* p) {
         u8 sum = 0x17;
-        for (unsigned i = 0x0C; i < 0x1FD8; ++i) sum ^= p[i];
+        for (unsigned i = 0x0C; i < 0x1CD8; ++i) sum ^= p[i];
         return sum == p[0];
     };
     Ultra5_10::Options o = small_options();
@@ -1136,6 +1420,14 @@ TEST(ultra5_10_new_nvram_is_a_sane_starting_point) {
         CHECK_EQ(p[0x2CA], 4u);     // boot-device "disk"
         CHECK(std::equal(p + 0x2CB, p + 0x2CB + 4, "disk"));
         CHECK_EQ(p[0x618 + 2], 8u);  // input-device "keyboard"
+        CHECK_EQ(p[0x2CF], 0u);       // (the 0 setenv leaves after it)
+        // Where OpenBoot has not written: the pattern a real Ultra 10's holds.
+        CHECK_EQ(p[0x004], 0x55u);
+        CHECK_EQ(p[0x080], 0xAAu);
+        CHECK(std::all_of(p + 0x6A3, p + 0x6A7, [](u8 b) { return b == 0xAA; }));  // ttya-mode's slot after it
+        CHECK(std::all_of(p + 0x834, p + 0x840, [](u8 b) { return b == 0x55; }));
+        CHECK(std::all_of(p + 0x8C0, p + 0x900, [](u8 b) { return b == 0xFF; }));
+        CHECK(std::all_of(p + 0x1E80, p + 0x1EC0, [](u8 b) { return b == 0xAA; }));
         const u8* id = p + 0x1FD8;
         CHECK_EQ(id[0], 0x01u);
         CHECK_EQ(id[1], 0x80u);

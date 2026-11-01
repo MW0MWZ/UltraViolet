@@ -34,7 +34,7 @@ std::string prom_folder_with_loop() {
 app::Settings loop_settings() {
     app::Settings s;
     s.prom_dir = prom_folder_with_loop();
-    s.ram_mb = 64;
+    s.ram_mb = 128;
     s.net = "none";
     s.console = "ttya";
     s.timing = Pacer::Mode::Free;

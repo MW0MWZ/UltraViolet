@@ -94,6 +94,7 @@ Hme::Hme(Scheduler& scheduler, double cpu_hz)
     set_cfg8(pci::kMinGrant, 0x0A);
     set_cfg8(pci::kMaxLatency, 0x05);
     define_bar(0, 0x8000, false);
+    define_rom(16u << 20);  // as a real Ultra 10 sizes it
     save_reset_state();
     reset();
 }

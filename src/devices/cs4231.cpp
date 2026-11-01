@@ -128,7 +128,7 @@ bool Cs4231::read(u64 offset, unsigned size, u64& value) {
             case kIndex: b = index_; break;
             case kData: b = read_indexed(index_ & index_mask()); break;
             case kStatus: {
-                b = status_ & kStInt;
+                b = (status_ & kStInt) | kStSamplePosition;
                 if (errors_) b |= kStSer;
                 if ((regs_[kInterface] & (kPen | kPpio)) == (kPen | kPpio) && pio_.size() < 4) b |= kStPrdy;
                 if ((regs_[kInterface] & (kCen | kCpio)) == (kCen | kCpio)) b |= kStCrdy;

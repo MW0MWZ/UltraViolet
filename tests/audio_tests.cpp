@@ -89,6 +89,15 @@ struct Rig {
 TEST(cs4231_identifies_itself_in_both_modes) {
     Rig r;
     CHECK_EQ(r.in(Cs4231::kIndex), Cs4231::kMce);  // MCE after a reset
+    CHECK_EQ(r.in(Cs4231::kStatus), 0xCCu);        // as a real Ultra 10's at ok
+    // The registers after a reset, as a real Ultra 10's at ok; I16-I31 are I0-I15
+    // in mode 1.
+    static constexpr u8 kAtOk[16] = {0x00, 0x00, 0x88, 0x88, 0x88, 0x88, 0x80, 0x80,
+                                     0x00, 0x08, 0x00, 0x00, 0x8A, 0x00, 0x00, 0x00};
+    for (u8 i = 0; i < 32; ++i) {  // (MCE kept, as OpenBoot leaves it: no calibration starts)
+        r.out(Cs4231::kIndex, static_cast<u8>(i | Cs4231::kMce));
+        CHECK_EQ(r.in(Cs4231::kData), kAtOk[i & 15]);
+    }
     CHECK_EQ(r.get(Cs4231::kModeId), 0x8Au);
     CHECK_EQ(r.get(Cs4231::kInterface), Cs4231::kAcal);
     // In mode 1 only the first 16 registers answer: I25 is I9.

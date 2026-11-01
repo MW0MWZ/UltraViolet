@@ -75,7 +75,10 @@ public:
     // space. Later mappings replace earlier ones; the remap handler is told
     // (cached host pointers, such as the CPU's soft TLB, must then be dropped).
     void map_ram(u64 base, u64 size, u8* host, bool writable = true);
-    void map_device(u64 base, u64 size, Device* device);
+    void map_device(u64 base, u64 size, Device* device) { map_device(base, size, device, base); }
+    // As map_device, the device seeing offsets from `device_base` (part of
+    // a larger window put back).
+    void map_device(u64 base, u64 size, Device* device, u64 device_base);
     void unmap(u64 base, u64 size);
     void set_remap_handler(std::function<void()> handler) { remap_handler_ = std::move(handler); }
 

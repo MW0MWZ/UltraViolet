@@ -18,6 +18,7 @@
 // at the rate the clock synthesiser is set to.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <vector>
@@ -40,9 +41,46 @@ public:
     const std::array<std::array<u8, 3>, 256>& palette() const { return palette_; }
     u8 dac_mask() const { return dac_mask_; }
 
+    // What the picture is made from: the mode and scan-out registers, and
+    // the hardware cursor (compared to find what a frame must remake).
+    struct Scanout {
+        bool extended = false, blank = false, double_scan = false, wide_dac = false, nibble_swap = false;
+        unsigned width = 0, height = 0, depth = 0;
+        u32 base = 0, pitch = 0;  // bytes
+        u8 mask = 0xFF;
+        bool operator==(const Scanout&) const = default;
+    };
+    struct Cursor {
+        bool shown = false;
+        int x = 0, y = 0;
+        unsigned hoff = 0, voff = 0;
+        u32 bits = 0, colour[2] = {};
+        bool operator==(const Cursor&) const = default;
+    };
+    // A picture kept up to date by render(Frame&): each call remakes only
+    // the rows whose frame buffer memory was written since the last, and
+    // those the cursor left or moved onto; everything when the mode, the
+    // palette or the DAC changes. `changed_top` to `changed_bottom`
+    // (exclusive): the rows the last call remade (none if equal).
+    struct Frame {
+        std::vector<u32> pixels;  // width x height of 0x00RRGGBB
+        unsigned width = 0, height = 0;
+        unsigned changed_top = 0, changed_bottom = 0;
+
+    private:
+        friend class Mach64;
+        std::vector<u32> base_;  // the picture without the cursor
+        bool made_ = false, shown_ = false;
+        u64 seen_ = 0;  // display_version() when made
+        Scanout scan_;
+        Cursor cursor_;
+        std::array<std::array<u8, 3>, 256> palette_{};
+    };
+
     // The picture as the monitor would show it: `width` x `height` pixels of
     // 0x00RRGGBB (blank while the CRTC or display is off). False if no mode
     // is set (nothing to show).
+    bool render(Frame& frame) const;
     bool render(std::vector<u32>& pixels, unsigned& width, unsigned& height) const;
     // Where the hardware cursor's 64 x 64 image starts on the picture, if
     // it is shown.
@@ -121,6 +159,10 @@ private:
         u32 triple_bit = 0;
     };
     EngineOp op_;
+    // What a guest asked of the engine that is not modelled, each said once
+    // (a log warning): the reason a drawing may be wrong.
+    u32 engine_warned_ = 0;
+    void engine_unmodelled(unsigned what, const char* text);
     std::vector<u32> host_;  // host data for the operation: used up to word host_word_, bit host_bit_
     std::size_t host_word_ = 0;
     unsigned host_bit_ = 0;
@@ -132,6 +174,17 @@ private:
 
     std::vector<u8> vram_;
     u64 version_ = 0;
+    // Frame buffer memory in 1 KiB granules: the display_version() each was
+    // last written at (what a Frame need remake).
+    static constexpr unsigned kGranuleShift = 10;
+    std::vector<u64> written_;
+    void written(u32 from, u32 to) {  // bytes [from, to] written
+        for (u32 g = from >> kGranuleShift, last = std::min<u32>(to, kVramSize - 1) >> kGranuleShift; g <= last; ++g)
+            written_[g] = version_;
+    }
+    Scanout scanout() const;
+    Cursor cursor() const;
+    bool written_since(u32 from, u32 bytes, u64 version) const;
     std::array<u32, 512> regs_{};
     std::array<u8, 64> pll_{};
     // Palette DAC: 256 entries of R, G, B; write and read index, which of

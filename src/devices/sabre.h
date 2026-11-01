@@ -37,7 +37,7 @@ public:
 
     // `send_vector`: delivers an interrupt vector (its first data word) to
     // the processor; false if its receive register is busy.
-    Sabre(Bus& bus, Scheduler& scheduler, double cpu_hz, std::function<bool(u64)> send_vector);
+    Sabre(Bus& bus, Scheduler& scheduler, std::function<bool(u64)> send_vector);
     ~Sabre();
 
     void map();
@@ -62,6 +62,10 @@ public:
     // Called for a software power-on or externally initiated reset written
     // to the reset control register.
     std::function<void(bool por)> on_soft_reset;
+    // Mem_Control0 written (or initialised at power-on): its 11-bit column
+    // mode decides how memory is decoded.
+    static constexpr u64 kMc0Col11 = 1ull << 12, kMc0RefEnable = 1ull << 31;
+    std::function<void(u64)> on_mem_control0;
 
     u64 reg(u32 offset) const;
 
@@ -89,11 +93,8 @@ private:
     u64& imap(unsigned ino);
     void dispatch(unsigned ino);
     void dispatch_all();
-    void timer_update(unsigned n);
 
     Bus& bus_;
-    Scheduler& sched_;
-    double cpu_hz_;
     std::function<bool(u64)> send_vector_;
     pci::Bus root_;
     std::unique_ptr<HostFunction> host_;
@@ -109,16 +110,7 @@ private:
     u64 pci_ctl_ = 0, pci_afsr_ = 0, pci_afar_ = 0, pci_diag_ = 0, pci_tasr_ = 0;
     u64 ue_afsr_ = 0, ce_afsr_ = 0, uece_afar_ = 0;
     u64 reset_ctl_ = 0;
-    // Timer/counters: 29-bit counts at 1 MHz; the limit register holds the
-    // interrupt enable (bit 31), clear-at-limit (bit 30), restart (bit 29)
-    // and the limit.
-    struct TimerCounter {
-        u64 base_cycle = 0;  // cycle at which the count was last zero
-        u64 limit = 0;
-    };
-    u64 tc_count(unsigned n) const;
-    std::array<TimerCounter, 2> tc_{};
-    std::array<std::unique_ptr<Timer>, 2> tc_timer_;
+    u64 ffb_config_ = 0, mem_control0_ = 0, mem_control1_ = 0;
 };
 
 }  // namespace uv
