@@ -16,11 +16,29 @@ namespace {
 constexpr u32 kUpaPortId = 0x0000;
 constexpr u32 kUeAfsr = 0x0030, kUeceAfar = 0x0038, kCeAfsr = 0x0040, kUeceAfarAlias = 0x0048;
 constexpr u32 kIommuCtl = 0x0200, kIommuTsb = 0x0208, kIommuFlush = 0x0210;
-constexpr u32 kPciImap = 0x0C00, kObioImap = 0x1000, kPciIclr = 0x1400, kObioIclr = 0x1800, kRetryTimer = 0x1A00;
-constexpr u32 kTimer = 0x1C00, kWriteSync = 0x1C20;
+constexpr u32 kPciImap = 0x0C00, kObioImap = 0x1000, kPciIclr = 0x1400, kObioIclr = 0x1800;
+constexpr u32 kWriteSync = 0x1C20;
+// Reserved in the IIi manual (where the Psycho has its interrupt retry timer
+// and timer/counters): a real Ultra 10 reads 0x7C0 at each, and takes writes
+// as nothing.
+constexpr u32 kReservedAt1A00 = 0x1A00, kReservedTimers = 0x1C00;
+constexpr u64 kReservedValue = 0x7C0;
+// The delay before a vector the processor refused goes again (not a
+// register on the IIi's bus module)
+constexpr u64 kRetryCycles = 1000;
 constexpr u32 kPciCtl = 0x2000, kPciAfsr = 0x2010, kPciAfar = 0x2018, kPciDiag = 0x2020, kPciTasr = 0x2028;
 constexpr u32 kGfxImapAlias = 0x6000, kUpaImapAlias = 0x8000;
-constexpr u32 kResetCtl = 0xF020;
+constexpr u32 kFfbConfig = 0xF000, kMcuF008 = 0xF008, kMemControl0 = 0xF010, kMemControl1 = 0xF018, kResetCtl = 0xF020;
+// FFB_Config: the slave request queue size (27:24, 1 at reset; OpenBoot
+// sets 7 for a Creator3D) and Oneread (14), always 1.
+constexpr u64 kFfbSprqs = 0xFull << 24, kFfbOneread = 1ull << 14, kFfbConfigReset = 1ull << 24;
+// Mem_Control0 and 1 at power-on (IIi manual tables 18-3 and 18-7: refresh
+// every 0x30 x 32 clocks for all four DIMM pairs, off; the SME1430's
+// default timings), and their writable bits.
+constexpr u64 kMc0Reset = 0x00000F30, kMc0Writable = 0x9E001FFF, kMc1Reset = 0x004A2950, kMc1Writable = 0xFFFFFFFF;
+// 0xF008, not in the IIi manual's list of MCU registers, reads this on a
+// real Ultra 10; taken as read-only.
+constexpr u64 kMcuF008Value = 0x4242424200001232ull;
 
 // UPA port ID (read-only), as a real Ultra 10 reads it.
 constexpr u64 kUpaPortIdValue = 0x8E10002000000000ull;
@@ -55,10 +73,6 @@ constexpr unsigned kIommuProtection = 0, kIommuInvalid = 1;
 // The bus module's own interrupts: PCI error, uncorrectable and correctable
 // DMA errors (as a real Ultra 10's sabre node lists them)
 constexpr unsigned kInoPciErr = 0x30, kInoUe = 0x2E, kInoCe = 0x2F;
-
-// Timer limit fields
-constexpr u64 kLimitIntEn = 1ull << 31, kLimitToZero = 1ull << 30, kLimitMask = 0x1FFFFFFF;
-constexpr unsigned kTimerIno[2] = {0x2C, 0x2D};
 
 u64 swap_size(u64 v, unsigned size) {
     switch (size) {
@@ -105,8 +119,8 @@ public:
     void received(u16 bit) { set_cfg16(pci::kStatus, cfg16(pci::kStatus) | bit); }
 };
 
-Sabre::Sabre(Bus& bus, Scheduler& scheduler, double cpu_hz, std::function<bool(u64)> send_vector)
-    : bus_(bus), sched_(scheduler), cpu_hz_(cpu_hz), send_vector_(std::move(send_vector)),
+Sabre::Sabre(Bus& bus, Scheduler& scheduler, std::function<bool(u64)> send_vector)
+    : bus_(bus), send_vector_(std::move(send_vector)),
       host_(std::make_unique<HostFunction>()),
       regs_win_(std::make_unique<Window>(*this, "sabre-regs", &Sabre::regs_read, &Sabre::regs_write)),
       config_win_(std::make_unique<Window>(*this, "pci-config", &Sabre::config_read, &Sabre::config_write,
@@ -115,16 +129,6 @@ Sabre::Sabre(Bus& bus, Scheduler& scheduler, double cpu_hz, std::function<bool(u
       mem_win_(std::make_unique<Window>(*this, "pci-mem", &Sabre::mem_read, &Sabre::mem_write, &Sabre::mem_stable)),
       retry_timer_(scheduler, [this] { dispatch_all(); }) {
     root_.attach(0, 0, host_.get());
-    for (unsigned n = 0; n < 2; ++n)
-        tc_timer_[n] = std::make_unique<Timer>(scheduler, [this, n] {
-            TimerCounter& t = tc_[n];
-            if (t.limit & kLimitToZero) t.base_cycle = sched_.now();
-            if (t.limit & kLimitIntEn) {
-                set_interrupt(kTimerIno[n], true);
-                set_interrupt(kTimerIno[n], false);  // edge: latched by the clear state
-            }
-            timer_update(n);
-        });
     reset(true);
 }
 
@@ -137,10 +141,17 @@ void Sabre::map() {
     bus_.map_device(kMemBase, 0x100000000ull, mem_win_.get());
 }
 
-void Sabre::map_mem_window(u64 pa, u64 size) { bus_.map_device(pa, size, mem_win_.get()); }
+void Sabre::map_mem_window(u64 pa, u64 size) { bus_.map_device(pa, size, mem_win_.get(), kMemBase); }
 
 void Sabre::reset(bool power_on) {
     regs_.clear();
+    // Only a power-on reset initialises Mem_Control0/1 (IIi manual 18.2:
+    // SOFT_POR, B_POR and the XIRs leave refresh running as it was).
+    if (power_on) {
+        mem_control0_ = kMc0Reset, mem_control1_ = kMc1Reset;
+        if (on_mem_control0) on_mem_control0(mem_control0_);
+    }
+    ffb_config_ = kFfbConfigReset;
     for (unsigned i = 0; i < 8; ++i) pci_imap_[i] = (u64{kIgn} << 6) | (i << 2);
     for (unsigned i = 0; i < 32; ++i) obio_imap_[i] = (u64{kIgn} << 6) | (0x20 + i);
     // On a real Ultra 10 the maps past the on-board devices' (0x1088-0x10C8)
@@ -153,9 +164,8 @@ void Sabre::reset(bool power_on) {
     pci_ctl_ = pci_afsr_ = pci_afar_ = pci_diag_ = pci_tasr_ = 0;
     ue_afsr_ = ce_afsr_ = uece_afar_ = 0;
     update_error_interrupts();
+    // The reason: POR at power-on; after a SOFT_POR its own bit, still set.
     reset_ctl_ = power_on ? kRstPor : (reset_ctl_ & ~kRstPor);
-    tc_ = {};
-    for (auto& t : tc_timer_) t->cancel();
     retry_timer_.cancel();
     root_.reset();
 }
@@ -179,29 +189,13 @@ void Sabre::dispatch(unsigned ino) {
     } else if (!retry_timer_.active()) {
         // The processor is busy with another vector: try again after the
         // interrupt retry timer.
-        const u64 retry = regs_.count(kRetryTimer) ? (regs_[kRetryTimer] & 0xFFFFF) : 0;
-        retry_timer_.schedule_in(retry ? retry : 1000);
+        retry_timer_.schedule_in(kRetryCycles);
     }
 }
 
 void Sabre::dispatch_all() {
     for (unsigned ino = 0; ino < kNumIno; ++ino)
         if (level_[ino]) dispatch(ino);
-}
-
-u64 Sabre::tc_count(unsigned n) const {
-    const double us = static_cast<double>(sched_.now() - tc_[n].base_cycle) * 1e6 / cpu_hz_;
-    return static_cast<u64>(us) & kLimitMask;
-}
-
-void Sabre::timer_update(unsigned n) {
-    TimerCounter& t = tc_[n];
-    tc_timer_[n]->cancel();
-    const u64 limit = t.limit & kLimitMask;
-    if (!(t.limit & (kLimitIntEn | kLimitToZero)) || limit == 0) return;
-    const u64 count = tc_count(n);
-    const u64 ticks = limit > count ? limit - count : (kLimitMask + 1 - count + limit);
-    tc_timer_[n]->schedule_in(static_cast<u64>(static_cast<double>(ticks) * cpu_hz_ / 1e6) + 1);
 }
 
 u64 Sabre::reg(u32 o) const {
@@ -219,6 +213,10 @@ u64 Sabre::reg(u32 o) const {
         case kPciDiag: return pci_diag_;
         case kPciTasr: return pci_tasr_;
         case kResetCtl: return reset_ctl_;
+        case kFfbConfig: return ffb_config_ | kFfbOneread;
+        case kMcuF008: return kMcuF008Value;
+        case kMemControl0: return mem_control0_;
+        case kMemControl1: return mem_control1_;
         default: break;
     }
     if (o >= kPciImap && o < kPciImap + 0x40) return pci_imap_[(o - kPciImap) >> 3];
@@ -227,10 +225,7 @@ u64 Sabre::reg(u32 o) const {
     if (o == kUpaImapAlias) return obio_imap_[(0x10A0 - kObioImap) >> 3];
     if (o >= kPciIclr && o < kPciIclr + 0x100) return state_[((o - kPciIclr) >> 3) & 0x1F];
     if (o >= kObioIclr && o < kObioIclr + 0x100) return state_[0x20 + (((o - kObioIclr) >> 3) & 0x1F)];
-    if (o >= kTimer && o < kTimer + 0x20) {
-        const unsigned n = (o - kTimer) >> 4;
-        return (o & 8) ? tc_[n].limit : tc_count(n);
-    }
+    if (o == kReservedAt1A00 || (o >= kReservedTimers && o < kReservedTimers + 0x20)) return kReservedValue;
     const auto it = regs_.find(o);
     return it == regs_.end() ? 0 : it->second;
 }
@@ -278,11 +273,24 @@ bool Sabre::regs_write(u64 offset, unsigned size, u64 value) {
         case kPciDiag: pci_diag_ = v; return true;
         case kPciTasr: pci_tasr_ = v & 0xFF; return true;
         case kWriteSync: return true;
-        case kResetCtl:
-            reset_ctl_ = (reset_ctl_ & ~(v & 0x98000000ull)) | (v & 0x60000000ull);
-            if ((v & kRstSoftPor) && on_soft_reset) on_soft_reset(true);
-            else if ((v & kRstSoftXir) && on_soft_reset) on_soft_reset(false);
+        case kFfbConfig: ffb_config_ = v & kFfbSprqs; return true;
+        case kMcuF008: return true;
+        case kMemControl0:
+            mem_control0_ = v & kMc0Writable;
+            if (on_mem_control0) on_mem_control0(mem_control0_);
             return true;
+        case kMemControl1: mem_control1_ = v & kMc1Writable; return true;
+        case kResetCtl: {
+            // POR, B_POR and B_XIR clear when written with 1; SOFT_POR and
+            // SOFT_XIR hold what is written (IIi manual table 17-2). Setting
+            // one resets: written with 1 again while still set it does not
+            // (OpenBoot writes back what it read to clear the others).
+            const u64 rising = v & ~reset_ctl_ & (kRstSoftPor | kRstSoftXir);
+            reset_ctl_ = (reset_ctl_ & ~(v & 0x98000000ull) & ~0x60000000ull) | (v & 0x60000000ull);
+            if ((rising & kRstSoftPor) && on_soft_reset) on_soft_reset(true);
+            else if ((rising & kRstSoftXir) && on_soft_reset) on_soft_reset(false);
+            return true;
+        }
         default: break;
     }
     if (o >= kPciImap && o < kPciImap + 0x40) {
@@ -306,17 +314,7 @@ bool Sabre::regs_write(u64 offset, unsigned size, u64 value) {
         if (state_[ino] == kStateIdle && level_[ino]) dispatch(ino);  // a level still held is sent again
         return true;
     }
-    if (o >= kTimer && o < kTimer + 0x20) {
-        const unsigned n = (o - kTimer) >> 4;
-        if (o & 8) {
-            tc_[n].limit = v & (0xE0000000ull | kLimitMask);
-        } else {
-            const double cycles = static_cast<double>(v & kLimitMask) * cpu_hz_ / 1e6;
-            tc_[n].base_cycle = sched_.now() - static_cast<u64>(cycles);
-        }
-        timer_update(n);
-        return true;
-    }
+    if (o == kReservedAt1A00 || (o >= kReservedTimers && o < kReservedTimers + 0x20)) return true;
     regs_[o] = v;
     return true;
 }

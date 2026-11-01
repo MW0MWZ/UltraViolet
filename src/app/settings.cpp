@@ -19,19 +19,9 @@
 namespace uv::app {
 
 std::vector<unsigned> ram_sizes() {
-    // As the machine places them: banks of up to 256 MiB, each a power of
-    // two, the largest first; a size is offered if it all finds a place.
-    std::vector<unsigned> sizes;
-    for (unsigned mb = 32; mb <= 1024; mb += 32) {
-        unsigned left = mb;
-        for (unsigned bank = 0; bank < Ultra5_10::kBanks && left; ++bank) {
-            unsigned size = std::min(left, 256u);
-            while (size & (size - 1)) size &= size - 1;
-            left -= size;
-        }
-        if (!left) sizes.push_back(mb);
-    }
-    return sizes;
+    // As real DIMMs fill the board (Ultra5_10::Options::ram_mb): two 64 MiB,
+    // two 128 MiB, four 128 MiB or four 256 MiB.
+    return {128, 256, 512, 1024};
 }
 
 const std::vector<CpuModule>& cpu_modules() {
@@ -53,8 +43,7 @@ bool check_hardware(const Settings& s, std::string& error) {
     if (std::find(sizes.begin(), sizes.end(), s.ram_mb) == sizes.end()) {
         std::string list;
         for (unsigned mb : sizes) list += (list.empty() ? "" : ", ") + std::to_string(mb);
-        error = "the Ultra 5/10 cannot hold " + std::to_string(s.ram_mb) +
-                " MiB (four banks of 32 to 256 MiB, each a power of two); it takes " + list;
+        error = "memory of " + std::to_string(s.ram_mb) + " MiB is not offered; the sizes are " + list + " MiB";
         return false;
     }
     for (const CpuModule& m : cpu_modules())
@@ -85,6 +74,7 @@ Ultra5_10::Options Settings::options() const {
     o.mac = mac;
     o.timing = timing;
     o.fast_disk = fast_disk;
+    o.flash_write_enable = flash_write_enable;
     o.keyboard = console == "screen";
     o.keyboard_layout = keyboard_layout(keyboard);
     return o;
@@ -174,7 +164,7 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
     else if (key == "nvram") s.nvram = v;
     else if (key == "disk") s.disk = v;
     else if (key == "cdrom") s.cdroms.push_back(v);
-    else if (key == "ram_mb") ok = parse_number(v, n) && n >= 32 && n <= 1024 && n == static_cast<unsigned>(n) &&
+    else if (key == "ram_mb") ok = parse_number(v, n) && n >= 1 && n <= 1024 && n == static_cast<unsigned>(n) &&
                                   (s.ram_mb = static_cast<unsigned>(n), true);  // checked at power-on
     else if (key == "cpu_mhz") ok = parse_number(v, n) && n >= 10 && n <= 2000 && (s.cpu_mhz = n, true);
     else if (key == "ecache_kb") ok = parse_number(v, n) && n == static_cast<unsigned>(n) &&
@@ -197,6 +187,7 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
     else if (key == "jit") ok = parse_bool(v, s.jit);
     else if (key == "idle_skip") ok = parse_bool(v, s.idle_skip);
     else if (key == "fast_disk") ok = parse_bool(v, s.fast_disk);
+    else if (key == "flash_write_enable") ok = parse_bool(v, s.flash_write_enable);
     else if (key == "mouse_auto_capture") ok = parse_bool(v, s.mouse_auto_capture);
     else if (key == "sound") ok = parse_bool(v, s.sound);
     else if (key == "volume") ok = parse_number(v, n) && n >= 0 && n <= 100 && n == static_cast<unsigned>(n) &&
@@ -281,7 +272,7 @@ bool save_settings(const std::string& path, const Settings& s, std::string& erro
           << "\nnet=" << s.net << "\n";
         for (const auto& fw : s.forwards) f << "hostfwd=" << forward_text(fw) << "\n";
         f << "timing=" << timing_name(s.timing) << "\nblock_cache=" << (s.block_cache ? 1 : 0)
-          << "\njit=" << (s.jit ? 1 : 0) << "\nidle_skip=" << (s.idle_skip ? 1 : 0) << "\nfast_disk=" << (s.fast_disk ? 1 : 0) << "\nlog=" << s.log << "\nmouse_auto_capture=" << (s.mouse_auto_capture ? 1 : 0)
+          << "\njit=" << (s.jit ? 1 : 0) << "\nidle_skip=" << (s.idle_skip ? 1 : 0)  << "\nfast_disk=" << (s.fast_disk ? 1 : 0) << "\nflash_write_enable=" << (s.flash_write_enable ? 1 : 0) << "\nlog=" << s.log << "\nmouse_auto_capture=" << (s.mouse_auto_capture ? 1 : 0)
           << "\nwheel_keys=" << s.wheel_keys << "\nsound=" << (s.sound ? 1 : 0) << "\nvolume=" << s.volume << "\n";
         if (!f) {
             error = "cannot write " + tmp;

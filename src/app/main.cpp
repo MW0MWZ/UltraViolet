@@ -71,7 +71,7 @@ void usage() {
         "  --disk-size MB   create the disk image at this size if it does not exist\n"
         "  --cdrom FILE     CD image in the drive (secondary master); give it more than once\n"
         "                   for a set of discs (Ctrl+Alt+E in the window, or SIGUSR1, moves on)\n"
-        "  --ram MB         memory size (default 256)\n"
+        "  --ram MB         memory size: 128, 256, 512 or 1024 (default 256)\n"
         "  --cpu-mhz MHZ    processor module by clock: 270, 300, 333, 360, 400 or 440\n"
         "                   (default 440); its E-cache goes with it\n"
         "  --ecache-kb KB   E-cache, for 360 MHz, which came with 256 or 2048 (default)\n"
@@ -107,6 +107,8 @@ void usage() {
                "                   (default: at once, to the next event, the host asleep)\n"
                "  --no-fast-disk   the IDE drives with a real drive's delays and DMA at the\n"
                "                   controller's rate (default: at once, at host speed)\n"
+               "  --flash-write-enable  the flash PROM jumper (JP2) on Enable, for a flash\n"
+               "                   update (default: as shipped, writes ignored)\n"
                "  --headless       no window: ttya is this terminal\n"
                "  --foreground     keep the window's messages on this terminal (the window otherwise\n"
                "                   runs in the background, writing them to ultraviolet.log)\n"
@@ -330,7 +332,8 @@ int main(int argc, char** argv) {
             const char* key;
             const char* value;
         } kSwitches[] = {{"--no-jit", "jit", "0"}, {"--no-block-cache", "block_cache", "0"},
-                         {"--no-idle-skip", "idle_skip", "0"}, {"--no-fast-disk", "fast_disk", "0"}};
+                         {"--no-idle-skip", "idle_skip", "0"}, {"--no-fast-disk", "fast_disk", "0"},
+                         {"--flash-write-enable", "flash_write_enable", "1"}};
         std::string key, value, error;
         for (const auto& v : kValued)
             if (!std::strcmp(a, v.flag)) key = v.key, value = next();

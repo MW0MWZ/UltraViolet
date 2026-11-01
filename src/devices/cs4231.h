@@ -35,6 +35,9 @@ public:
     static constexpr u8 kInit = 0x80, kMce = 0x40, kTrd = 0x20;
     // Status register bits
     static constexpr u8 kStInt = 0x01, kStPrdy = 0x02, kStSer = 0x10, kStCrdy = 0x20;
+    // PL/R, PU/L, CL/R, CU/L: the next PIO byte is a left sample's upper
+    // (or only) byte, playback and capture, as a real Ultra 10 reads at ok.
+    static constexpr u8 kStSamplePosition = 0xCC;
     // Indexed registers
     static constexpr unsigned kLeftOut = 6, kRightOut = 7, kPlayFormat = 8, kInterface = 9, kPinControl = 10,
                               kErrorStatus = 11, kModeId = 12, kPlayCountHigh = 14, kPlayCountLow = 15,

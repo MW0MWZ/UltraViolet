@@ -326,7 +326,7 @@ TEST(atapi_cdrom_read_cd_builds_raw_sectors_and_dma_reads) {
 
 TEST(cmd646_answers_on_bus_a_and_latches_interrupts) {
     Ultra5_10::Options o;
-    o.ram_mb = 64;
+    o.ram_mb = 32;
     o.prom.assign(1u << 20, 0);
     store_be<u32>(o.prom.data() + 0x20, 0x10800000);
     store_be<u32>(o.prom.data() + 0x24, 0x01000000);
@@ -340,6 +340,8 @@ TEST(cmd646_answers_on_bus_a_and_latches_interrupts) {
     CHECK_EQ(byteswap(v), 0x06461095u);
     m.bus().read(cfg(1, 3, 8), v);
     CHECK_EQ(byteswap(v), 0x01018A03u);  // both channels in compatibility mode at power-on
+    m.bus().read(cfg(1, 3, 0x3C), v);
+    CHECK_EQ(byteswap(v), 0x0402010Eu);  // max_lat 4, min_gnt 2, pin A, line 0x0E: as a real Ultra 10's
     m.bus().write(cfg(1, 3, 9), u8{0x8F});  // OBP switches both to native mode
     m.bus().read(cfg(1, 3, 8), v);
     CHECK_EQ(byteswap(v), 0x01018F03u);

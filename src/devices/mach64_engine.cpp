@@ -13,6 +13,7 @@
 #include <algorithm>
 
 #include "core/endian.h"
+#include "core/log.h"
 #include "devices/mach64.h"
 
 namespace uv {
@@ -111,6 +112,17 @@ u32 mix(unsigned code, u32 s, u32 d, u32 chain, unsigned bpp) {
 
 }  // namespace
 
+// Unmodelled things a guest may ask of the engine, a bit each.
+enum : unsigned {
+    kUnTrapezoid, kUnReservedMix, kUnColourPattern, kUnCompare, kUnRightToLeftHost, kUnDst24Rot,
+};
+
+void Mach64::engine_unmodelled(unsigned what, const char* text) {
+    if (engine_warned_ & (1u << what)) return;
+    engine_warned_ |= 1u << what;
+    UV_LOG(Warn, "mach64", "engine: %s (not modelled; drawn as described in mach64_engine.cpp)", text);
+}
+
 void Mach64::engine_reset() {
     op_ = {};
     host_.clear();
@@ -150,6 +162,7 @@ void Mach64::engine_write(unsigned index, u32 v) {
         case kDstBresLnth:
         case kLeadBresLnth:
             r[kDstBresLnth] = r[kLeadBresLnth] = v;
+            if (v & 0x8000) engine_unmodelled(kUnTrapezoid, "a trapezoid (DST_BRES_LNTH bit 15): not drawn");
             if (!(v & 0x80008000)) engine_start(true);  // (not LINE_DIS, not a trapezoid)
             break;
         case kSrcYX: r[kSrcY] = v & 0xFFFF, r[kSrcX] = v >> 16; break;
@@ -191,6 +204,18 @@ void Mach64::engine_start(bool line) {
     op_.sx = sext(r[kSrcX], 14);
     op_.sy = sext(r[kSrcY], 15);
     op_.sbit = static_cast<u64>(r[kSrcOffPitch] & 0xFFFFF) * 64;
+    const u32 src = r[kDpSrc];
+    const bool host = ((src >> 16) & 3) == 2 || ((src >> 8) & 7) == kSrcHost || (src & 7) == kSrcHost;
+    if (host && !(r[kDstCntl] & kDstXDir) && !line)
+        engine_unmodelled(kUnRightToLeftHost, "host data drawn right to left: taken in the order it comes");
+    if (r[kDstCntl] & (1u << 7)) engine_unmodelled(kUnDst24Rot, "DST_24_ROT_EN: packed 24 bpp drawn from DP_PIX_WIDTH");
+    for (unsigned code : {(r[kDpMix] >> 16) & 0x1F, r[kDpMix] & 0x1F})
+        if ((code >= 0x10 && code <= 0x16) || code >= 0x18) engine_unmodelled(kUnReservedMix, "a reserved mix: drawn as the source");
+    if (((src >> 8) & 7) == kSrcPattern || (src & 7) == kSrcPattern)
+        if (!(r[kPatCntl] & (kPatClr4x2 | kPatClr8x1)))
+            engine_unmodelled(kUnColourPattern, "a colour pattern source without 4x2 or 8x1: drawn as 0");
+    if (const unsigned fn = r[kClrCmpCntl] & 7; fn != 0 && fn != 1 && fn != 4 && fn != 5)
+        engine_unmodelled(kUnCompare, "a colour compare function other than never, always, equal, not equal: ignored");
     op_.active = true;
     engine_run();
 }
@@ -296,6 +321,7 @@ void Mach64::vram_put(u64 bit, unsigned bpp, bool lsb_first, u32 value) {
     ++version_;
     const u64 byte = bit / 8;
     if (byte >= vram_.size()) return;
+    written(static_cast<u32>(byte), static_cast<u32>(byte + 3));
     if (bpp < 8) {
         const unsigned in = bit % 8, shift = lsb_first ? in : 8 - bpp - in;
         const u8 m = static_cast<u8>(width_mask(bpp) << shift);

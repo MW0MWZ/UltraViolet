@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andy Taylor
 // Intel 82077AA-compatible floppy disk controller (the SuperIO's, "fdthree"
-// on the Ultra 5/10): status registers A and B, digital output (drive
-// selects, motors, reset), tape drive, main status and data rate select,
+// on the Ultra 5/10), in PC-AT mode: digital output (drive selects,
+// motors, reset), tape drive, main status and data rate select,
 // the FIFO data port, digital input and configuration control; command,
 // execution and result phases; and the reset interrupt with its four
 // sense-interrupt results. No drives are connected yet: commands needing

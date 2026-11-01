@@ -304,7 +304,11 @@ bool UltraSparc::translate_data(u64 va, u8 a, AccessKind kind, unsigned size, Ac
         data_fault(tt::kDataAccessException, va, a, ct, context, kFtSideEffect, write, true);
         return false;
     }
-    if (!nonfaulting && (d & tte::NFO)) {
+    // A store to a no-fault-only page that is not writable is a protection
+    // fault, not data_access_exception (the manual does not order the two;
+    // NetBSD enters V|NFO mappings for missing pages and relies on its
+    // protection handler, on the MMU globals, for stores to them).
+    if (!nonfaulting && (d & tte::NFO) && !(write && !(d & tte::W))) {
         data_fault(tt::kDataAccessException, va, a, ct, context, kFtNfo, write, d & tte::E);
         return false;
     }

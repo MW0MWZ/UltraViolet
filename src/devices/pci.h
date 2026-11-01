@@ -102,6 +102,9 @@ protected:
     // Declares BAR `bar` (0-5): `size` a power of two, I/O or memory.
     // `reset_address` is its value at power-on (normally 0).
     void define_bar(unsigned bar, u32 size, bool io, u32 reset_address = 0, bool prefetchable = false);
+    // Declares the expansion ROM BAR: `size` a power of two. Its address
+    // and enable bit are stored; no ROM answers in it.
+    void define_rom(u32 size) { set_wmask(kRomBase, 4, ~(size - 1) | 1u); }
     // Accesses that fall in an enabled BAR, at `offset` into it.
     virtual bool bar_read(unsigned bar, u32 offset, unsigned size, u64& value);
     virtual bool bar_write(unsigned bar, u32 offset, unsigned size, u64 value);
@@ -223,6 +226,11 @@ protected:
     virtual bool forwards_io(u32 addr) const;
 
 private:
+    // A cycle forwarded that no function on the secondary bus claims:
+    // received master abort in the secondary status; with the bridge
+    // control's master-abort mode clear, a read completes with all ones and
+    // a write is discarded (true), else the abort goes on upstream (false).
+    bool master_abort(unsigned size, u64& value);
     Bus secondary_;
 };
 

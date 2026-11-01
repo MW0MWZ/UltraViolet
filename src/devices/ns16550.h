@@ -19,6 +19,8 @@ public:
     // `clock_hz`: the UART's input clock (divided by 16 x divisor for the baud
     // rate). `cpu_hz`: the scheduler's clock, to time characters.
     Ns16550(Scheduler& scheduler, SerialLine& line, double clock_hz, double cpu_hz);
+    // The scratch register's contents at power-on (no reset sets it).
+    void set_scratch(u8 v) { scr_ = v; }
 
     const char* name() const override { return "ns16550"; }
     bool read(u64 offset, unsigned size, u64& value) override;

@@ -48,15 +48,25 @@ namespace uv {
 class Ultra5_10 {
 public:
     // Memory: four banks of up to 256 MiB, at physical 0, 0x1000_0000,
-    // 0x2000_0000 and 0x3000_0000. A pair of DIMMs fills bank 0 or 2 (and
-    // with double-sided DIMMs, bank 1 or 3 as well). Address bits above a
-    // bank's size are not decoded, so a smaller bank repeats through its
-    // window; an empty bank reads as zero.
+    // 0x2000_0000 and 0x3000_0000: the bottom sides of the board's two DIMM
+    // groups (wired as the IIi's pairs 0 and 2), then their top sides (256
+    // MiB DIMMs alone have two). As Mem_Control0's column mode decodes them
+    // (IIi manual chapter 7): with 10-bit columns PA[28:27] selects the
+    // pair, a bank has the first 128 MiB of its window (the rest, pairs 1
+    // and 3, is empty) and COL is PA[13:4]; with 11-bit columns PA[28]
+    // selects it, the whole 256 MiB, COL PA[14:4]. Sun's DIMMs have 11-bit
+    // column DRAMs but for the 16 MiB one (service manual table C-3): in
+    // the other mode the extra column bit is lost (the DRAM ignores it, or
+    // is given 0). Address bits above a bank's rows are not decoded, so a
+    // smaller bank repeats through its window; an empty bank reads as zero.
     static constexpr u64 kBankWindow = 256ull << 20;
     static constexpr unsigned kBanks = 4;
 
     struct Options {
-        u32 ram_mb = 256;  // 32 to 1024; each bank's share is a power of two
+        // Memory, as DIMM pairs make it: 1024 MiB is four 256 MiB DIMMs, 512
+        // four 128 MiB; otherwise a pair in group 0 (and group 1 for what is
+        // left), each a power of two of up to 256 MiB.
+        u32 ram_mb = 256;
         double cpu_hz = 440e6;
         u32 ecache_bytes = 2u << 20;
         std::vector<u8> prom;    // the flash image (1 MiB: OpenBoot, then POST)
@@ -80,6 +90,9 @@ public:
         // with a real drive's command delays and the controller's transfer
         // rate (always so with Max timing).
         bool fast_disk = false;
+        // JP2 on pins 2-3: the flash PROM takes writes (a flash update).
+        // Its default (1-2) disables them.
+        bool flash_write_enable = false;
         // The host side of the on-board Ethernet (HME); none: no cable.
         std::shared_ptr<net::NetBackend> network;
         // A Sun Type 5 keyboard and mouse on the keyboard port. Without
@@ -104,7 +117,9 @@ public:
     explicit Ultra5_10(const Options& options);
     ~Ultra5_10();
 
-    void reset();
+    // A reset of the whole system: at power-on, or (`power_on` false) the
+    // processor's SOFT_POR, which leaves the memory controller as it is.
+    void reset(bool power_on = true);
     // Runs up to `instructions` instructions (stops early if the CPU halts
     // or the system switches itself off).
     void run(u64 instructions);
@@ -118,6 +133,7 @@ public:
     Scheduler& scheduler() { return sched_; }
     Sabre& sabre() { return sabre_; }
     M48t59& nvram() { return nvram_; }
+    std::vector<u8>& prom_image() { return flash_.image(); }  // the flash PROM's array
     Cmd646& ide() { return ide_; }
     AtapiCdrom& cdrom() { return cdrom_; }
     AtaDisk* disk() { return disk_.get(); }
@@ -203,6 +219,7 @@ private:
     std::time_t start_time_ = 0;
     M48t59 nvram_;
     SuperIoConfig superio_;
+    FloatingBus superio_float_{FloatingBus::kSuperIo};
     Ns16550 su_kbd_, su_mouse_;
     Sab82532 se_;
     Fdc82077 fdc_;
@@ -242,6 +259,29 @@ private:
         }
         bool write(u64, unsigned, u64) override { return true; }
     } empty_bank_;
+    // A bank whose DRAMs do not have the column width the controller drives:
+    // every access translated (16 KiB at a time, finer than the bus pages).
+    class MismatchedBank final : public Device {
+    public:
+        const char* name() const override { return "dram-columns"; }
+        bool read(u64 offset, unsigned size, u64& value) override;
+        bool write(u64 offset, unsigned size, u64 value) override;
+        u8* host = nullptr;
+        u64 size = 0;
+        unsigned drive_cols = 10, dram_cols = 10;
+
+    private:
+        u64 cell(u64 offset) const;
+    };
+    struct Bank {
+        u8* host = nullptr;
+        u64 size = 0;  // 0: no DIMMs
+        unsigned cols = 11;  // the DRAMs' column address bits
+    };
+    std::array<Bank, kBanks> banks_{};
+    std::array<MismatchedBank, kBanks> mismatched_{};
+    bool col11_ = false;  // Mem_Control0's 11-bit column mode, as the RAM is mapped
+    void map_memory(bool col11);
 };
 
 }  // namespace uv

@@ -5,7 +5,10 @@
 // on-board devices). Instead of base/limit windows each forwards the
 // 2 MiB blocks of I/O space and 512 MiB blocks of memory space whose bits
 // are set in its I/O and memory address map registers. Its implementation
-// registers include a tick counter that software uses for timeouts.
+// registers include a tick counter that software uses for timeouts. The
+// registers the APB manual marks aliased (the primary header, the tick,
+// the primary master retry limit) are one register seen from both
+// functions.
 #pragma once
 
 #include <functional>
@@ -16,12 +19,15 @@ namespace uv {
 
 class Simba final : public pci::Bridge {
 public:
-    static constexpr u8 kTick = 0xB0, kIoMap = 0xDE, kMemMap = 0xDF;
+    static constexpr u8 kTick = 0xB0, kIntAck = 0xB8, kRetryLimit = 0xC0, kIoMap = 0xDE, kMemMap = 0xDF,
+                        kPciControl = 0xE0;
 
     // `bus_a`: this is function 1 (on-board devices), which forwards
     // everything at power-on so the boot PROM is reachable. `ticks` returns
     // the tick counter's free-running count.
     Simba(bool bus_a, std::function<u64()> ticks);
+    // The other function of the same APB, for the aliased registers.
+    static void pair(Simba& a, Simba& b) { a.other_ = &b, b.other_ = &a; }
 
     const char* name() const override { return bus_a_ ? "simba-a" : "simba-b"; }
     void reset() override;
@@ -34,7 +40,13 @@ protected:
     bool forwards_io(u32 addr) const override;
 
 private:
+    // Brings the bits two registers share into line after a write to
+    // [reg, reg + size), and copies the aliased registers to the other
+    // function.
+    void after_write(u8 reg, unsigned size);
+
     bool bus_a_;
+    Simba* other_ = nullptr;
     std::function<u64()> ticks_;
     u64 tick_base_ = 0;  // count at the last write of the tick register
 };

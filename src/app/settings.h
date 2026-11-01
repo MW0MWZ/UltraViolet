@@ -36,6 +36,9 @@ struct Settings {
     bool idle_skip = true;  // run the guest's idle loops at once (UltraSparc::set_idle_skip)
     // The IDE drives without a real drive's delays, DMA at host speed.
     bool fast_disk = true;
+    // The flash PROM's write enable jumper (JP2) moved to Enable, for a
+    // flash update; as shipped writes are disabled.
+    bool flash_write_enable = false;
     bool mouse_auto_capture = true;  // the window captures the mouse when the pointer moves onto the screen
     // The wheel, which the Sun mouse lacks, as keys: "off", "arrows" (Up
     // and Down) or "pages" (Page Up and Down).
@@ -51,8 +54,7 @@ struct Settings {
     Ultra5_10::Options options() const;
 };
 
-// The memory sizes (MiB) the four banks hold (each a power of two, 256 MiB
-// at most, filled largest first).
+// The memory sizes (MiB) offered, each as real DIMM pairs make it.
 std::vector<unsigned> ram_sizes();
 // The processor modules the Ultra 5 and 10 shipped with: clock and E-cache.
 struct CpuModule {

@@ -26,6 +26,7 @@ Cmd646::Cmd646(Scheduler& scheduler, double cpu_hz)
     set_cfg16(pci::kStatus, 0x0280);  // medium DEVSEL, fast back-to-back
     set_cfg16(pci::kSubsystemVendor, 0x1095);
     set_cfg16(pci::kSubsystemId, 0x0646);
+    set_cfg8(pci::kInterruptLine, 0x0E);  // as a real Ultra 10 reads it after a reset (OBP does not write it)
     set_cfg8(pci::kInterruptPin, 1);
     set_cfg8(pci::kMinGrant, 0x02);
     set_cfg8(pci::kMaxLatency, 0x04);

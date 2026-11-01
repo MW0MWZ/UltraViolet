@@ -79,6 +79,8 @@ TEST(mach64_register_windows_and_identity) {
     // Block 1 (GUI_CNTL at 0x178): through BAR2 always, through the
     // aperture only when enabled.
     r.wr(kBar2 + 0x178, 2);
+    CHECK_EQ(r.rd(kBar0 + 0x7FF978), 2u);  // (BUS_EXT_REG_EN is set at power-on)
+    r.wr(kRegs + 0xA0, 0);
     CHECK_EQ(r.rd(kBar0 + 0x7FF978), 0u);  // (frame buffer there: past the 4 MiB fitted)
     r.wr(kRegs + 0xA0, 1u << 27);
     CHECK_EQ(r.rd(kBar0 + 0x7FF978), 2u);
@@ -148,16 +150,50 @@ TEST(mach64_pll_registers) {
     CHECK_EQ(r.rd(kRegs + 0x92, 1), 0x77u);
 }
 
-// GP_IO: pins driven read what is driven, released pins read high (no
-// monitor answering on DDC).
+// GP_IO: pins driven read what is driven, released pins read as the
+// Ultra 10's board leaves them (0x3F5C; DDC on 12 and 13 high, no monitor
+// answering).
 TEST(mach64_gp_io_pins) {
     Rig r;
-    CHECK_EQ(r.rd(kRegs + 0x78) & 0xFFFF, 0xFFFFu);
+    CHECK_EQ(r.rd(kRegs + 0x78) & 0xFFFF, 0x3F5Cu);
     r.wr(kRegs + 0x7B, 0x20, 1);  // pin 13 driven
     r.wr(kRegs + 0x79, 0x00, 1);  // low
-    CHECK_EQ(r.rd(kRegs + 0x79, 1), 0xDFu);
+    CHECK_EQ(r.rd(kRegs + 0x79, 1), 0x1Fu);
     r.wr(kRegs + 0x7B, 0x00, 1);  // released
-    CHECK_EQ(r.rd(kRegs + 0x79, 1), 0xFFu);
+    CHECK_EQ(r.rd(kRegs + 0x79, 1), 0x3Fu);
+    r.wr(kRegs + 0x78, 0x00803FDC);  // pin 7 driven high, as OpenBoot leaves it: reads low
+    CHECK_EQ(r.rd(kRegs + 0x78), 0x00803F5Cu);
+}
+
+// What a real Ultra 10's Rage Pro reads at power-on, and after OpenBoot's
+// writes (BUS_CNTL written back, DAC_CNTL 0x80010102, GEN_TEST_CNTL 0):
+// the read-only bits stay, as on a real Ultra 10.
+TEST(mach64_power_on_values_and_read_only_bits_as_on_real_hardware) {
+    Rig r;
+    CHECK_EQ(r.m.config_read(pci::kStatus, 2), 0x0280u);
+    CHECK_EQ(r.m.config_read(pci::kInterruptLine, 4), 0x0008011Bu);
+    CHECK_EQ(r.m.config_read(0x40, 4), 0x0000000Cu);
+    CHECK_EQ(r.m.config_read(0x50, 4), 0x00100002u);
+    CHECK_EQ(r.m.config_read(0x54, 4), 0xFF000001u);
+    r.m.config_write(pci::kCommand, 2, 0);
+    CHECK_EQ(r.m.config_read(pci::kCommand, 2), 0x0080u);  // stepping: fixed
+    r.m.config_write(pci::kCommand, 2, 0x0003);
+    CHECK_EQ(r.rd(kRegs + 0xE4), 0x0080001Du);  // CONFIG_STAT0
+    CHECK_EQ(r.rd(kRegs + 0xA0), 0x7B33A040u);  // BUS_CNTL
+    CHECK_EQ(r.rd(kRegs + 0xC4), 0x87010182u);  // DAC_CNTL
+    CHECK_EQ(r.rd(kRegs + 0xD0), 0x00000008u);  // GEN_TEST_CNTL
+    r.wr(kRegs + 0xA0, 0x7B33A040);
+    CHECK_EQ(r.rd(kRegs + 0xA0), 0x7B33A040u);  // (bit 21 a setting, not an error status)
+    r.wr(kRegs + 0xC4, 0x80010102);
+    CHECK_EQ(r.rd(kRegs + 0xC4), 0x87010182u);  // comparator, DAC type and GIO pins read-only
+    r.wr(kRegs + 0xD0, 0);
+    CHECK_EQ(r.rd(kRegs + 0xD0), 0x00000008u);  // EEPROM data in: high
+    r.wr(kRegs + 0x90, 0x12 << 10);
+    CHECK_EQ(r.rd(kRegs + 0x92, 1), 0x80u);  // PLL 0x12
+    r.wr(kRegs + 0x90, 0x14 << 10);
+    CHECK_EQ(r.rd(kRegs + 0x92, 1), 0x10u);  // PLL 0x14
+    r.wr(kRegs + 0xA0, 0xFFFFFFFF);  // (BUS_APER_REG_DIS too: through BAR2 from here)
+    CHECK_EQ(r.rd(kBar2 + 0x4A0), 0xFF7FFFF9u);  // LAT16X read-only, the one-shots read 0
 }
 
 // Vertical blank follows the mode's timing: the live bit, the current line,
@@ -251,6 +287,75 @@ TEST(mach64_scans_out_the_frame_buffer_and_cursor) {
     r.wr(kRegs + 0x1C, 0x03000240);  // display disabled
     r.m.render(px, w, h);
     CHECK_EQ(px[1152 * 2 + 3], 0u);
+}
+
+// A kept frame is remade only where the picture changed (the rows whose
+// memory was written, those the cursor left and reached), and whole when
+// the palette or mode changes; each time it matches a picture made afresh.
+TEST(mach64_frames_remake_only_what_changed) {
+    Rig r;
+    r.mode_1152x900();
+    r.wr(kRegs + 0xC4, 1u << 8);
+    for (unsigned i = 0; i < 4; ++i) {
+        r.wr(kRegs + 0xC0, i, 1);
+        for (u8 v : {u8(i * 60), u8(255 - i * 60), u8(i * 30)}) r.wr(kRegs + 0xC1, v, 1);
+    }
+    for (u32 a = 0; a < 1152 * 900; a += 4) r.wr(kBar0 + a, (a * 2654435761u) & 0x03030303);
+    Mach64::Frame f;
+    std::vector<u32> px;
+    unsigned w = 0, h = 0;
+    auto fresh = [&] {
+        r.m.render(px, w, h);
+        return f.pixels == px;
+    };
+    CHECK(r.m.render(f));
+    CHECK_EQ(f.changed_top, 0u);
+    CHECK_EQ(f.changed_bottom, 900u);
+    CHECK(fresh());
+    CHECK(r.m.render(f));  // nothing changed
+    CHECK_EQ(f.changed_bottom, f.changed_top);
+    // A byte in row 10: its 1 KiB granule's rows only.
+    r.wr(kBar0 + 1152 * 10 + 700, 3, 1);
+    r.m.render(f);
+    CHECK(f.changed_top <= 10 && f.changed_bottom > 10 && f.changed_bottom - f.changed_top <= 2);
+    CHECK(fresh());
+    // The cursor shown at (100, 50), then moved to (300, 400): the rows it
+    // was on are put back.
+    r.wr(kRegs + 0x68, 0x300000 / 8);
+    r.wr(kRegs + 0x6C, 100u | 50u << 16);
+    r.wr(kRegs + 0x60, 0x11223300);
+    r.wr(kRegs + 0x64, 0xAABBCC00);
+    for (u32 a = 0; a < 1024; ++a) r.wr(kBar0 + 0x300000 + a, 0b11100100, 1);
+    r.wr(kRegs + 0xD0, 1u << 7);
+    r.m.render(f);
+    CHECK_EQ(f.changed_top, 50u);
+    CHECK_EQ(f.changed_bottom, 114u);
+    CHECK(fresh());
+    CHECK_EQ(f.pixels[1152 * 50 + 100], 0x112233u);
+    r.wr(kRegs + 0x6C, 300u | 400u << 16);
+    r.m.render(f);
+    CHECK_EQ(f.changed_top, 50u);
+    CHECK_EQ(f.changed_bottom, 464u);
+    CHECK(fresh());
+    CHECK(f.pixels[1152 * 50 + 100] != 0x112233u);
+    // The cursor's image rewritten: its rows only.
+    r.wr(kBar0 + 0x300000, 0, 1);
+    r.m.render(f);
+    CHECK_EQ(f.changed_top, 400u);
+    CHECK_EQ(f.changed_bottom, 464u);
+    CHECK(fresh());
+    // A palette entry: everything.
+    r.wr(kRegs + 0xC0, 2, 1);
+    for (u8 v : {1, 2, 3}) r.wr(kRegs + 0xC1, v, 1);
+    r.m.render(f);
+    CHECK_EQ(f.changed_top, 0u);
+    CHECK_EQ(f.changed_bottom, 900u);
+    CHECK(fresh());
+    // Display off: blank, no cursor.
+    r.wr(kRegs + 0x1C, 0x03000240);
+    r.m.render(f);
+    CHECK(fresh());
+    CHECK_EQ(f.pixels[1152 * 400 + 300], 0u);
 }
 
 // ---- the 2D engine ----
@@ -480,3 +585,4 @@ TEST(mach64_engine_packed_24_bit_fills) {
     CHECK_EQ(e.m.vram()[8], 0x33u);
     CHECK_EQ(e.m.vram()[9], 0u);
 }
+

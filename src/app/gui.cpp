@@ -176,7 +176,7 @@ private:
     float density_ = 1.0f;  // pixels per window coordinate (2 on Retina)
     SDL_Texture* texture_ = nullptr;
     unsigned tex_w_ = 0, tex_h_ = 0;
-    std::vector<u32> pixels_;
+    Mach64::Frame frame_;  // the picture, remade where it changes
     u64 shown_version_ = 0;
     bool picture_ = false, picture_stale_ = true;
     SDL_FRect dest_{};  // where the picture is drawn, in window coordinates
@@ -874,21 +874,28 @@ void Gui::update_picture() {
     }
     Mach64& gfx = machine->graphics();
     if (!picture_stale_ && gfx.display_version() == shown_version_) return;
+    if (picture_stale_) frame_ = {};  // (another machine: remade whole)
     picture_stale_ = false;
     shown_version_ = gfx.display_version();
-    unsigned w = 0, h = 0;
     const bool had = picture_;
-    picture_ = gfx.render(pixels_, w, h);
+    picture_ = gfx.render(frame_);
     if (picture_ != had) update_title();
     if (!picture_) return;
+    const unsigned w = frame_.width, h = frame_.height;
+    SDL_Rect rows{0, static_cast<int>(frame_.changed_top), static_cast<int>(w),
+                  static_cast<int>(frame_.changed_bottom - frame_.changed_top)};
     if (!texture_ || w != tex_w_ || h != tex_h_) {
         if (texture_) SDL_DestroyTexture(texture_);
         texture_ = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_XRGB8888, SDL_TEXTUREACCESS_STREAMING,
                                      static_cast<int>(w), static_cast<int>(h));
         tex_w_ = w;
         tex_h_ = h;
+        rows = {0, 0, static_cast<int>(w), static_cast<int>(h)};  // (a new texture holds nothing)
     }
-    SDL_UpdateTexture(texture_, nullptr, pixels_.data(), static_cast<int>(w * sizeof(u32)));
+    if (rows.h <= 0) return;
+    // Only the rows that changed go to the texture.
+    SDL_UpdateTexture(texture_, &rows, frame_.pixels.data() + static_cast<std::size_t>(rows.y) * w,
+                      static_cast<int>(w * sizeof(u32)));
     pending_frames_ = std::max(pending_frames_, 1);
 }
 
@@ -1416,6 +1423,9 @@ void Gui::draw_settings() {
                 if (ImGui::Combo("##layout", &layout, "Type 5, US\0Type 5, UK\0Other (as the settings file has it)\0"))
                     if (layout < 2) edit_.keyboard = layout == 1 ? "uk" : "us";
             }
+            ImGui::Checkbox("Flash PROM writable (JP2 on Enable)", &edit_.flash_write_enable);
+            ImGui::SetItemTooltip("The motherboard jumper that lets the flash PROM be reprogrammed, as for a\n"
+                                  "flash-update. As shipped (pins 1-2) the PROM ignores every write.");
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::Spacing();

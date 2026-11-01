@@ -119,9 +119,9 @@ bool Bus::read_block(u64 paddr, u8* data, std::size_t length) const {
     return true;
 }
 
-void Bus::map_device(u64 base, u64 size, Device* device) {
+void Bus::map_device(u64 base, u64 size, Device* device, u64 device_base) {
     check_range(base, size);
-    for (u64 off = 0; off < size; off += kPageSize) page_for_write(base + off) = Page{nullptr, false, device, base};
+    for (u64 off = 0; off < size; off += kPageSize) page_for_write(base + off) = Page{nullptr, false, device, device_base};
     if (remap_handler_) remap_handler_();
 }
 

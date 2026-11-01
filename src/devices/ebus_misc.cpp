@@ -130,12 +130,14 @@ bool FlashProm::read(u64 offset, unsigned size, u64& value) {
 }
 
 bool FlashProm::write(u64 offset, unsigned size, u64 value) {
+    if (!write_enabled_) return true;
     for (unsigned i = 0; i < size; ++i) write_byte(static_cast<u32>(offset + i), static_cast<u8>(value >> (8 * (size - 1 - i))));
     return true;
 }
 
 RegisterBlock::RegisterBlock(std::string name, std::size_t size, u8 fill)
-    : name_(std::move(name)), fill_(fill), bytes_(size, fill), seen_(size, false) {}
+    : name_(std::move(name)), fill_(fill), bytes_(size, fill), reset_bytes_(size, fill), writable_(size, 0xFF),
+      seen_(size, false) {}
 
 bool PowerControl::read(u64 offset, unsigned size, u64& value) {
     value = 0;
@@ -162,7 +164,11 @@ bool RegisterBlock::read(u64 offset, unsigned size, u64& value) {
 }
 
 bool RegisterBlock::write(u64 offset, unsigned size, u64 value) {
-    for (unsigned i = 0; i < size; ++i) bytes_[(offset + i) % bytes_.size()] = static_cast<u8>(value >> (8 * (size - 1 - i)));
+    for (unsigned i = 0; i < size; ++i) {
+        const std::size_t at = (offset + i) % bytes_.size();
+        const u8 b = static_cast<u8>(value >> (8 * (size - 1 - i)));
+        bytes_[at] = static_cast<u8>((bytes_[at] & ~writable_[at]) | (b & writable_[at]));
+    }
     const std::size_t at = static_cast<std::size_t>(offset % bytes_.size());
     if (!seen_[at]) {
         seen_[at] = true;

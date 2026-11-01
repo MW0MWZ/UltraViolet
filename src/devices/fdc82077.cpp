@@ -5,6 +5,10 @@
 namespace uv {
 
 namespace {
+
+// What the SuperIO's undriven data lines read, and the tape drive
+// register's media sense with no media information (a real Ultra 10)
+constexpr u8 kFloating = 0x76, kTdrMediaSense = 0x70;
 // Main status register
 constexpr u8 kMsrRqm = 0x80, kMsrDio = 0x40, kMsrCb = 0x10;
 // Digital output register
@@ -167,10 +171,16 @@ void Fdc82077::execute() {
 
 bool Fdc82077::read(u64 offset, unsigned, u64& value) {
     switch (offset & 7) {
-        case 0: value = irq_line_ ? 0x80 : 0; break;  // SRA: interrupt pending
-        case 1: value = 0xC0 | (dor_ & 0x01 ? 0x20 : 0) | ((dor_ >> 4) & 0x03); break;  // SRB
+        // In PC-AT mode, as the Ultra 5/10's PC87332 runs, status registers
+        // A and B are not there and the data lines float (0x76 on
+        // a real Ultra 10); nor are bits 6:0 of the digital input register, whose
+        // bit 7 is the disk change line. The tape drive register gives
+        // the media sense (no media information: 0x70 on a real Ultra 10) above
+        // the tape drive select.
+        case 0:
+        case 1: value = kFloating; break;
         case 2: value = dor_; break;
-        case 3: value = tdr_; break;
+        case 3: value = kTdrMediaSense | (tdr_ & 0x03); break;
         case 4: {  // main status register
             u8 msr = 0;
             if (!(dor_ & kDorReset)) {
@@ -193,7 +203,7 @@ bool Fdc82077::read(u64 offset, unsigned, u64& value) {
                 result_.pop_front();
             }
             break;
-        case 7: value = 0x7F & ~0x80; break;  // DIR: no disk change
+        case 7: value = kFloating & 0x7F; break;  // DIR: no disk change
         default: value = 0xFF; break;
     }
     return true;

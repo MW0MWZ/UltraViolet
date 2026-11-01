@@ -235,6 +235,19 @@ TEST(vis_logical_partitioned_add_and_merge) {
     CHECK_EQ(r.cpu.freg64(dreg(16)), 0x0001000200030004ull ^ 0x00100020FFFF0040ull);  // FXOR
 }
 
+TEST(vis_fmul8sux16_and_fmul8ulx16_add_to_a_16_by_16_multiply) {
+    // The manual's Code Example 13-1: fmul8sux16, fmul8ulx16, fpadd16 give
+    // each lane's 16 x 16 product, upper 16 bits.
+    Rig r;
+    r.cpu.set_freg64(dreg(0), 0x12345678FFFF8000ull);
+    r.cpu.set_freg64(dreg(2), 0x40007FFF7FFF4000ull);
+    r.exec({VIS(dreg(4), dreg(0), dreg(2), 0x036), VIS(dreg(6), dreg(0), dreg(2), 0x037),
+            VIS(dreg(8), dreg(4), dreg(6), 0x050)});
+    CHECK_EQ(r.cpu.freg64(dreg(4)), 0x04802B00FF80E000ull);
+    CHECK_EQ(r.cpu.freg64(dreg(6)), 0x000D003C007F0000ull);  // e.g. 0x78 x 0x7FFF = 0x3BFF88, rounded at bit 16: 0x3C
+    CHECK_EQ(r.cpu.freg64(dreg(8)), 0x048D2B3CFFFFE000ull);  // (exact: 0x048D2B3BFFFFE000)
+}
+
 TEST(vis_alignaddress_and_faligndata) {
     Rig r;
     r.cpu.set_reg(g1, 0x2003);

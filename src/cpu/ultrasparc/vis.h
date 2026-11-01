@@ -88,14 +88,16 @@ u64 fmul8x16(u64 a, u64 b, u64) {
     }
     return r;
 }
-// FMUL8SUx16 (0x036): the signed upper byte of each lane of rs1;
-// FMUL8ULx16 (0x037): the unsigned lower byte.
+// FMUL8SUx16 (0x036): the signed upper byte of each lane of rs1, the
+// product's upper 16 bits; FMUL8ULx16 (0x037): the unsigned lower byte, the
+// upper 16 bits of the product sign-extended to 32 (so that the two added
+// with FPADD16 make a 16 x 16 multiply).
 template <unsigned Opf>
 u64 fmul8x16_lanes(u64 a, u64 b, u64) {
     u64 r = 0;
     for (unsigned i = 0; i < 4; ++i) {
         const s32 lane = lane16(a, i), y = lane16(b, i);
-        const s32 p = Opf == 0x036 ? ((lane >> 8) * y + 128) >> 8 : ((lane & 0xFF) * y + 128) >> 8;
+        const s32 p = Opf == 0x036 ? ((lane >> 8) * y + 0x80) >> 8 : ((lane & 0xFF) * y + 0x8000) >> 16;
         r = (r << 16) | (static_cast<u32>(p) & 0xFFFF);
     }
     return r;
