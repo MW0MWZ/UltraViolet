@@ -169,6 +169,7 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
     else if (key == "cpu_mhz") ok = parse_number(v, n) && n >= 10 && n <= 2000 && (s.cpu_mhz = n, true);
     else if (key == "ecache_kb") ok = parse_number(v, n) && n == static_cast<unsigned>(n) &&
                                      (s.ecache_kb = static_cast<unsigned>(n), true);
+    else if (key == "upa") ok = (v == "none" || v == "creator3d") && (s.upa = v, true);
     else if (key == "console") ok = (v == "screen" || v == "ttya") && (s.console = v, true);
     else if (key == "keyboard") {
         char* end = nullptr;
@@ -268,7 +269,7 @@ bool save_settings(const std::string& path, const Settings& s, std::string& erro
         f << "prom_dir=" << s.prom_dir << "\nnvram=" << s.nvram << "\ndisk=" << s.disk << "\n";
         for (const auto& c : s.cdroms) f << "cdrom=" << c << "\n";
         f << "ram_mb=" << s.ram_mb << "\ncpu_mhz=" << s.cpu_mhz << "\necache_kb=" << s.ecache_kb
-          << "\nconsole=" << s.console << "\nkeyboard=" << s.keyboard << "\nmac=" << (s.mac ? mac_text(*s.mac) : "")
+          << "\nupa=" << s.upa << "\nconsole=" << s.console << "\nkeyboard=" << s.keyboard << "\nmac=" << (s.mac ? mac_text(*s.mac) : "")
           << "\nnet=" << s.net << "\n";
         for (const auto& fw : s.forwards) f << "hostfwd=" << forward_text(fw) << "\n";
         f << "timing=" << timing_name(s.timing) << "\nblock_cache=" << (s.block_cache ? 1 : 0)

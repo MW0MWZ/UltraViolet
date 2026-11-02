@@ -24,11 +24,12 @@
 #include <vector>
 
 #include "core/scheduler.h"
+#include "devices/display.h"
 #include "devices/pci.h"
 
 namespace uv {
 
-class Mach64 final : public pci::Function {
+class Mach64 final : public pci::Function, public Display {
 public:
     static constexpr u32 kVramSize = 4u << 20;  // 4 MiB, as a real Ultra 10's
 
@@ -57,37 +58,19 @@ public:
         u32 bits = 0, colour[2] = {};
         bool operator==(const Cursor&) const = default;
     };
-    // A picture kept up to date by render(Frame&): each call remakes only
-    // the rows whose frame buffer memory was written since the last, and
-    // those the cursor left or moved onto; everything when the mode, the
-    // palette or the DAC changes. `changed_top` to `changed_bottom`
-    // (exclusive): the rows the last call remade (none if equal).
-    struct Frame {
-        std::vector<u32> pixels;  // width x height of 0x00RRGGBB
-        unsigned width = 0, height = 0;
-        unsigned changed_top = 0, changed_bottom = 0;
-
-    private:
-        friend class Mach64;
-        std::vector<u32> base_;  // the picture without the cursor
-        bool made_ = false, shown_ = false;
-        u64 seen_ = 0;  // display_version() when made
-        Scanout scan_;
-        Cursor cursor_;
-        std::array<std::array<u8, 3>, 256> palette_{};
-    };
-
-    // The picture as the monitor would show it: `width` x `height` pixels of
-    // 0x00RRGGBB (blank while the CRTC or display is off). False if no mode
-    // is set (nothing to show).
-    bool render(Frame& frame) const;
-    bool render(std::vector<u32>& pixels, unsigned& width, unsigned& height) const;
+    // The picture (Display): each call remakes only the rows whose frame
+    // buffer memory was written since the last, and those the cursor left
+    // or moved onto; everything when the mode, the palette or the DAC
+    // changes. Blank while the CRTC or display is off; false if no mode is
+    // set (nothing to show).
+    using Display::render;
+    bool render(Frame& frame) const override;
     // Where the hardware cursor's 64 x 64 image starts on the picture, if
     // it is shown.
-    bool cursor_position(int& x, int& y) const;
+    bool cursor_position(int& x, int& y) const override;
     // Changes with anything that may change the picture (memory, registers,
     // the palette), so a display need not be remade while it stays put.
-    u64 display_version() const { return version_; }
+    u64 display_version() const override { return version_; }
 
 protected:
     bool bar_read(unsigned bar, u32 offset, unsigned size, u64& value) override;
@@ -184,6 +167,15 @@ private:
     }
     Scanout scanout() const;
     Cursor cursor() const;
+    // What a Frame was made from.
+    struct FrameState final : Frame::State {
+        std::vector<u32> base;  // the picture without the cursor
+        bool made = false, shown = false;
+        u64 seen = 0;  // display_version() when made
+        Scanout scan;
+        Cursor cursor;
+        std::array<std::array<u8, 3>, 256> palette{};
+    };
     bool written_since(u32 from, u32 bytes, u64 version) const;
     std::array<u32, 512> regs_{};
     std::array<u8, 64> pll_{};

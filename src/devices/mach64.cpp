@@ -438,26 +438,27 @@ bool Mach64::written_since(u32 from, u32 bytes, u64 version) const {
 }
 
 bool Mach64::render(Frame& f) const {
+    FrameState& st = frame_state<FrameState>(f);
     f.changed_top = f.changed_bottom = 0;
-    if (f.made_ && f.seen_ == version_) return f.shown_;
+    if (st.made && st.seen == version_) return st.shown;
     const Scanout s = scanout();
     const Cursor c = s.extended && !s.blank ? cursor() : Cursor{};
-    const bool all = !f.made_ || !(s == f.scan_) || f.palette_ != palette_;
-    const u64 since = f.seen_;
-    f.made_ = true;
-    f.shown_ = s.extended;
-    f.seen_ = version_;
+    const bool all = !st.made || !(s == st.scan) || st.palette != palette_;
+    const u64 since = st.seen;
+    st.made = true;
+    st.shown = s.extended;
+    st.seen = version_;
     if (!s.extended) {
-        f.scan_ = s;
+        st.scan = s;
         return false;
     }
     const unsigned width = s.width, height = s.height;
     if (all) {
         f.width = width;
         f.height = height;
-        f.base_.assign(static_cast<std::size_t>(width) * height, 0);
-        f.pixels.assign(f.base_.size(), 0);
-        f.palette_ = palette_;
+        st.base.assign(static_cast<std::size_t>(width) * height, 0);
+        f.pixels.assign(st.base.size(), 0);
+        st.palette = palette_;
     }
 
     // The rows to remake: those whose memory was written, and those the
@@ -475,12 +476,12 @@ bool Mach64::render(Frame& f) const {
             if (y >= 0 && y < static_cast<int>(height)) recompose[static_cast<unsigned>(y)] |= mark;
         }
     };
-    if (all || !(c == f.cursor_) || (c.shown && written_since(c.bits, 64 * 16, since))) {
-        cursor_rows(f.cursor_, 2);
+    if (all || !(c == st.cursor) || (c.shown && written_since(c.bits, 64 * 16, since))) {
+        cursor_rows(st.cursor, 2);
         cursor_rows(c, 2);
     }
-    f.cursor_ = c;
-    f.scan_ = s;
+    st.cursor = c;
+    st.scan = s;
 
     // Palette lookups: the DAC's 6-bit entries widened unless it is in
     // 8-bit mode; and for indexed pixels, the colour an index shows
@@ -500,7 +501,7 @@ bool Mach64::render(Frame& f) const {
     auto indexed = [&](unsigned i) { return index_lut[i & 0xFF]; };
     auto rgb = [&](unsigned r, unsigned g, unsigned b) { return lut[0][r] | lut[1][g] | lut[2][b]; };
     auto make_row = [&](unsigned y) {
-        u32* out = &f.base_[static_cast<std::size_t>(y) * width];
+        u32* out = &st.base[static_cast<std::size_t>(y) * width];
         if (s.blank) {
             std::fill(out, out + width, 0);
             return;
@@ -566,22 +567,12 @@ bool Mach64::render(Frame& f) const {
     for (unsigned y = 0; y < height; ++y) {
         if (!recompose[y]) continue;
         if (redo[y]) make_row(y);
-        std::copy_n(&f.base_[static_cast<std::size_t>(y) * width], width, &f.pixels[static_cast<std::size_t>(y) * width]);
+        std::copy_n(&st.base[static_cast<std::size_t>(y) * width], width, &f.pixels[static_cast<std::size_t>(y) * width]);
         draw_cursor(y);
         top = std::min(top, y);
         bottom = y + 1;
     }
     if (top < bottom) f.changed_top = top, f.changed_bottom = bottom;
-    return true;
-}
-
-bool Mach64::render(std::vector<u32>& pixels, unsigned& width, unsigned& height) const {
-    Frame f;
-    const bool shown = render(f);
-    if (!shown) return false;
-    pixels = std::move(f.pixels);
-    width = f.width;
-    height = f.height;
     return true;
 }
 

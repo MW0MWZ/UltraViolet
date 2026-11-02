@@ -30,6 +30,7 @@
 #include "devices/ebus_misc.h"
 #include "devices/fdc82077.h"
 #include "devices/hme.h"
+#include "devices/ffb.h"
 #include "devices/mach64.h"
 #include "devices/sun_keyboard.h"
 #include "devices/m48t59.h"
@@ -100,6 +101,9 @@ public:
         // display, the screen is the console.
         bool keyboard = false;
         u8 keyboard_layout = SunKeyboard::kLayoutUs;
+        // A Creator3D in the UPA slot (Ultra 10), given its FCode PROM's
+        // image (a byte each, as read); none if empty.
+        std::vector<u8> creator3d_fcode;
         // The host clock guest time keeps to (default: the system's), as
         // the pacer takes it.
         Pacer::HostClock host_clock;
@@ -179,6 +183,10 @@ public:
     // progress). Call with the machine stopped.
     std::string describe() const;
     Mach64& graphics() { return mach64_; }
+    Ffb* creator3d() { return ffb_.get(); }
+    // The monitor the window shows: the Creator3D's if one is fitted (the
+    // console OpenBoot chooses), else the on-board graphics'.
+    Display& display() { return ffb_ ? static_cast<Display&>(*ffb_) : mach64_; }
     Cs4231& audio() { return audio_; }
     // Where the audio's playback goes (16-bit stereo frames at a rate).
     void set_audio_sink(Cs4231::AudioSink sink) { audio_.set_audio_sink(std::move(sink)); }
@@ -228,6 +236,7 @@ private:
     Cmd646 ide_;
     Hme hme_;
     Mach64 mach64_;
+    std::unique_ptr<Ffb> ffb_;  // in the UPA slot
     std::unique_ptr<SunKeyboard> keyboard_;
     std::unique_ptr<SunMouse> mouse_;
     // Input from the host, waiting for the emulation thread.

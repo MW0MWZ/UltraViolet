@@ -63,6 +63,8 @@ add_library(uv_emu STATIC
   src/devices/cs4231.cpp
   src/devices/fdc82077.cpp
   src/devices/hme.cpp
+  src/devices/ffb.cpp
+  src/devices/ffb_engine.cpp
   src/devices/mach64.cpp
   src/devices/mach64_engine.cpp
   src/devices/ata.cpp
@@ -70,6 +72,7 @@ add_library(uv_emu STATIC
   src/devices/cmd646.cpp
   src/storage/disk_image.cpp
   src/machine/ultra5_10/ultra5_10.cpp
+  src/net/guest_names.cpp
   src/net/net_backend.cpp
   src/net/slirp_backend.cpp
   src/net/tap_backend.cpp
@@ -241,8 +244,10 @@ if(UV_BUILD_TESTS)
     tests/machine_tests.cpp
     tests/ide_tests.cpp
     tests/hme_tests.cpp
+    tests/net_tests.cpp
     tests/input_tests.cpp
     tests/mach64_tests.cpp
+    tests/ffb_tests.cpp
     tests/jit_tests.cpp
     tests/session_tests.cpp
     tests/audio_tests.cpp

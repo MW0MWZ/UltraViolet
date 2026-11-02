@@ -29,4 +29,9 @@ std::string prom_folder(const Settings& s);
 bool select_prom(const Settings& s, PromImage& out, std::string& error);
 bool read_prom(const PromImage& p, std::vector<u8>& data, std::string& error);
 
+// A Creator3D's FCode PROM image (FFB2+, ffb2p.fth) in the PROM folder:
+// the newest version's contents and the file's path; false, with a message,
+// if there is none.
+bool select_creator3d_fcode(const Settings& s, std::vector<u8>& data, std::string& path, std::string& error);
+
 }  // namespace uv::app

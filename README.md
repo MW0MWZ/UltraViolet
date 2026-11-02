@@ -31,12 +31,16 @@ UltraViolet is at an early stage, but runs real operating systems. In place so f
   keyboard and mouse. OpenBoot finds them as its `disk`,
   `cdrom`, `net`, `screen` and `keyboard`, and takes the screen and
   keyboard as its console, and the network passes OpenBoot's `test net` and
-  gets an address by `boot net:dhcp`.
+  gets an address by `boot net:dhcp`. In the Ultra 10's UPA slot, a
+  Creator3D (FFB2+): with its FCode PROM image in the PROM folder and
+  `--upa creator3d` (or Settings), OpenBoot probes it and takes it as its
+  screen, and Solaris's console runs on it; CDE's picture on it is not yet
+  right.
 - **Guests:** Solaris 8 and Solaris 9 install from their media and run the
   CDE desktop on the Rage Pro, and Solaris 10 its GNOME desktop in 24-bit
-  colour. NetBSD/sparc64 (8.1 and 11.0) and
-  Debian GNU/Linux 9 (sparc64, Linux 4.15) install to disk and boot to a
-  login, with networking.
+  colour. NetBSD/sparc64 (8.1 and 11.0), OpenBSD/sparc64 8.0 and Debian
+  GNU/Linux 9 (sparc64, Linux 4.15) install to disk and boot to a login,
+  with networking; OpenBSD runs X on the Rage Pro with its drawing engine.
 - **UltraSPARC IIi interpreter:** the SPARC V9 integer unit with register
   windows, trap levels and the global register sets, the I- and D-MMU with
   their TLBs and TSB pointers, the internal ASIs, TICK and interrupts, the
@@ -46,7 +50,7 @@ UltraViolet is at an early stage, but runs real operating systems. In place so f
   host pacing, logging, guest memory, the x86-64 and AArch64 code emitters for
   the JIT, and user-mode (libslirp) and TAP networking.
 
-Next come OpenBSD and the rest of the Rage Pro's drawing engine; see
+Next comes the rest of the Rage Pro's drawing engine; see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Building
@@ -163,10 +167,27 @@ ISO image in the CD-ROM drive (given more than once, a set of discs).
 `--help` lists the rest.
 
 The Ethernet is on user-mode networking by default when built with
-libslirp (`--net user`: the guest is 10.0.2.15 behind a NAT, with DHCP and
-DNS; `--hostfwd tcp:2222:22` forwards a host port to it), or on a TAP
-interface (`--net tap:NAME`, Linux), or unplugged (`--net none`). `--mac`
-sets the Ethernet address of a new NVRAM.
+libslirp (`--net user`; `--hostfwd tcp:2222:22` forwards a host port to the
+guest), or on a TAP interface (`--net tap:NAME`, Linux), or unplugged
+(`--net none`). `--mac` sets the Ethernet address of a new NVRAM.
+
+On user-mode networking the guest is behind a NAT, and DHCP gives it:
+
+| | |
+|---|---|
+| Address | 10.0.2.15, netmask 255.255.255.0 |
+| Host name | `UltraViolet` |
+| Domain | `home.arpa` (the domain reserved for local networks) |
+| Gateway | 10.0.2.2 (the host) |
+| DNS server | 10.0.2.3 |
+
+These are fixed: each machine has a NAT of its own, so nothing else on that
+network can clash with them. The DNS server answers the guest's own name, and its address back to that
+name, in any domain: the one DHCP gives, or whatever domain an installer is
+given, so a name-service check during an install succeeds. A name the guest
+asks DHCP for is answered the same way, and so is an address query for no
+name at all, which is how the Solaris installer looks up its own name before
+it has set the one DHCP gave it. Other names go to the host's resolver.
 
 ## Firmware and media
 
