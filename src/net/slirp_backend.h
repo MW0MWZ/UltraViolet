@@ -2,8 +2,9 @@
 // Copyright (C) 2026 Andy Taylor
 // User-mode networking through libslirp: the guest sits behind a NAT on
 // 10.0.2.0/24, where 10.0.2.2 is the host (and gateway) and 10.0.2.3 forwards
-// DNS. Nothing needs privileges; ports on the host can be forwarded to the
-// guest (at 10.0.2.15).
+// DNS (answering the guest's own name itself: net/guest_names.h). DHCP gives
+// the guest the name UltraViolet in the domain home.arpa. Nothing needs
+// privileges; ports on the host can be forwarded to the guest (at 10.0.2.15).
 #pragma once
 
 #include <memory>

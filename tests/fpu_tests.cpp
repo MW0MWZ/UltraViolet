@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andy Taylor
 #include <bit>
+#include <cmath>
+#include <limits>
 
 #include "cpu_rig.h"
 #include "test.h"
@@ -281,4 +283,56 @@ TEST(fpu_block_store_and_load) {
     CHECK_EQ(r.load64(0x3038), 0x8888888888888888ull);
     CHECK_EQ(r.cpu.freg64(dreg(32)), 0x1111111111111111ull);
     CHECK_EQ(r.cpu.freg64(dreg(46)), 0x8888888888888888ull);
+}
+
+TEST(fpu_tininess_is_detected_before_rounding) {
+    constexpr u64 kTemUf = u64{0x04} << 23, kNs = u64{1} << 22, kRoundUp = u64{2} << 30;
+    const float flt_min = std::numeric_limits<float>::min();
+    const double dbl_min = std::numeric_limits<double>::min();
+    // FMULs (exponents adding up to the bias: the IIi finishes it) whose
+    // exact product, 2^-126 (1 - 2^-46), rounds up to the smallest normal:
+    // underflow as well as inexact.
+    Rig r;
+    r.cpu.set_freg32(1, fs(std::ldexp(1.0f + 0x1p-23f, -63)));
+    r.cpu.set_freg32(2, fs(std::ldexp(2.0f - 0x1p-22f, -64)));
+    r.exec({FPOP1(3, 1, 2, 0x049)});
+    CHECK_EQ(r.cpu.freg32(3), fs(flt_min));
+    CHECK_EQ(r.cpu.fsr() & 0x1F, 0x05u);
+    // An exact subnormal product with the underflow trap enabled: trapped.
+    Rig t;
+    t.cpu.set_fsr(kTemUf);
+    t.cpu.set_freg32(1, fs(0x1p-63f));
+    t.cpu.set_freg32(2, fs(0x1.8p-64f));
+    t.cpu.set_freg32(3, fs(42.0f));
+    t.exec({FPOP1(3, 1, 2, 0x049)}, 1);
+    CHECK_EQ(t.cpu.trap_type(1), tt::kFpExceptionIeee754);
+    CHECK_EQ(t.cpu.fsr() & 0x1F, 0x04u);
+    CHECK_EQ(t.cpu.freg32(3), fs(42.0f));
+    // FMULd: 2^-1022 (1 - 2^-104) up to the smallest normal (underflow);
+    // 2^-1022 (1 + 2^-53 - 2^-105) down to it (inexact only).
+    Rig d;
+    d.cpu.set_freg64(dreg(2), fd(std::ldexp(1.0 + 0x1p-52, -511)));
+    d.cpu.set_freg64(dreg(4), fd(std::ldexp(2.0 - 0x1p-51, -512)));
+    d.cpu.set_freg64(dreg(6), fd(std::ldexp(2.0 - 0x1p-52, -511)));
+    d.cpu.set_freg64(dreg(8), fd(std::ldexp(1.0 + 0x1p-52, -512)));
+    d.exec({FPOP1(dreg(10), dreg(2), dreg(4), 0x04A)});
+    CHECK_EQ(d.cpu.freg64(dreg(10)), fd(dbl_min));
+    CHECK_EQ(d.cpu.fsr() & 0x1F, 0x05u);
+    d.exec({FPOP1(dreg(12), dreg(6), dreg(8), 0x04A)});
+    CHECK_EQ(d.cpu.freg64(dreg(12)), fd(dbl_min));
+    CHECK_EQ(d.cpu.fsr() & 0x1F, 0x01u);
+    // Nonstandard mode flushes what was tiny before rounding: FDIVd rounded
+    // up to the smallest normal, FdTOs rounded to it.
+    Rig n;
+    n.cpu.set_fsr(kNs | kRoundUp);
+    n.cpu.set_freg64(dreg(2), fd(std::ldexp(2.0 - 0x1p-51, -1022)));
+    n.cpu.set_freg64(dreg(4), fd(2.0 - 0x1p-52));
+    n.exec({FPOP1(dreg(6), dreg(2), dreg(4), 0x04E)});
+    CHECK_EQ(n.cpu.freg64(dreg(6)), 0u);
+    CHECK_EQ(n.cpu.fsr() & 0x1F, 0x05u);
+    n.cpu.set_fsr(kNs);
+    n.cpu.set_freg64(dreg(8), fd(-static_cast<double>(flt_min) * (1.0 - 0x1p-30)));
+    n.exec({FPOP1(9, 0, dreg(8), 0x0C6)});
+    CHECK_EQ(n.cpu.freg32(9), 0x80000000u);
+    CHECK_EQ(n.cpu.fsr() & 0x1F, 0x05u);
 }

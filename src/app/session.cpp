@@ -103,6 +103,8 @@ bool Session::power_on(std::string& error) {
 
     Ultra5_10::Options o = s.options();
     if (!read_prom(prom, o.prom, error)) return false;
+    std::string fcode_path;
+    if (s.upa == "creator3d" && !select_creator3d_fcode(s, o.creator3d_fcode, fcode_path, error)) return false;
     if (s.net == "user") {
         if (net::slirp_available()) o.network = net::make_slirp_backend(s.forwards, error);
         else if (!s.forwards.empty()) error = "port forwarding needs user-mode networking, which this build lacks";
@@ -125,6 +127,7 @@ bool Session::power_on(std::string& error) {
         return false;
     }
     UV_LOG(Info, "session", "flash PROM: %s (OpenBoot %s)", prom.path.c_str(), prom.version.c_str());
+    if (!fcode_path.empty()) UV_LOG(Info, "session", "Creator3D FCode PROM: %s", fcode_path.c_str());
     machine_->cpu().set_block_cache(s.block_cache);
     machine_->cpu().set_jit(s.jit);
     machine_->cpu().set_idle_skip(s.idle_skip);
@@ -233,7 +236,7 @@ void Session::periodic() {
 bool Session::save_screenshot(const std::string& path) {
     std::vector<u32> pixels;
     unsigned w = 0, h = 0;
-    if (!machine_ || !machine_->graphics().render(pixels, w, h)) return false;
+    if (!machine_ || !machine_->display().render(pixels, w, h)) return false;
     std::ofstream f(path, std::ios::binary);
     f << "P6\n" << w << " " << h << "\n255\n";
     for (u32 p : pixels) {

@@ -27,7 +27,10 @@ struct Settings {
     // graphics, with a Sun keyboard and mouse) or "ttya" (no keyboard: the
     // first serial port).
     std::string console = "screen";
-    std::string keyboard = "us";  // the keyboard's layout: us, uk or a number (the DIP switch value)
+    std::string keyboard = "us";
+    // The Ultra 10's UPA slot: "none", or "creator3d" (a Creator3D, its
+    // FCode PROM image found in the PROM folder; the screen then is its).
+    std::string upa = "none";  // the keyboard's layout: us, uk or a number (the DIP switch value)
     std::optional<std::array<u8, 6>> mac;
     std::string net = "user";  // user | tap:NAME | none
     std::vector<net::PortForward> forwards;

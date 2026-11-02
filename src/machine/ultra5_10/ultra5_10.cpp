@@ -44,6 +44,9 @@ constexpr u32 kEbusNvram = 0x000000, kEbusAudio = 0x200000, kEbusSuperIo = 0x300
 constexpr u32 kEbusAuxio[] = {0x726000, 0x728000, 0x72A000, 0x72C000, 0x72F000};
 constexpr u8 kAuxioValue[] = {0x00, 0xFF, 0x07, 0x01, 0x06};
 
+// UPA port 0x1E's space: the UPA slot.
+constexpr u64 kUpaSlot = 0x1FC00000000;
+
 constexpr double kPciHz = 66.0e6;      // the APB's primary bus clock, which its tick register counts
 constexpr double kSuperIoUartHz = 1843200.0;
 constexpr u32 kSuperIoWindow = 0x10000;  // its chip selects' ISA addresses (0x2000 floppy ... 0x8000 keyboard)
@@ -51,6 +54,8 @@ constexpr u8 kSuperIoSid = 0x90;       // SuperIO identification register value,
 constexpr u8 kMachineType = 0x80;      // IDPROM machine type: sun4u
 constexpr unsigned kNvramIdprom = 0x1FD8;  // the IDPROM in the NVRAM (the configuration below it)
 constexpr unsigned kNvramConfigEnd = 0x1CD8;  // the end of what OpenBoot's checksum covers
+constexpr char kBoardDate[] = "19991101";     // a new board's date of manufacture (a 1999 board, as a real Ultra 10's)
+constexpr u32 kBoardDateBcd = 0x11011999;     // the same, as the IDPROM holds it (MMDDYYYY)
 
 }  // namespace
 
@@ -137,6 +142,12 @@ Ultra5_10::Ultra5_10(const Options& options)
     simba_a_.secondary().attach(1, 1, &hme_);  // the RIO's Ethernet
     simba_a_.secondary().attach(2, 0, &mach64_);  // the on-board graphics
     simba_a_.secondary().attach(3, 0, &ide_);
+
+    // The UPA slot: a graphics card at port 0x1E.
+    if (!opt_.creator3d_fcode.empty()) {
+        ffb_ = std::make_unique<Ffb>(sched_, opt_.cpu_hz, opt_.creator3d_fcode);
+        bus_.map_device(kUpaSlot, Ffb::kSpace, ffb_.get());
+    }
 
     // EBus devices
     ebus_.set_prom(&flash_, static_cast<u32>(std::max<std::size_t>(opt_.prom.size(), 1)));
@@ -271,6 +282,7 @@ void Ultra5_10::reset(bool power_on) {
     fdc_.reset();
     for (EbusDma* d : {&ecpp_dma_, &audio_play_dma_, &audio_rec_dma_, &fd_dma_}) d->reset();
     audio_.reset();
+    if (ffb_) ffb_->reset();
     for (auto& b : blocks_) b->reset();
     cpu_.reset();
 }
@@ -297,8 +309,8 @@ bool Ultra5_10::nvram_blank() const {
 //
 // OpenBoot keeps its variables at fixed places: byte 0 a checksum (0x17
 // XOR every byte from 0x0C to 0x1CD7), byte 1 diag-switch? (0 or 0xFF),
-// byte 2 diag-level (0x20 min, 0x40 max, 0x80 menus), byte 0x0B the
-// power-cycle count; strings as a length, the text and a 0; flags 0 or
+// byte 2 diag-level (0x20 min, 0x40 max, 0x80 menus), bytes 8-0x0B the
+// power-cycle count (#power-cycles, 32 bits); strings as a length, the text and a 0; flags 0 or
 // 0xFF. Above 0x1CD8, outside the checksum, are its own records, which
 // it writes as it boots.
 // DRAM geometry: 16 bytes per column, the bank's columns as its DRAMs have
@@ -382,9 +394,6 @@ void Ultra5_10::write_new_nvram() {
     std::copy(kBootDevice, kBootDevice + sizeof kBootDevice, p + 0x2CB);
     p[1] = 0x00;  // diag-switch? false
     p[2] = 0x20;  // diag-level min
-    u8 sum = 0x17;
-    for (unsigned i = 0x0C; i < kNvramConfigEnd; ++i) sum ^= p[i];
-    p[0] = sum;
 
     std::array<u8, 6> mac{0x08, 0x00, 0x20, 0, 0, 0};
     if (opt_.mac) {
@@ -393,7 +402,25 @@ void Ultra5_10::write_new_nvram() {
         std::random_device rd;
         for (int i = 3; i < 6; ++i) mac[static_cast<std::size_t>(i)] = static_cast<u8>(rd());
     }
-    nvram_.write_idprom(kMachineType, mac.data(), static_cast<u32>(mac[3]) << 16 | static_cast<u32>(mac[4]) << 8 | mac[5]);
+    const u32 serial = static_cast<u32>(mac[3]) << 16 | static_cast<u32>(mac[4]) << 8 | mac[5];
+
+    // What the factory programs and the defaults leave alone, as a real Ultra 10
+    // has them: a power-cycle count from 0 (powerd will not shut an idle
+    // machine down once it is high for the board's age),
+    // system-board-date (YYYYMMDD) and system-board-serial#, at 0x50, and
+    // the same date in the IDPROM.
+    std::fill(p + 0x08, p + 0x0C, u8{0});
+    unsigned at = 0x50;
+    for (const std::string& v : {std::string(kBoardDate), "WSS200#" + std::to_string(10000 + serial % 90000)}) {
+        p[at] = static_cast<u8>(v.size());
+        std::copy(v.begin(), v.end(), p + at + 1);
+        p[at + 1 + v.size()] = 0;
+        at += static_cast<unsigned>(v.size()) + 2;
+    }
+    u8 sum = 0x17;
+    for (unsigned i = 0x0C; i < kNvramConfigEnd; ++i) sum ^= p[i];
+    p[0] = sum;
+    nvram_.write_idprom(kMachineType, mac.data(), kBoardDateBcd, serial);
 }
 
 void Ultra5_10::set_timing(Pacer::Mode mode) {

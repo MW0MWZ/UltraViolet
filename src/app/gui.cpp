@@ -176,7 +176,7 @@ private:
     float density_ = 1.0f;  // pixels per window coordinate (2 on Retina)
     SDL_Texture* texture_ = nullptr;
     unsigned tex_w_ = 0, tex_h_ = 0;
-    Mach64::Frame frame_;  // the picture, remade where it changes
+    Display::Frame frame_;  // the picture, remade where it changes
     u64 shown_version_ = 0;
     bool picture_ = false, picture_stale_ = true;
     SDL_FRect dest_{};  // where the picture is drawn, in window coordinates
@@ -609,7 +609,7 @@ bool Gui::auto_capture(float x, float y) {
     auto* m = session_.machine();
     int cx = 0, cy = 0;
     if (!capture_armed_ || !session_.settings().mouse_auto_capture || !m || !m->keyboard() ||
-        !m->graphics().cursor_position(cx, cy) || !(SDL_GetWindowFlags(window_) & SDL_WINDOW_INPUT_FOCUS) ||
+        !m->display().cursor_position(cx, cy) || !(SDL_GetWindowFlags(window_) & SDL_WINDOW_INPUT_FOCUS) ||
         SDL_GetMouseState(nullptr, nullptr) || ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
         return false;
     capture_at(x, y);
@@ -629,7 +629,7 @@ void Gui::mouse_frame() {
     dx_ -= static_cast<float>(x);
     dy_ -= static_cast<float>(y);
     int cx = 0, cy = 0;
-    const bool cursor = m->graphics().cursor_position(cx, cy) && tex_w_ && tex_h_;
+    const bool cursor = m->display().cursor_position(cx, cy) && tex_w_ && tex_h_;
     if (syncing_) {
         // Moves made meanwhile move the target. Each step waits for the one
         // before to land: the Sun mouse sends at 1200 baud, and the guest
@@ -872,7 +872,7 @@ void Gui::update_picture() {
         picture_ = false;
         return;
     }
-    Mach64& gfx = machine->graphics();
+    Display& gfx = machine->display();
     if (!picture_stale_ && gfx.display_version() == shown_version_) return;
     if (picture_stale_) frame_ = {};  // (another machine: remade whole)
     picture_stale_ = false;
@@ -1409,6 +1409,14 @@ void Gui::draw_settings() {
                     if (ImGui::Selectable((std::to_string(mb) + " MiB").c_str(), edit_.ram_mb == mb)) edit_.ram_mb = mb;
                 ImGui::EndCombo();
             }
+            label("UPA slot");
+            ImGui::SetNextItemWidth(-1);
+            int upa = edit_.upa == "creator3d" ? 1 : 0;
+            if (ImGui::Combo("##upa", &upa, "Empty\0Creator3D (FFB2+, double-buffered)\0"))
+                edit_.upa = upa == 1 ? "creator3d" : "none";
+            ImGui::SetItemTooltip("The Ultra 10's UPA graphics slot. A Creator3D needs its FCode PROM image\n"
+                                  "(ffb2p.fth, read from a real card) in the PROM folder; it is then the\n"
+                                  "screen, and the on-board Rage Pro has no monitor.");
             label("Console");
             ImGui::SetNextItemWidth(-1);
             int con = edit_.console == "ttya" ? 1 : 0;
@@ -1565,6 +1573,19 @@ void Gui::draw_settings() {
                         ImGui::TextUnformatted(text);
                     };
                     const auto lines = [](const char* text) { ImGui::TextDisabled("%s", text); };
+                    heading("What DHCP gives the guest:");
+                    lines("  address     10.0.2.15, netmask 255.255.255.0\n"
+                          "  host name   UltraViolet\n"
+                          "  domain      home.arpa\n"
+                          "  gateway     10.0.2.2 (the host)\n"
+                          "  DNS server  10.0.2.3");
+                    heading("Names:");
+                    lines("  The DNS server answers the guest's own name (UltraViolet,\n"
+                          "  or a name it asks DHCP for) in any domain, and its address\n"
+                          "  back to that name, so an installer's name-service check\n"
+                          "  passes whatever domain it is given (Solaris's installer\n"
+                          "  asks before it has a name: that is answered too). Other\n"
+                          "  names go to the host's resolver.");
                     heading("Solaris, as root (lasts until the next restart):");
                     lines("  ifconfig hme0 plumb\n"
                           "  ifconfig hme0 10.0.2.15 netmask 255.255.255.0 up\n"

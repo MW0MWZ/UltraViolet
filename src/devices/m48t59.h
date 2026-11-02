@@ -56,9 +56,10 @@ public:
     bool save(const std::string& path) const;
     bool dirty() const { return dirty_; }
 
-    // A valid IDPROM (format 1, the machine type, the Ethernet address, a
-    // serial number and the checksum) at 0x1FD8, for an empty NVRAM.
-    void write_idprom(u8 machine_type, const u8 mac[6], u32 serial);
+    // A valid IDPROM (format 1, the machine type, the Ethernet address, the
+    // date of manufacture as BCD MMDDYYYY, a serial number and the checksum)
+    // at 0x1FD8, for an empty NVRAM.
+    void write_idprom(u8 machine_type, const u8 mac[6], u32 date, u32 serial);
 
 private:
     std::time_t now() const;

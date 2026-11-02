@@ -100,4 +100,29 @@ bool read_prom(const PromImage& p, std::vector<u8>& data, std::string& error) {
     return true;
 }
 
+bool select_creator3d_fcode(const Settings& s, std::vector<u8>& data, std::string& path, std::string& error) {
+    const std::string folder = prom_folder(s);
+    static const std::string kName = "SUNW,ffb", kTag = "ffb2p.fth ";
+    std::vector<int> best;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(folder, ec)) {
+        std::vector<u8> d;
+        if (!entry.is_regular_file(ec) || entry.file_size(ec) > (256u << 10) || ec || !read_file(entry.path().string(), d))
+            continue;
+        // An FCode program (its start token first) that names itself SUNW,ffb.
+        if (d.size() < 8 || d[0] < 0xF0 || d[0] > 0xF3 || std::search(d.begin(), d.end(), kName.begin(), kName.end()) == d.end())
+            continue;
+        const auto tag = std::search(d.begin(), d.end(), kTag.begin(), kTag.end());
+        if (tag == d.end()) continue;
+        std::string v;
+        for (auto q = tag + static_cast<std::ptrdiff_t>(kTag.size()); q != d.end() && *q > 0x20 && *q < 0x7F; ++q)
+            v.push_back(static_cast<char>(*q));
+        const std::vector<int> n = version_numbers(v);
+        if (path.empty() || n > best) best = n, path = entry.path().string(), data = std::move(d);
+    }
+    if (!path.empty()) return true;
+    error = "no Creator3D FCode PROM image (ffb2p.fth, read from the card's PROM) in " + folder;
+    return false;
+}
+
 }  // namespace uv::app

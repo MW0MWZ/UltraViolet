@@ -874,13 +874,15 @@ TEST(m48t59_alarm_and_watchdog_raise_their_flags_and_irq) {
 TEST(m48t59_idprom_checksum) {
     M48t59 rtc;
     const u8 mac[6] = {8, 0, 0x20, 1, 2, 3};
-    rtc.write_idprom(0x80, mac, 0x123456);
+    rtc.write_idprom(0x80, mac, 0x05211999, 0x123456);
     const u8* p = rtc.data() + 0x1FD8;
     u8 sum = 0;
     for (int i = 0; i < 16; ++i) sum ^= p[i];
     CHECK_EQ(sum, 0u);
     CHECK_EQ(p[1], 0x80u);
     CHECK_EQ(p[7], 3u);
+    CHECK_EQ(p[8], 0x05u);
+    CHECK_EQ(p[11], 0x99u);
 }
 
 TEST(ns16550_transmits_receives_and_identifies_interrupts) {
@@ -1421,6 +1423,13 @@ TEST(ultra5_10_new_nvram_is_a_sane_starting_point) {
         CHECK(std::equal(p + 0x2CB, p + 0x2CB + 4, "disk"));
         CHECK_EQ(p[0x618 + 2], 8u);  // input-device "keyboard"
         CHECK_EQ(p[0x2CF], 0u);       // (the 0 setenv leaves after it)
+        CHECK(std::all_of(p + 0x08, p + 0x0C, [](u8 b) { return b == 0; }));  // #power-cycles 0
+        // The factory's system-board-date and system-board-serial#.
+        CHECK_EQ(p[0x50], 8u);
+        CHECK(std::equal(p + 0x51, p + 0x51 + 9, "19991101"));
+        CHECK_EQ(p[0x5A], 12u);
+        CHECK(std::equal(p + 0x5B, p + 0x5B + 7, "WSS200#"));
+        CHECK_EQ(p[0x5B + 12], 0u);
         // Where OpenBoot has not written: the pattern a real Ultra 10's holds.
         CHECK_EQ(p[0x004], 0x55u);
         CHECK_EQ(p[0x080], 0xAAu);
@@ -1433,6 +1442,8 @@ TEST(ultra5_10_new_nvram_is_a_sane_starting_point) {
         CHECK_EQ(id[1], 0x80u);
         CHECK_EQ(id[5], 0xABu);
         CHECK_EQ(id[7], 0xEFu);
+        CHECK_EQ(id[8], 0x11u);  // made 11/01/1999
+        CHECK_EQ(id[11], 0x99u);
         CHECK_EQ(id[12], 0xABu);  // serial = the address's last three bytes
         CHECK_EQ(id[14], 0xEFu);
     }

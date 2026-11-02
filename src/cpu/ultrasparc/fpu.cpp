@@ -14,6 +14,7 @@
 #include <cstring>
 #include <limits>
 
+#include "core/int128.h"
 #include "core/log.h"
 #include "cpu/ultrasparc/ultrasparc.h"
 #include "cpu/ultrasparc/vis.h"
@@ -155,6 +156,55 @@ int exact_er(F a, F b, Arith op, const Format& f) {
     return l + f.bias;
 }
 
+// Tininess as the IIi detects it, before rounding (User's Manual 14.3.2):
+// the exact product or quotient nonzero and below the smallest normal
+// number. Hosts differ (x86 detects it after rounding), so it is decided
+// here, exactly, on the operands' significands as integers.
+// (Only a result rounded to the smallest normal number or below can have
+// been tiny.)
+template <typename F>
+bool tiny(F a, F b, F rounded, Arith op) {
+    if (std::fabs(rounded) > std::numeric_limits<F>::min()) return false;
+    if (a == 0 || b == 0 || std::isinf(a) || std::isinf(b)) return false;
+    constexpr int digits = std::numeric_limits<F>::digits;            // |x| = m 2^(e - digits), m an integer
+    constexpr int least = std::numeric_limits<F>::min_exponent - 1;  // the smallest normal number is 2^least
+    int ea, eb;
+    const u64 ma = static_cast<u64>(std::ldexp(std::fabs(std::frexp(a, &ea)), digits));
+    const u64 mb = static_cast<u64>(std::ldexp(std::fabs(std::frexp(b, &eb)), digits));
+    u64 hi, lo;
+    if (op == Arith::Mul) {
+        const int n = least - (ea - digits) - (eb - digits);  // tiny: ma mb < 2^n
+        if (n <= 0) return false;
+        if (n >= 128) return true;
+        mul_u64(ma, mb, hi, lo);
+        return n >= 64 ? hi < (u64{1} << (n - 64)) : hi == 0 && lo < (u64{1} << n);
+    }
+    const int k = least - ea + eb;  // tiny: ma < mb 2^k
+    if (k >= 64) return true;
+    if (k <= -64) return false;
+    if (k >= 0) {
+        mul_u64(mb, u64{1} << k, hi, lo);
+        return hi != 0 || ma < lo;
+    }
+    mul_u64(ma, u64{1} << -k, hi, lo);
+    return hi == 0 && lo < mb;
+}
+
+// Underflow for a result whose tininess is known: with FSR.NS set a tiny
+// result is flushed to zero (true), with underflow and inexact; otherwise
+// underflow when its trap is enabled (a tiny result, exact or not, is
+// trapped) or the result is inexact.
+bool settle_underflow(bool tiny, bool ns, unsigned tem, unsigned& exc) {
+    exc &= ~kUf;
+    if (!tiny) return false;
+    if (ns) {
+        exc |= kUf | kNx;
+        return true;
+    }
+    if ((tem & kUf) || (exc & kNx)) exc |= kUf;
+    return false;
+}
+
 // Conversions to integers round toward zero. NaN and out-of-range values
 // are invalid and give the largest integer of the value's sign.
 template <typename I, typename F>
@@ -200,8 +250,7 @@ void UltraSparc::fp_unfinished() {
 
 bool UltraSparc::fp_finish(unsigned cexc) {
     const unsigned tem = static_cast<unsigned>(fsr_ >> kFsrTemShift) & 0x1F;
-    // Underflow is signalled for an inexact tiny result, as the host
-    // reports it.
+    // (Underflow is already settled: tininess before rounding.)
     if (cexc & tem) {
         // Of the exceptions raised, only the trapping ones are reported:
         // overflow or underflow with inexact report just the former.
@@ -293,7 +342,12 @@ void UltraSparc::fpop1(u32 insn) {
             HostFp h(rnd);
             const float v = opaque(op(opaque(f32(a)), opaque(f32(b))));
             exc |= h.exceptions();
-            r = std::isnan(v) ? kDefaultNan32 : ns_out32(bits(v), ns, exc);
+            if (std::isnan(v))
+                r = kDefaultNan32;
+            else if (kind == Arith::Add)
+                r = ns_out32(bits(v), ns, exc);  // (a sum in the subnormal range is exact)
+            else
+                r = settle_underflow(tiny(f32(a), f32(b), v, kind), ns, tem, exc) ? bits(v) & 0x80000000u : bits(v);
         }
         if (fp_finish(exc)) set_f32(rd, r);
     };
@@ -317,7 +371,14 @@ void UltraSparc::fpop1(u32 insn) {
             HostFp h(rnd);
             const double v = opaque(op(opaque(f64(a)), opaque(f64(b))));
             exc |= h.exceptions();
-            r = std::isnan(v) ? kDefaultNan64 : ns_out64(bits(v), ns, exc);
+            if (std::isnan(v))
+                r = kDefaultNan64;
+            else if (kind == Arith::Add)
+                r = ns_out64(bits(v), ns, exc);
+            else
+                r = settle_underflow(tiny(f64(a), f64(b), v, kind), ns, tem, exc)
+                        ? bits(v) & 0x8000000000000000ull
+                        : bits(v);
         }
         if (fp_finish(exc)) set_f64(rd, r);
     };
@@ -462,9 +523,13 @@ void UltraSparc::fpop1(u32 insn) {
                 r = static_cast<u32>((b >> 32) & 0x80000000u) | 0x7FC00000u | static_cast<u32>((b >> 29) & 0x003FFFFFu);
             } else {
                 HostFp h(rnd);
-                const float v = opaque(static_cast<float>(opaque(f64(b))));
+                const double d = f64(b);
+                const float v = opaque(static_cast<float>(opaque(d)));
                 exc |= h.exceptions();
-                r = ns_out32(bits(v), ns, exc);
+                const bool below = d != 0 && std::fabs(d) < std::numeric_limits<float>::min();
+                r = settle_underflow(below, ns, static_cast<unsigned>(fsr_ >> kFsrTemShift) & 0x1F, exc)
+                        ? bits(v) & 0x80000000u
+                        : bits(v);
             }
             if (fp_finish(exc)) set_f32(rd, r);
             return;

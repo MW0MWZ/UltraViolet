@@ -276,12 +276,12 @@ bool M48t59::write(u64 offset, unsigned size, u64 value) {
     return true;
 }
 
-void M48t59::write_idprom(u8 machine_type, const u8 mac[6], u32 serial) {
+void M48t59::write_idprom(u8 machine_type, const u8 mac[6], u32 date, u32 serial) {
     u8* p = mem_.data() + kIdprom;
     p[0] = 0x01;  // format
     p[1] = machine_type;
     for (int i = 0; i < 6; ++i) p[2 + i] = mac[i];
-    p[8] = p[9] = p[10] = p[11] = 0;  // manufacturing date
+    for (int i = 0; i < 4; ++i) p[8 + i] = static_cast<u8>(date >> (24 - 8 * i));
     p[12] = static_cast<u8>(serial >> 16);
     p[13] = static_cast<u8>(serial >> 8);
     p[14] = static_cast<u8>(serial);

@@ -26,6 +26,8 @@
 #include <thread>
 #include <type_traits>
 
+#include "net/guest_names.h"
+
 // libslirp 4.9 replaced the descriptor-based polling interface with a
 // socket-based one (SlirpConfig version 6); older releases only have the
 // former. On Unix both take plain file descriptors.
@@ -41,6 +43,11 @@
 namespace uv::net {
 
 namespace {
+
+// The guest's name and domain from DHCP: the domain reserved for local
+// networks such as this one (RFC 8375).
+constexpr const char* kGuestName = "UltraViolet";
+constexpr const char* kDomain = "home.arpa";
 
 // What libslirp's polling hands over, and the loop's own wake-up channel: a
 // pipe on Unix, a connected pair of loopback UDP sockets on Windows (whose
@@ -80,7 +87,8 @@ public:
         inet_pton(AF_INET, "10.0.2.2", &cfg.vhost);
         inet_pton(AF_INET, "10.0.2.15", &cfg.vdhcp_start);
         inet_pton(AF_INET, "10.0.2.3", &cfg.vnameserver);
-        cfg.vhostname = "UltraViolet";  // the name DHCP gives the guest
+        cfg.vhostname = kGuestName;  // the name DHCP gives the guest
+        cfg.vdomainname = kDomain;   // and its domain
         // Filled in place, once: what is not set stays null (including, with
         // libslirp 4.9, the deprecated descriptor callbacks, which a copy of
         // the struct would touch).
@@ -153,6 +161,10 @@ public:
     }
 
     void send(const u8* frame, std::size_t length) override {
+        if (names_.answer(frame, length, reply_)) {  // the guest's own name, in any domain
+            deliver(reply_.data(), reply_.size());
+            return;
+        }
         {
             std::lock_guard<std::mutex> lock(mutex_);
             slirp_input(slirp_, frame, static_cast<int>(length));
@@ -294,6 +306,8 @@ private:
         return this;
     }
 
+    GuestNames names_{kGuestName, kDomain, 0x0A000203};  // (DNS at 10.0.2.3)
+    std::vector<u8> reply_;
     Slirp* slirp_ = nullptr;
     std::mutex mutex_;
     std::vector<pollfd>* fds_ = nullptr;
