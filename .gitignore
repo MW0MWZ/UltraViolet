@@ -3,7 +3,8 @@ build*/
 compile_commands.json
 *.o
 # User-supplied firmware, media and disk images are never committed
-roms/
+roms/*
+!roms/README.md
 iso/
 disks/
 *.bin

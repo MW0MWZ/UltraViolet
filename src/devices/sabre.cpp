@@ -44,6 +44,10 @@ constexpr u64 kMcuF008Value = 0x4242424200001232ull;
 constexpr u64 kUpaPortIdValue = 0x8E10002000000000ull;
 
 constexpr u64 kImapValid = 0x80000000ull, kImapTid = 0x7C000000ull;
+// The graphics and UPA64S expansion maps (full maps): the whole interrupt
+// number is software's.
+constexpr u32 kGfxImap = 0x1098, kUpaImap = 0x10A0;
+constexpr u64 kImapInr = 0x7FFull;
 constexpr unsigned kStateIdle = 0, kStatePending = 3;
 
 // Reset control
@@ -158,7 +162,8 @@ void Sabre::reset(bool power_on) {
     // read with no interrupt number, and the graphics and UPA expansion maps
     // (0x1098, 0x10A0) read 0.
     for (unsigned i = 0x11; i <= 0x19; ++i) obio_imap_[i] = u64{kIgn} << 6;
-    obio_imap_[(0x1098 - kObioImap) >> 3] = obio_imap_[(0x10A0 - kObioImap) >> 3] = 0;
+    obio_imap_[(kGfxImap - kObioImap) >> 3] = obio_imap_[(kUpaImap - kObioImap) >> 3] = 0;
+    pulse_.fill(false);
     state_.fill(kStateIdle);
     iommu_ctl_ = iommu_tsb_ = 0;
     pci_ctl_ = pci_afsr_ = pci_afar_ = pci_diag_ = pci_tasr_ = 0;
@@ -196,6 +201,27 @@ void Sabre::dispatch(unsigned ino) {
 void Sabre::dispatch_all() {
     for (unsigned ino = 0; ino < kNumIno; ++ino)
         if (level_[ino]) dispatch(ino);
+    for (unsigned i = 0; i < 2; ++i)
+        if (pulse_[i]) dispatch_pulse(i);
+}
+
+void Sabre::pulse_upa_interrupt(unsigned which) {
+    if (which > 1 || pulse_[which]) return;
+    if (!(obio_imap_[((which ? kUpaImap : kGfxImap) - kObioImap) >> 3] & kImapValid)) return;
+    pulse_[which] = true;
+    dispatch_pulse(which);
+}
+
+// A pulse is sent with its map's interrupt number and then forgotten: it
+// has no clear register.
+void Sabre::dispatch_pulse(unsigned which) {
+    const u64 map = obio_imap_[((which ? kUpaImap : kGfxImap) - kObioImap) >> 3];
+    if (!(map & kImapValid)) return;
+    if (send_vector_ && send_vector_(map & kImapInr)) {
+        pulse_[which] = false;
+    } else if (!retry_timer_.active()) {
+        retry_timer_.schedule_in(kRetryCycles);
+    }
 }
 
 u64 Sabre::reg(u32 o) const {
@@ -221,8 +247,8 @@ u64 Sabre::reg(u32 o) const {
     }
     if (o >= kPciImap && o < kPciImap + 0x40) return pci_imap_[(o - kPciImap) >> 3];
     if (o >= kObioImap && o < kObioImap + 0x100) return obio_imap_[((o - kObioImap) >> 3) & 31];
-    if (o == kGfxImapAlias) return obio_imap_[(0x1098 - kObioImap) >> 3];
-    if (o == kUpaImapAlias) return obio_imap_[(0x10A0 - kObioImap) >> 3];
+    if (o == kGfxImapAlias) return obio_imap_[(kGfxImap - kObioImap) >> 3];
+    if (o == kUpaImapAlias) return obio_imap_[(kUpaImap - kObioImap) >> 3];
     if (o >= kPciIclr && o < kPciIclr + 0x100) return state_[((o - kPciIclr) >> 3) & 0x1F];
     if (o >= kObioIclr && o < kObioIclr + 0x100) return state_[0x20 + (((o - kObioIclr) >> 3) & 0x1F)];
     if (o == kReservedAt1A00 || (o >= kReservedTimers && o < kReservedTimers + 0x20)) return kReservedValue;
@@ -300,11 +326,10 @@ bool Sabre::regs_write(u64 offset, unsigned size, u64 value) {
         return true;
     }
     if ((o >= kObioImap && o < kObioImap + 0x100) || o == kGfxImapAlias || o == kUpaImapAlias) {
-        const unsigned i = o == kGfxImapAlias ? (0x1098 - kObioImap) >> 3
-                         : o == kUpaImapAlias ? (0x10A0 - kObioImap) >> 3
-                                              : ((o - kObioImap) >> 3) & 31;
-        u64& m = obio_imap_[i];
-        m = (m & ~(kImapValid | kImapTid)) | (v & (kImapValid | kImapTid));
+        const u32 at = o == kGfxImapAlias ? kGfxImap : o == kUpaImapAlias ? kUpaImap : o;
+        const u64 writable = kImapValid | kImapTid | (at == kGfxImap || at == kUpaImap ? kImapInr : 0);
+        u64& m = obio_imap_[((at - kObioImap) >> 3) & 31];
+        m = (m & ~writable) | (v & writable);
         dispatch_all();
         return true;
     }

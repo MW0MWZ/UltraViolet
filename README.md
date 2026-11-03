@@ -10,48 +10,48 @@ An open-source emulator for Sun **UltraSPARC** workstations, starting with the
 memory controller and PCI host bridge, the PCI I/O chipset, onboard ATI Rage
 graphics and, on the Ultra 10, the UPA slot. The aim is to run the original
 OpenBoot PROM and Solaris unmodified, at or above the speed of the real
-machine, with a just-in-time compiler for the UltraSPARC IIi. Linux is the
-primary host; macOS and Windows builds are planned from the start.
+machine, with a just-in-time compiler for the UltraSPARC IIi. It runs on
+Linux, macOS and Windows.
 
 ## Status
 
-UltraViolet is at an early stage, but runs real operating systems. In place so far:
+UltraViolet runs the original OpenBoot PROM and real operating systems,
+installed from their own media.
 
-- **Ultra 5/10 machine:** the original OpenBoot PROM (3.31) runs its power-on
-  sequence to the `ok` prompt on the serial console (ttya): it probes memory
-  and the PCI buses, finds no keyboard or screen and uses ttya, prints its
-  banner and answers commands. Modelled so far: the UltraSPARC IIi's PCI bus
-  module (Sabre) with its IOMMU and interrupt mapping, the Advanced PCI
-  Bridge (Simba), the PCIO EBus with the flash PROM, the M48T59 NVRAM and
-  clock, the SuperIO's keyboard and mouse UARTs and floppy controller, the
-  SAB82532 serial ports, the CMD646 IDE controller with an ATA disk and
-  an ATAPI CD-ROM drive (bus-master DMA included), the on-board Happy
-  Meal Ethernet with its PHY, the on-board ATI Rage Pro graphics, the
-  CS4231 audio codec, the front-panel power button, and a Sun Type 5
-  keyboard and mouse. OpenBoot finds them as its `disk`,
-  `cdrom`, `net`, `screen` and `keyboard`, and takes the screen and
-  keyboard as its console, and the network passes OpenBoot's `test net` and
-  gets an address by `boot net:dhcp`. In the Ultra 10's UPA slot, a
-  Creator3D (FFB2+): with its FCode PROM image in the PROM folder and
-  `--upa creator3d` (or Settings), OpenBoot probes it and takes it as its
-  screen, and Solaris's console runs on it; CDE's picture on it is not yet
-  right.
-- **Guests:** Solaris 8 and Solaris 9 install from their media and run the
-  CDE desktop on the Rage Pro, and Solaris 10 its GNOME desktop in 24-bit
-  colour. NetBSD/sparc64 (8.1 and 11.0), OpenBSD/sparc64 8.0 and Debian
-  GNU/Linux 9 (sparc64, Linux 4.15) install to disk and boot to a login,
-  with networking; OpenBSD runs X on the Rage Pro with its drawing engine.
-- **UltraSPARC IIi interpreter:** the SPARC V9 integer unit with register
-  windows, trap levels and the global register sets, the I- and D-MMU with
-  their TLBs and TSB pointers, the internal ASIs, TICK and interrupts, the
-  floating-point unit and VIS 1.0, and a disassembler; decoded blocks are
-  cached, and blocks run often are recompiled to x86-64 or AArch64 code.
-- **Foundations:** the 41-bit physical address space, the event scheduler and
-  host pacing, logging, guest memory, the x86-64 and AArch64 code emitters for
-  the JIT, and user-mode (libslirp) and TAP networking.
+- **Machine:** OpenBoot 3.31 runs its power-on sequence and boots from
+  disk, CD-ROM or the network, with the screen and keyboard or the serial
+  port (ttya) as its console. Modelled: the UltraSPARC IIi's PCI bus module
+  (Sabre) with its IOMMU and interrupt mapping, the Advanced PCI Bridge
+  (Simba), the PCIO EBus with the flash PROM, the M48T59 NVRAM and clock,
+  the SuperIO's keyboard and mouse UARTs and floppy controller, the
+  SAB82532 serial ports, the CMD646 IDE controller with ATA disks and an
+  ATAPI CD-ROM drive, the on-board Happy Meal Ethernet, the on-board ATI
+  Rage Pro graphics with its drawing engine, the CS4231 audio codec, the
+  front-panel power button, and a Sun Type 5 keyboard and mouse.
+- **Creator3D:** a Creator3D (FFB2+) in the Ultra 10's UPA slot, with the
+  card's PROM image (see [roms/README.md](roms/README.md)): OpenBoot takes it
+  as its screen, with the card's own banner logo; Solaris 8 and 9 run the
+  CDE desktop on it and Solaris 10 its GNOME desktop, and NetBSD, OpenBSD
+  and Linux their consoles. Its 2D drawing, window lookups, overlay and
+  vertical retrace interrupt are modelled; its 3D operations are not yet.
+- **Guests:** Solaris 8, 9 and 10 install from their media; Solaris 8 and 9
+  run the CDE desktop on the Rage Pro, and Solaris 10 its GNOME desktop in
+  24-bit colour. NetBSD/sparc64 (8.1 and 11.0), OpenBSD/sparc64 8.0 and
+  Debian GNU/Linux 9 (sparc64, Linux 4.15) install to disk and boot to a
+  login, with networking; OpenBSD runs X on the Rage Pro.
+- **Processor:** the SPARC V9 integer unit with register windows, trap
+  levels and the global register sets, the I- and D-MMU with their TLBs and
+  TSB pointers, the internal ASIs, TICK and interrupts, the floating-point
+  unit and VIS 1.0; decoded blocks are cached, and blocks run often are
+  compiled to x86-64 or AArch64 code. Guest time keeps to the wall clock.
+- **Front end:** a window with the machine's screen, its keyboard, mouse and
+  sound on the host, menus and settings, and terminal windows for the serial
+  ports; or headless, with ttya on the terminal. It builds on Linux, macOS
+  and Windows.
 
-Next comes the rest of the Rage Pro's drawing engine; see
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Not done yet: the Creator3D's 3D operations, audio capture, audio CDs,
+and the Blade 100/150 and Blade 1000/2000 machines. See
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it is put together.
 
 ## Building
 
@@ -191,11 +191,12 @@ it has set the one DHCP gave it. Other names go to the host's resolver.
 
 ## Firmware and media
 
-UltraViolet will need an OpenBoot PROM image from a real Ultra 5/10, and
-Solaris (or another sparc64 operating system) media. Neither is included:
-they are not part of this project and must come from your own machines and
-media. The `roms/`, `iso/` and `disks/` folders are ignored by git for that
-purpose.
+UltraViolet runs the Ultra 5/10's own OpenBoot PROM, and for a Creator3D
+the card's own FCode PROM, with Solaris (or another sparc64 operating
+system) from its media. None of these is included: [roms/README.md](roms/README.md)
+says which images it expects, where they come from, and how to make them
+from the original Sun files with the `sunrom` tool. The `roms/`, `iso/` and
+`disks/` folders are ignored by git (but for that page).
 
 ## Legal
 
