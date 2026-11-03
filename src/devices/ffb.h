@@ -36,6 +36,7 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -56,6 +57,8 @@ public:
     Ffb(Scheduler& scheduler, double cpu_hz, std::vector<u8> fcode);
     const char* name() const override { return "ffb"; }
     void reset();
+    // The card's interrupt: a pulse to the UPA slot's interrupt line.
+    void set_interrupt_sink(std::function<void()> pulse) { on_interrupt_ = std::move(pulse); }
 
     bool read(u64 offset, unsigned size, u64& value) override;
     bool write(u64 offset, unsigned size, u64 value) override;
@@ -88,11 +91,13 @@ private:
     // the raster processor or a smart view writes; and the operations.
     void draw_pixel(unsigned x, unsigned y, u32 colour, bool background = false);
     void smart_write(unsigned x, unsigned y, u32 value, u32 lanes);
-    u32 read_pixel(unsigned x, unsigned y) const;
+    void smart_view_write(unsigned x, unsigned y, u32 value, u32 lanes);  // through the smart 32-bit view
     void start_drawop(u32 reg);  // the operation's last register (bw or bx) written
     void line(int x0, int y0, int x1, int y1, bool last);
     void fast_fill(u32 reg);
-    void rectangle(int x, int y, int w, int h);
+    void polygon_vertex(u32 reg);  // a polygon's vertex written (its x register)
+    void polygon();
+    void rectangle(int x, int y, int w, int h, u32 colour);
     void vscroll(int sx, int sy, int dx, int dy, int w, int h);
     void font_row(u32 bits);
     bool clipped(int x, int y) const;
@@ -107,6 +112,9 @@ private:
     };
     Timing timing() const;
     unsigned current_line() const;
+    void schedule_retrace();
+    void retrace();
+    void window_transfer();
 
     // Rows [y0, y1) of frame buffer memory written; a change to what
     // every pixel is shown through (the DAC).
@@ -135,7 +143,13 @@ private:
     // (0x10000-0x11FFF), as words.
     std::vector<u32> regs_, kregs_;
     u32 ucsr_ = 0;
+    u32 interrupts_ = 0;  // the FBC's interrupt register
+    bool transfer_pending_ = false;  // a window transfer waiting for the vertical blank
+    Timer retrace_timer_;
+    std::function<void()> on_interrupt_;
     u32 engine_warned_ = 0;
+    u32 fast_fill_colour_ = 0;  // the colour block's colour
+    std::vector<std::pair<int, int>> polygon_;  // the polygon's vertices so far (x, y)
 
     // DAC: configuration pointer and registers; the cursor's.
     u32 dac_ptr_ = 0, cur_ptr_ = 0;
@@ -161,6 +175,8 @@ private:
         bool cursor = false;
     };
     std::map<std::pair<u32, u32>, unsigned> debug_ops_;  // (fbc, ppc) of drawing, for describe()
+    u64 debug_retraces_ = 0;                             // vertical retrace interrupts raised, for describe()
+    std::map<u32, unsigned> debug_dac_reads_;            // DAC addresses read (the cursor's + 0x10000), for describe()
     u64 cursor_version_ = 0;
     u64 dac_version_ = 0;  // changes to what the picture is made through
 };

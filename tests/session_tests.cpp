@@ -8,6 +8,7 @@
 #include <thread>
 #include <vector>
 
+#include "app/proms.h"
 #include "app/session.h"
 #include "core/endian.h"
 #include "test.h"
@@ -125,4 +126,27 @@ TEST(session_hold_is_had_while_the_machine_waits_for_the_wall_clock) {
         CHECK(took < std::chrono::milliseconds(20));
         wait_ms(3);
     }
+}
+
+TEST(creator3d_prom_prefers_the_whole_prom_to_its_fcode_alone) {
+    // Two images of FCode 2.9: the FCode program as read, and the whole PROM
+    // (the same program, then the card's logo): the whole one is taken.
+    const auto dir = std::filesystem::temp_directory_path() / "uv_ffb_prom_tests";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const std::string body = "SUNW,ffb @(#)ffb2p.fth 2.9 98/07/14 ";
+    std::vector<u8> fcode = {0xF3, 0x03, 0xC7, 0x71};
+    fcode.insert(fcode.end(), body.begin(), body.end());
+    std::vector<u8> whole = fcode;
+    whole.resize(0x10000, 0xFF);
+    for (auto [name, image] : {std::pair{"a-fcode.bin", fcode}, std::pair{"b-prom.bin", whole}})
+        std::ofstream(dir / name, std::ios::binary).write(reinterpret_cast<const char*>(image.data()),
+                                                          static_cast<std::streamsize>(image.size()));
+    app::Settings s;
+    s.prom_dir = dir.string();
+    std::vector<u8> data;
+    std::string path, error;
+    CHECK(app::select_creator3d_fcode(s, data, path, error));
+    CHECK_EQ(data.size(), 0x10000u);
+    std::filesystem::remove_all(dir);
 }

@@ -147,6 +147,7 @@ Ultra5_10::Ultra5_10(const Options& options)
     if (!opt_.creator3d_fcode.empty()) {
         ffb_ = std::make_unique<Ffb>(sched_, opt_.cpu_hz, opt_.creator3d_fcode);
         bus_.map_device(kUpaSlot, Ffb::kSpace, ffb_.get());
+        ffb_->set_interrupt_sink([this] { sabre_.pulse_upa_interrupt(0); });
     }
 
     // EBus devices

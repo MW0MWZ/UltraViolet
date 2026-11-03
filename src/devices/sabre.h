@@ -50,6 +50,8 @@ public:
     // Interrupt input `ino` (0x00-0x1F: PCI slots, slot << 2 | INTx; 0x20 and
     // up: on-board devices) at level `asserted`.
     void set_interrupt(unsigned ino, bool asserted);
+    // A pulse on the graphics (0) or UPA64S expansion (1) interrupt.
+    void pulse_upa_interrupt(unsigned which);
     // Interrupt sources asserted or not idle, for a diagnostic report.
     void describe(std::string& out) const;
 
@@ -93,6 +95,7 @@ private:
     u64& imap(unsigned ino);
     void dispatch(unsigned ino);
     void dispatch_all();
+    void dispatch_pulse(unsigned which);
 
     Bus& bus_;
     std::function<bool(u64)> send_vector_;
@@ -105,6 +108,7 @@ private:
     std::array<u64, 32> obio_imap_{};       // INO 0x20 + n
     std::array<u8, kNumIno> state_{};       // clear register state: 0 idle, 1 received, 3 pending
     std::array<bool, kNumIno> level_{};
+    std::array<bool, 2> pulse_{};           // the graphics and expansion pulses, not yet sent
     Timer retry_timer_;
     u64 iommu_ctl_ = 0, iommu_tsb_ = 0;
     u64 pci_ctl_ = 0, pci_afsr_ = 0, pci_afar_ = 0, pci_diag_ = 0, pci_tasr_ = 0;

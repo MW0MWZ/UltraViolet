@@ -562,6 +562,26 @@ TEST(sabre_maps_interrupts_to_vectors_and_holds_them_until_cleared) {
     CHECK_EQ(m.sabre().reg(0x1858), 0u);
 }
 
+TEST(sabre_graphics_interrupt_is_a_pulse_with_softwares_interrupt_number) {
+    {
+        // Not mapped: a pulse is lost (the receive register stays free).
+        Ultra5_10 u(small_options());
+        u.sabre().pulse_upa_interrupt(0);
+        CHECK(u.cpu().deliver_interrupt_vector(0, 0, 0));
+    }
+    Ultra5_10 m(small_options());
+    auto& cpu = m.cpu();
+    cpu.set_pstate(usparc::pstate::PRIV);
+    // The full map takes the whole interrupt number (as Solaris writes it
+    // for a Creator3D), through either address; a partial map keeps its own.
+    m.bus().write(Sabre::kRegsBase + 0x6000, u64{0x800007B3ull});
+    CHECK_EQ(m.sabre().reg(0x1098), 0x800007B3ull);
+    m.bus().write(Sabre::kRegsBase + 0x1058, u64{0x800007FFull});
+    CHECK_EQ(m.sabre().reg(0x1058) & 0x7FF, 0x7EBull);
+    m.sabre().pulse_upa_interrupt(0);
+    CHECK(!cpu.deliver_interrupt_vector(0, 0, 0));  // busy with the pulse's vector
+}
+
 TEST(machine_ebus_audio_auxio_and_power_button_answer_where_openboot_puts_them) {
     Ultra5_10 m(small_options());
     constexpr u64 ebus = 0x1FFF1000000ull;  // EBus BAR1 at power-on

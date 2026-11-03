@@ -118,7 +118,10 @@ bool select_creator3d_fcode(const Settings& s, std::vector<u8>& data, std::strin
         for (auto q = tag + static_cast<std::ptrdiff_t>(kTag.size()); q != d.end() && *q > 0x20 && *q < 0x7F; ++q)
             v.push_back(static_cast<char>(*q));
         const std::vector<int> n = version_numbers(v);
-        if (path.empty() || n > best) best = n, path = entry.path().string(), data = std::move(d);
+        // The newest version; of the same version, the longer image (a whole
+        // PROM, which also holds the card's own logo, over its FCode alone).
+        if (path.empty() || n > best || (n == best && d.size() > data.size()))
+            best = n, path = entry.path().string(), data = std::move(d);
     }
     if (!path.empty()) return true;
     error = "no Creator3D FCode PROM image (ffb2p.fth, read from the card's PROM) in " + folder;
