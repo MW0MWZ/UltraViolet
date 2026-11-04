@@ -105,6 +105,7 @@ public:
         return emit_site(0x36000000u | ((bit >> 5) << 31) | ((bit & 31) << 19) | r, Fix::B14);
     }
     void b_to(std::size_t target) { bind_to(b(), target); }
+    void bl_to(std::size_t target) { bind_to(emit_site(0x94000000u, Fix::B26), target); }  // (x30 = the return address)
     // A branch (or BL, with the return address in x30) to `target`, this
     // code being placed at `base` (within 128 MiB).
     void b_abs(const u8* target, const u8* base) {

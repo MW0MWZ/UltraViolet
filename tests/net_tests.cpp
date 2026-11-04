@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andy Taylor
 // The user-mode network's own names: the guest's name answered in any
-// domain, its address answered back, a name asked of DHCP learnt, and
-// every other query left for the host's resolver.
+// domain, its address answered back, a name asked of DHCP learnt, DHCP's
+// domain answered for, and every other query left for the host's resolver.
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -162,6 +162,43 @@ TEST(guest_names_learns_the_name_asked_of_dhcp) {
     CHECK(names.answer(ptr.data(), ptr.size(), r));
     CHECK_EQ(answer_data(r)[0], 8u);  // "sparcbox"
     CHECK_EQ(answer_data(r)[1], u8{'s'});
+}
+
+TEST(guest_names_answers_for_dhcps_domain_itself) {
+    // Solaris's installer looks up localhost in its domain, and the host's
+    // resolver must not be needed for that (nor be waited for).
+    net::GuestNames names("UltraViolet", "home.arpa", kDns);
+    std::vector<u8> r;
+    for (const char* name : {"localhost.home.arpa", "LOCALHOST.Home.Arpa", "localhost"}) {
+        const auto a = query(name, 1);
+        CHECK(names.answer(a.data(), a.size(), r));
+        CHECK_EQ(be16(r, 44), 0x8580u);
+        CHECK((answer_data(r) == std::vector<u8>{127, 0, 0, 1}));
+    }
+    const auto ptr = query("1.0.0.127.in-addr.arpa", 12);
+    CHECK(names.answer(ptr.data(), ptr.size(), r));
+    CHECK((answer_data(r) == std::vector<u8>{9, 'l', 'o', 'c', 'a', 'l', 'h', 'o', 's', 't', 0}));
+    // Any other name in it: no such name, at once, whatever the type.
+    for (const auto& f : {query("loghost.home.arpa", 1), query("www.sun.com.home.arpa", 28),
+                          query("mailhost.home.arpa", 15), query("localhost.lab.home.arpa", 1)}) {
+        CHECK(names.answer(f.data(), f.size(), r));
+        CHECK_EQ(be16(r, 44), 0x8583u);
+        CHECK_EQ(be16(r, 48), 0u);
+    }
+    // The domain itself is there, with no records.
+    const auto soa = query("home.arpa", 6);
+    CHECK(names.answer(soa.data(), soa.size(), r));
+    CHECK_EQ(be16(r, 44), 0x8580u);
+    CHECK_EQ(be16(r, 48), 0u);
+    // Other domains, localhost in them included, are the resolver's; and with
+    // no domain from DHCP, nothing but the guest's names and localhost is ours.
+    for (const auto& f : {query("arpa", 2), query("localhost.example.com", 1), query("home.arpa.example.com", 1)})
+        CHECK(!names.answer(f.data(), f.size(), r));
+    net::GuestNames bare("UltraViolet", "", kDns);
+    const auto other = query("loghost.home.arpa", 1);
+    CHECK(!bare.answer(other.data(), other.size(), r));
+    const auto lo = query("localhost", 1);
+    CHECK(bare.answer(lo.data(), lo.size(), r));
 }
 
 TEST(guest_names_leaves_other_queries_to_the_resolver) {

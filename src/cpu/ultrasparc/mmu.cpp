@@ -115,7 +115,7 @@ bool UltraSparc::asi_restricted_check(u8 a) {
 
 TlbEntry* UltraSparc::tlb_lookup(MmuRegs& mmu, u64 va, unsigned context) {
     const u64 page = va >> 13;
-    SoftTlbEntry& s = soft_tlb_[&mmu == &dmmu_][page & (kSoftTlbSize - 1)];
+    SoftTlbEntry& s = soft_tlb_[&mmu == &dmmu_][soft_tlb_index(page)];
     if (s.gen == tlb_gen_ && s.va_page == page && s.context == context && s.epoch == s.entry->epoch) {
         s.entry->used = true;
         return s.entry;
@@ -443,7 +443,7 @@ void UltraSparc::fast_fill(u64 va, u8 a, const Access& acc, AccessKind kind) {
     const bool write = code != nullptr;
     u8* const host = write ? writable : bus_.host_read_ptr(acc.pa & ~kPage);
     if (!host) return;
-    FastEntry& f = fast_[mode][(va >> 13) & (kFastEntries - 1)];
+    FastEntry& f = fast_[mode][fast_index(va >> 13)];
     const u64 key = (va >> 13) | fast_key_[mode];
     const s64 addend = static_cast<s64>(reinterpret_cast<uintptr_t>(host) - (va & ~kPage));
     if (f.key != key || f.addend != addend || (f.perms & kFastDev)) f = FastEntry{key, addend, nullptr, 0};
@@ -456,7 +456,7 @@ bool UltraSparc::fast_device(u64 va, u8 a, AccessKind kind, Access& acc) const {
     if (kind != AccessKind::Load && kind != AccessKind::Store) return false;
     const int mode = fast_class(a);  // (none for no-fault loads, which fault on side effects)
     if (mode < 0) return false;
-    const FastEntry& f = fast_[mode][(va >> 13) & (kFastEntries - 1)];
+    const FastEntry& f = fast_[mode][fast_index(va >> 13)];
     if (f.key != ((va >> 13) | fast_key_[mode]) || !(f.perms & (kind == AccessKind::Load ? kFastDevRead : kFastDevWrite))) return false;
     acc.pa = static_cast<u64>(static_cast<s64>(va) + f.addend);
     acc.little = asi_is_little(a);
@@ -469,7 +469,7 @@ void UltraSparc::fast_fill_device(u64 va, u8 a, const Access& acc, AccessKind ki
     const int mode = fast_class(a);
     if (mode < 0 || acc.little != asi_is_little(a)) return;  // (TTE.IE)
     constexpr u64 kPage = 0x1FFF;
-    FastEntry& f = fast_[mode][(va >> 13) & (kFastEntries - 1)];
+    FastEntry& f = fast_[mode][fast_index(va >> 13)];
     const u64 key = (va >> 13) | fast_key_[mode];
     const s64 addend = static_cast<s64>((acc.pa & ~kPage) - (va & ~kPage));
     if (f.key != key || f.addend != addend || !(f.perms & kFastDev)) f = FastEntry{key, addend, nullptr, 0};
@@ -661,7 +661,8 @@ void UltraSparc::forget_translations(MmuRegs& mmu, TlbEntry& e) {
         for (unsigned c = 0; c < kFastClasses; ++c) {
             if (c == 5) continue;  // (physical: no TLB)
             for (u64 k = 0; k < std::min<u64>(count, kFastEntries); ++k) {
-                FastEntry& f = fast_[c][(first + k) & (kFastEntries - 1)];
+                // (Each page's entry; a range of kFastEntries pages or more, aligned as a TTE's is, takes them all.)
+                FastEntry& f = fast_[c][count >= kFastEntries ? k : fast_index(first + k)];
                 if (in_range(f.key & ((u64{1} << 51) - 1))) f = FastEntry{};
             }
         }
