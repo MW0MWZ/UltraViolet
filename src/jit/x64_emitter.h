@@ -38,6 +38,7 @@ public:
     void ret() { byte(0xC3); }
     void call(Reg r) { rex_opt(false, 0, r), byte(0xFF), byte(0xC0 | (2 << 3) | (r & 7)); }
     void jmp(Reg r) { rex_opt(false, 0, r), byte(0xFF), byte(0xC0 | (4 << 3) | (r & 7)); }
+    void jmp(Mem m) { op_mem(false, 0xFF, Reg(4), m); }  // jmp qword [m]
 
     // Loads and stores (w: 64-bit operand size)
     void mov(Reg dst, Mem m, bool w = true) { op_mem(w, 0x8B, dst, m); }
@@ -215,6 +216,10 @@ public:
         op_mem(false, 0xF6, Reg(0), m);
         byte(imm);
     }
+    void mov8_imm(Mem m, u8 imm) {  // mov byte [m], imm8
+        op_mem(false, 0xC6, Reg(0), m);
+        byte(imm);
+    }
 
     // SSE scalar floating point on xmm registers (numbered 0-15).
     enum class Sse : unsigned { Sqrt = 0x51, Add = 0x58, Mul = 0x59, Cvt = 0x5A, Sub = 0x5C, Div = 0x5E };
@@ -267,9 +272,13 @@ public:
         u32v(0);
         return n_;
     }
-    // Jumps back to an earlier position.
+    // Jumps back to, or calls, an earlier position.
     void jmp_to(std::size_t target) {
         byte(0xE9);
+        u32v(static_cast<u32>(static_cast<s64>(target) - static_cast<s64>(n_ + 4)));
+    }
+    void call_to(std::size_t target) {
+        byte(0xE8);
         u32v(static_cast<u32>(static_cast<s64>(target) - static_cast<s64>(n_ + 4)));
     }
     // A jump or call to `target`, this code being placed at `base`.

@@ -181,6 +181,28 @@ void UltraSparc::set_freg64(unsigned r, u64 v) {
     f_[n + 1] = static_cast<u32>(v);
 }
 
+bool UltraSparc::translation_at(const void* host_pc, std::vector<u32>& insns, const u8*& start, std::size_t& size) const {
+    if (!jit_buf_) return false;
+    const auto* pc = static_cast<const u8*>(host_pc);
+    const Block* found = nullptr;
+    const u8* end = jit_buf_->next();  // (the next translation's start, or the end of those made)
+    for (const Block& b : blocks_) {
+        const auto* c = reinterpret_cast<const u8*>(b.code);
+        if (!c) continue;
+        if (c <= pc && (!found || c > reinterpret_cast<const u8*>(found->code))) found = &b;
+    }
+    if (!found) return false;
+    start = reinterpret_cast<const u8*>(found->code);
+    for (const Block& b : blocks_) {
+        const auto* c = reinterpret_cast<const u8*>(b.code);
+        if (c > start && c < end) end = c;
+    }
+    if (pc >= end) return false;
+    insns.assign(found->insns.begin(), found->insns.begin() + found->length);
+    size = static_cast<std::size_t>(end - start);
+    return true;
+}
+
 u64 UltraSparc::tick() const {
     return ((cycles() + tick_offset_) & ~(u64{1} << 63)) | (tick_npt_ ? u64{1} << 63 : 0);
 }
@@ -218,7 +240,7 @@ u8 sub_codes(u64 a, u64 b) {
 
 u64 UltraSparc::loop_at_once(u32 loop, u64 room, u64 next) {
     if ((loop >> 30) == 2) return wait_for_tick(loop, room, next);
-    if (loop >> 30) return cycle_at_once(blocks_[loop & ((1u << kBlockBits) - 1)], (loop >> 16) & 0x3FFF, room, next);
+    if (loop >> 30) return cycle_at_once(blocks_[loop & ((1u << kBlockBits) - 1)], (loop >> kLoopBackShift) & kLoopBackMask, room, next);
     return count_down(loop, room);
 }
 
@@ -801,7 +823,7 @@ void UltraSparc::run_blocks(u64 instructions) {
         }
         // A delay loop, back at its start (with no recompiler: one
         // translates the loop, which then does this itself).
-        const u64 loop_back = (b.loop >> 30) == 3 ? 4 * ((b.loop >> 16) & 0x3FFF) : 0;
+        const u64 loop_back = (b.loop >> 30) == 3 ? 4 * ((b.loop >> kLoopBackShift) & kLoopBackMask) : 0;
         if (b.loop && !jit_buf_ && !trapped_ && !attention_ && pc_ == next - 4 * b.length - loop_back && npc_ == pc_ + 4) {
             const u64 room = std::min(instructions - done, tick_match_ > cycles_ ? tick_match_ - cycles_ : 0);
             const u64 k = loop_at_once(b.loop, room, cycles_ + 1);
@@ -858,7 +880,7 @@ void UltraSparc::decode_block(Block& b, const u8* host, u64 pa) {
             for (int i = 0; i < kPage - first; ++i) code[i] = load_be<u32>(host - 4 * back + 4 * i);
             const PollCycle c = poll_cycle(code, 0, kPage - first);
             if (c.count && c.last_start == back) {
-                b.loop = 3u << 30 | static_cast<u32>(back) << 16 | static_cast<u32>(&b - blocks_.data());
+                b.loop = 3u << 30 | static_cast<u32>(back) << kLoopBackShift | static_cast<u32>(&b - blocks_.data());
                 bus_.mark_code(host - 4 * back, 4 * static_cast<std::size_t>(kPage - first));  // (all it read)
             }
         }
@@ -881,22 +903,27 @@ void UltraSparc::code_written(const u8* page, const u8* host, std::size_t size) 
     bus_.clear_code(page);
     attention_ = true;
     ++code_invalidations_;
+    code_changed();
 }
 
 // Host memory was remapped: decoded blocks and cached fetch translations
 // may point at memory that is no longer there.
 void UltraSparc::flush_blocks() {
     for (Block& b : blocks_) b.host = nullptr, b.code = nullptr;
+    code_changed();
     flush_soft_tlb();
 }
 
 void UltraSparc::set_jit(bool enabled, std::size_t buffer) {
     for (Block& b : blocks_) b.code = nullptr, b.runs = 0;
     jit_buf_.reset();
-    jit_stub_seq_ = jit_stub_dyn_ = nullptr;
+    jit_stub_seq_ = jit_stub_dyn_ = jit_stub_ccr_ = nullptr;
     if (!enabled || !jit_compile_supported()) return;
     jit_buf_ = std::make_unique<jit::ExecBuffer>(buffer);
     if (!jit_buf_->ok()) jit_buf_.reset();
+    jit_links_size_ = buffer / 256;  // (a translation is several hundred bytes, with a link or two)
+    jit_links_ = std::make_unique<JitLink[]>(jit_links_size_);
+    jit_links_used_ = 0;
 }
 
 // Runs a translated block, then the same instructions through execute()

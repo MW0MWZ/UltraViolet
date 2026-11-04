@@ -152,6 +152,9 @@ public:
     // Blocks decoded, and of those how many took the place of another block.
     u64 block_decodes() const { return block_decodes_; }
     u64 block_evictions() const { return block_evictions_; }
+    // The translation whose host code holds `host_pc` (for profiling): its
+    // guest instructions, and where its host code starts and how long it is.
+    bool translation_at(const void* host_pc, std::vector<u32>& insns, const u8*& start, std::size_t& size) const;
     // The CPU's state for a diagnostic report: registers that say where it
     // is and what it waits for, TICK and TICK_CMPR, the interrupts taken at
     // each level and when the last came, and the recompiler's counts.
@@ -306,8 +309,13 @@ private:
     // sets of kBlockWays (a block goes in any way of its set, and stays in
     // that way until replaced). A block lies within one 4 KiB code page (and
     // so within one I-MMU page).
-    static constexpr unsigned kBlockBits = 16, kBlockWays = 4, kBlockSetBits = kBlockBits - 2;
+    static constexpr unsigned kBlockBits = 18, kBlockWays = 4, kBlockSetBits = kBlockBits - 2;
     static constexpr unsigned kMaxBlockLength = 32;
+    // A polling loop's Block::loop: 3 << 30 | how far back it starts (in
+    // instructions, within its 4 KiB code page) << kLoopBackShift | the
+    // block's index.
+    static constexpr unsigned kLoopBackShift = kBlockBits, kLoopBackMask = (1u << (30 - kBlockBits)) - 1;
+    static_assert(kLoopBackMask >= 1023, "a 4 KiB page's instructions");
     // Translated block: runs the block from its first instruction at `pc`,
     // and may go on into other translated blocks of the same page while
     // their instructions fit in `budget`; returns how many instructions it
@@ -321,8 +329,7 @@ private:
         u8 jit_mode = 0;        // jit_mode() the code was translated for
         bool jit_self = false;  // the code never calls execute()
         u32 loop = 0;           // a delay loop (CountedLoop::code(), TimedLoop::code(), or the last
-                                // block of a polling loop: 3 << 30 | how far back the loop starts
-                                // in instructions << 16 | its block index; 0: none)
+                                // block of a polling loop: see kLoopBackShift; 0: none)
         u16 page_off = 0;       // where it starts in its 4 KiB code page, in instructions
         std::array<u32, kMaxBlockLength> insns{};
     };
@@ -364,10 +371,36 @@ private:
     // npc = pc + 4, and with npc in a register.
     const void* jit_stub_seq_ = nullptr;
     const void* jit_stub_dyn_ = nullptr;
+    // The code that works out ccr_ from lazy condition codes (see cc_op_):
+    // called from translations, changing nothing but the host's flags (and
+    // on AArch64 x16 and x17).
+    const void* jit_stub_ccr_ = nullptr;
     bool jit_make_stubs();
     u64 jit_compiles_ = 0;
     u64 jit_flushes_ = 0;  // times the buffer filled and was emptied
     u64 code_invalidations_ = 0;
+    // Counts writes to code and other changes that drop decoded blocks: a
+    // translation going straight into another (JitLink) does so only while
+    // the count is the one it was linked at (never 0, which a link holds
+    // until it is first made).
+    u32 code_gen_ = 1;
+    // Where a translation's block goes on to a known block, the translation
+    // of that block the last time it was looked up (x86-64), with
+    // code_gen_ then. Made as translations are, and all dropped with them.
+    struct JitLink {
+        u32 gen = 0;
+        const void* target = nullptr;
+    };
+    std::unique_ptr<JitLink[]> jit_links_;
+    std::size_t jit_links_used_ = 0, jit_links_size_ = 0;
+    JitLink* new_jit_link() {
+        if (jit_links_used_ == jit_links_size_) return nullptr;
+        jit_links_[jit_links_used_] = JitLink{};
+        return &jit_links_[jit_links_used_++];
+    }
+    void code_changed() {
+        if (++code_gen_ == 0) code_gen_ = 1;
+    }
     u64 block_decodes_ = 0, block_evictions_ = 0;
     bool jit_check_ = false;
     u32 jit_run_checked(Block& b);
@@ -387,9 +420,12 @@ private:
     static constexpr unsigned kFetchEntries = 256;
     std::array<FetchEntry, kFetchEntries> fetch_cache_{};
     u16 fetch_mode() const { return static_cast<u16>((pstate_ & (pstate::RED | pstate::PRIV)) | (tl_ > 0 ? 0x8000 : 0)); }
-    // The first slot of the set for a block starting at `host`.
+    // The first slot of the set for a block starting at `host`: its
+    // instruction's address with the bits above the set's folded in (so
+    // that code a power of two apart does not share sets).
     static unsigned block_set(const u8* host) {
-        return (static_cast<unsigned>(reinterpret_cast<uintptr_t>(host) >> 2) & ((1u << kBlockSetBits) - 1)) * kBlockWays;
+        const uintptr_t a = reinterpret_cast<uintptr_t>(host) >> 2;
+        return (static_cast<unsigned>(a ^ (a >> kBlockSetBits)) & ((1u << kBlockSetBits) - 1)) * kBlockWays;
     }
     // The block starting at `host`, or the way of its set to decode it into
     // (an empty one, or each in turn).
@@ -521,6 +557,10 @@ private:
     static constexpr u8 kFastDevRead = 8, kFastDevWrite = 16, kFastDevSide = 32, kFastDev = kFastDevRead | kFastDevWrite;
     static constexpr unsigned kFastEntries = 512, kFastClasses = 6;
     std::array<std::array<FastEntry, kFastEntries>, kFastClasses> fast_{};
+    // A page's entry: its low bits with the next ones folded in, so that
+    // buffers a power of two apart (4 MiB, 8 MiB...) do not share entries
+    // while consecutive pages still take consecutive ones.
+    static unsigned fast_index(u64 page) { return static_cast<unsigned>(page ^ (page >> 9)) & (kFastEntries - 1); }
     // Each table's generation, in its keys' bits 63:51 (see
     // flush_fast_translations()).
     std::array<u64, kFastClasses> fast_key_ = [] {
@@ -651,6 +691,15 @@ private:
     std::array<u64*, 4> base_{};
 
     u8 ccr_ = 0, asi_ = 0, fprs_ = 0;
+    // Lazy condition codes, inside translated code only (x86-64): an add,
+    // subtract or logical operation that sets them leaves its kind in
+    // cc_op_ and its operands (a logical one's result) in cc_a_ and cc_b_,
+    // and ccr_ is out of date while cc_op_ is not kCcNone. Translations
+    // work ccr_ out (jit_stub_ccr_) before anything else may read it, so
+    // outside them cc_op_ is always kCcNone.
+    static constexpr u8 kCcNone = 0, kCcSub = 1, kCcAdd = 2, kCcLogic = 3;
+    u8 cc_op_ = kCcNone;
+    u64 cc_a_ = 0, cc_b_ = 0;
     u64 y_ = 0;
     u16 pstate_ = 0;
     unsigned tl_ = 0, pil_ = 0, cwp_ = 0;
@@ -693,6 +742,7 @@ private:
         TlbEntry* entry = nullptr;
     };
     static constexpr unsigned kSoftTlbSize = 1024;
+    static unsigned soft_tlb_index(u64 page) { return static_cast<unsigned>(page ^ (page >> 10)) & (kSoftTlbSize - 1); }  // (as fast_index())
     std::array<std::array<SoftTlbEntry, kSoftTlbSize>, 2> soft_tlb_{};
     u32 tlb_gen_ = 1;
     // The generation of the fetch cache, which knows neither the context

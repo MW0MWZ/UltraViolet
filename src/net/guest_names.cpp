@@ -69,10 +69,22 @@ bool valid_label(const std::string& s) {
 }  // namespace
 
 GuestNames::GuestNames(std::string name, std::string domain, u32 nameserver)
-    : names_{std::move(name)}, domain_(std::move(domain)), nameserver_(nameserver) {}
+    : names_{std::move(name)}, domain_(std::move(domain)), nameserver_(nameserver) {
+    for (std::size_t from = 0; from < domain_.size();) {
+        const std::size_t dot = std::min(domain_.find('.', from), domain_.size());
+        if (dot > from) zone_.push_back(domain_.substr(from, dot - from));
+        from = dot + 1;
+    }
+}
 
 bool GuestNames::is_ours(const std::string& label) const {
     return std::any_of(names_.begin(), names_.end(), [&](const std::string& n) { return same(n, label); });
+}
+
+// The name, or one under it, is in DHCP's domain (none if it gives none).
+bool GuestNames::in_zone(const std::vector<std::string>& labels) const {
+    if (zone_.empty() || labels.size() < zone_.size()) return false;
+    return std::equal(zone_.begin(), zone_.end(), labels.end() - static_cast<std::ptrdiff_t>(zone_.size()), same);
 }
 
 // A BOOTP request's options (after the 236-byte header and the magic
@@ -130,7 +142,9 @@ bool GuestNames::answer(const u8* frame, std::size_t length, std::vector<u8>& re
 
     const u32 guest = be32(ip + 12);
     std::vector<u8> rdata;
-    u16 rtype = 0;
+    u16 rtype = 0, rcode = 0;
+    std::string asked;
+    for (std::size_t i = 0; i < labels.size(); ++i) asked += (i ? "." : "") + labels[i];
     // The guest's name, here or in the domain it asks in; or no name at all,
     // the name of a host that does not know its own yet (Solaris's installer
     // checks its name server so, with the name DHCP gave it not yet set).
@@ -143,12 +157,26 @@ bool GuestNames::answer(const u8* frame, std::size_t length, std::vector<u8>& re
             rtype = kTypeA;
             put32(rdata, guest);
         }
+    } else if (!labels.empty() && same(labels[0], "localhost") && (labels.size() == 1 || (labels.size() == zone_.size() + 1 && in_zone(labels)))) {
+        // localhost, bare or in DHCP's domain: the loopback address (RFC 6761).
+        if (qtype == kTypeA || qtype == kTypeAny) {
+            rtype = kTypeA;
+            put32(rdata, 0x7F000001);
+        }
+    } else if (in_zone(labels)) {
+        // DHCP's domain is this network's own, as a home router's is: it
+        // has no other names, which is said at once (the host's resolver
+        // has no say in it, and may be slow to say so or never answer).
+        if (labels.size() > zone_.size()) rcode = 3;  // no such name
+    } else if (same(asked, "1.0.0.127.in-addr.arpa")) {
+        if (qtype == kTypePtr || qtype == kTypeAny) {
+            rtype = kTypePtr;
+            put_name(rdata, "localhost");
+        }
     } else {
         // Its own address, backwards under in-addr.arpa.
         const std::string reverse = std::to_string(guest & 0xFF) + "." + std::to_string(guest >> 8 & 0xFF) + "." +
                                     std::to_string(guest >> 16 & 0xFF) + "." + std::to_string(guest >> 24);
-        std::string asked;
-        for (std::size_t i = 0; i < labels.size(); ++i) asked += (i ? "." : "") + labels[i];
         if (!same(asked, reverse + ".in-addr.arpa")) return false;
         if (qtype == kTypePtr || qtype == kTypeAny) {
             rtype = kTypePtr;
@@ -157,7 +185,8 @@ bool GuestNames::answer(const u8* frame, std::size_t length, std::vector<u8>& re
         }
     }
 
-    // The answer (or none, for a type the name does not have), from the
+    // The answer (or none, for a type the name does not have, or a name
+    // that is not there), from the
     // address and port asked, to where it came from.
     reply.clear();
     reply.insert(reply.end(), frame + 6, frame + 12);  // to the sender's address
@@ -174,7 +203,7 @@ bool GuestNames::answer(const u8* frame, std::size_t length, std::vector<u8>& re
     reply.insert(reply.end(), udp, udp + 2);
     reply.insert(reply.end(), {0, 0, 0, 0});
     reply.insert(reply.end(), dns, dns + 2);                           // ID
-    put16(reply, static_cast<u16>(0x8480 | (flags & 0x0100)));          // response, authoritative, RD as asked, RA
+    put16(reply, static_cast<u16>(0x8480 | (flags & 0x0100) | rcode));  // response, authoritative, RD as asked, RA
     put16(reply, 1);
     put16(reply, rtype ? 1 : 0);
     put16(reply, 0);

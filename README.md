@@ -53,6 +53,58 @@ Not done yet: the Creator3D's 3D operations, audio capture, audio CDs,
 and the Blade 100/150 and Blade 1000/2000 machines. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it is put together.
 
+## Performance
+
+The same NetBSD/sparc64 8.1 disk image run under UltraViolet and under QEMU
+10.0's sun4u machine, both with 256 MB of memory, on the same host each time.
+UltraViolet ran with its default settings (guest time kept to the wall
+clock, disks at the host's speed). Each figure is the median of three runs,
+in seconds; lower is better. The last column is UltraViolet's speed as a
+multiple of QEMU's: above 1x is faster, below 1x slower.
+
+### x86-64 (2 cores)
+
+| Test | What it does | QEMU 10.0 | UltraViolet | Relative to QEMU |
+|---|---|---:|---:|---:|
+| Process start | 300 runs of `/bin/echo` from the shell | 3.58 | 2.87 | 1.25x |
+| awk | a 2-million-step integer loop | 17.09 | 9.11 | 1.88x |
+| gzip | `gzip -6` of the kernel (10 MB) | 2.89 | 4.29 | 0.67x |
+| md5 | `md5` of the kernel, three times | 1.55 | 1.24 | 1.25x |
+| sort | sort the word list, forwards and in reverse | 2.41 | 1.69 | 1.43x |
+| C compile | `cc -O2` of a 100-function source file | 18.89 | 15.63 | 1.21x |
+| FP matrix | 160 x 160 double-precision matrix multiply, 20 times | 2.08 | 1.38 | 1.51x |
+| FP library | 2 million rounds of `sin`, `cos` and `sqrt` | 3.37 | 2.54 | 1.33x |
+| Page faults | touch every page of 32 MB, 8 times | 2.00 | 1.58 | 1.27x |
+| memcpy | 8 MB copies, 120 times | 2.41 | 0.71 | 3.39x |
+| Large fork | 300 forks of a 32 MB process | 2.76 | 2.06 | 1.34x |
+| Disk write | 64 MB written with `dd`, then `sync` | 1.28 | 0.92 | 1.39x |
+| Disk read | 128 MB read from the raw disk with `dd` | 1.47 | 0.93 | 1.58x |
+| tar | `/usr/include` copied with `tar`, then `sync` | 10.28 | 6.30 | 1.63x |
+| sleep | `sleep 10` | 10.01 | 10.00 | 1.00x |
+
+### Apple M4 (arm64 Linux)
+
+| Test | QEMU 10.0 | UltraViolet | Relative to QEMU |
+|---|---:|---:|---:|
+| Process start | 1.81 | 1.05 | 1.72x |
+| awk | 9.45 | 3.90 | 2.42x |
+| gzip | 2.03 | 3.29 | 0.62x |
+| md5 | 0.93 | 0.90 | 1.03x |
+| sort | 1.38 | 0.74 | 1.86x |
+| C compile | 9.56 | 7.85 | 1.22x |
+| FP matrix | 1.29 | 0.72 | 1.79x |
+| memcpy | 1.47 | 0.49 | 3.00x |
+
+On both hosts UltraViolet is faster than QEMU in all but one of the timed
+tests (sleep only checks the clock): gzip, which takes about half as long
+again. Its time goes on short blocks of translated code, most of it on the
+loads of the data being compressed and on going from one block to the next.
+
+Both kept the guest's clock to the wall clock, to within a second over each
+whole run. With Fast disk turned off in the settings (the disks at an
+Ultra 10's own speed), on the x86-64 host the disk write takes 4.1 s, the
+read 8.5 s and tar 10.4 s; the other figures do not change.
+
 ## Building
 
 You need:

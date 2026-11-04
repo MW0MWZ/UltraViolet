@@ -3,6 +3,9 @@
 // The decoded-block cache and the recompiler against the interpreter: loops
 // run long enough to be translated must end exactly as step() leaves them.
 #include <array>
+#include <bit>
+#include <cmath>
+#include <random>
 #include <functional>
 #include <vector>
 
@@ -558,6 +561,77 @@ TEST(jit_floating_point_arithmetic_and_conversions_match_the_interpreter) {
     body.insert(body.end(), more.begin(), more.end());
     check_against_interpreter(body, 24, [](Rig& r) {
         r.put(Rig::kTba + (tt::kFpExceptionIeee754 << 5), {ADDi(i5, i5, 1), DONE});
+    }, pstate::PRIV | pstate::PEF, 6000);
+}
+
+TEST(jit_fp_exceptions_rounding_to_nearest_match_the_interpreter) {
+    // Rounding to nearest with no trap enabled, each arithmetic operation
+    // and conversion on 64 pairs of operands (one pair a pass): random
+    // values, small whole numbers, values of few bits (exact sums and
+    // products) and near neighbours, in double and single precision, the
+    // whole numbers taken from their bits too (with the largest ones,
+    // which round up past the format's range). FSR and the result after
+    // each are summed into %l0 and %l2.
+    auto ldxfsr = [](int off) { return f3i(3, 0x21, 1, o5, off); };
+    auto stxfsr = [](int off) { return f3i(3, 0x25, 1, o5, off); };
+    auto sum = [](unsigned acc) { return std::vector<u32>{LDX(g4, o5, 0), SLLXi(l1, acc, 5), ADD(acc, acc, l1), ADD(acc, acc, g4)}; };
+    std::vector<u32> body = {STX(g0, o5, 16), ldxfsr(16), SLLXi(g5, g1, 5), ADD(g5, g5, o4),
+                             LDDF(dreg(2), g5, -32), LDDF(dreg(4), g5, -24), LDF(8, g5, -16), LDF(9, g5, -12),
+                             LDDF(dreg(10), g5, -32), LDF(12, g5, -16)};
+    struct Op { unsigned rd, rs1, rs2, opf; bool dbl; };
+    const Op ops[] = {
+        {dreg(20), dreg(2), dreg(4), 0x042, true}, {dreg(20), dreg(2), dreg(4), 0x046, true},
+        {dreg(20), dreg(2), dreg(4), 0x04A, true}, {dreg(20), dreg(2), dreg(4), 0x04E, true},
+        {dreg(20), 0, dreg(6), 0x02A, true},       {22, 0, dreg(2), 0x0C6, false},
+        {22, 0, dreg(2), 0x0D2, false},            {dreg(20), 0, dreg(2), 0x082, true},
+        {dreg(20), 0, dreg(10), 0x088, true},      {22, 0, dreg(10), 0x084, false},
+        {dreg(20), 0, 12, 0x0C8, true},            {22, 0, 12, 0x0C4, false},
+        {22, 8, 9, 0x041, false},                  {22, 8, 9, 0x045, false},
+        {22, 8, 9, 0x049, false},                  {22, 8, 9, 0x04D, false},
+        {22, 0, 13, 0x029, false},                 {dreg(20), 0, 8, 0x0C9, true},
+        {22, 0, 8, 0x0D1, false},                  {dreg(20), 0, 8, 0x081, true},
+        {dreg(20), 8, 9, 0x069, true}};
+    body.push_back(FPOP1(dreg(6), 0, dreg(2), 0x00A));  // fabsd, for the square root
+    body.push_back(FPOP1(13, 0, 8, 0x009));             // fabss
+    for (const Op& op : ops) {
+        body.push_back(FPOP1(op.rd, op.rs1, op.rs2, op.opf));
+        body.push_back(stxfsr(0));
+        for (u32 w : sum(l0)) body.push_back(w);
+        body.push_back(op.dbl ? STDF(op.rd, o5, 0) : STF(op.rd, o5, 0));
+        if (!op.dbl) body.push_back(STW(g0, o5, 4));
+        for (u32 w : sum(l2)) body.push_back(w);
+    }
+    check_against_interpreter(body, 64, [](Rig& r) {
+        std::mt19937_64 rng(1234);
+        auto rnd = [&](int lo, int hi) { return static_cast<int>(rng() % static_cast<u64>(hi - lo + 1)) + lo; };
+        for (unsigned p = 0; p < 64; ++p) {
+            double a, b;
+            switch (p % 4) {
+                case 0:  // random
+                    a = std::ldexp(static_cast<double>(rng() >> 11) / 9007199254740992.0 + 1, rnd(-40, 40)) * (rng() & 1 ? -1 : 1);
+                    b = std::ldexp(static_cast<double>(rng() >> 11) / 9007199254740992.0 + 1, rnd(-40, 40));
+                    break;
+                case 1:  // small whole numbers
+                    a = rnd(-1000, 1000), b = rnd(-1000, 1000);
+                    break;
+                case 2:  // few bits
+                    a = std::ldexp(rnd(1, 4095), rnd(-12, 12)), b = std::ldexp(-rnd(1, 4095), rnd(-12, 12));
+                    break;
+                default:  // neighbours
+                    a = std::ldexp(static_cast<double>(rng() >> 11) / 9007199254740992.0 + 1, rnd(-8, 8));
+                    b = p & 4 ? -a : std::nextafter(a, 0.0);
+                    break;
+            }
+            const float fa = static_cast<float>(p % 8 == 3 ? a : a * 1.000001), fb = static_cast<float>(b);
+            const u64 at = kData + kDataSize / 2 + 32 * (63 - p);  // (the pass with %g1 at 64 - p)
+            // The largest whole numbers, for the conversions from them (NaNs as operands).
+            const u64 abits = p == 62 ? 0x7FFFFFFFFFFFFFFFull : p == 61 ? 0x7FFFFFFFFFFFFC00ull : std::bit_cast<u64>(a);
+            const u32 fabits = p == 63 ? 0x7FFFFFFFu : p == 60 ? 0x7FFFFF80u : std::bit_cast<u32>(fa);
+            r.bus.write(at, abits);
+            r.bus.write(at + 8, std::bit_cast<u64>(b));
+            r.bus.write(at + 16, fabits);
+            r.bus.write(at + 20, std::bit_cast<u32>(fb));
+        }
     }, pstate::PRIV | pstate::PEF, 6000);
 }
 
