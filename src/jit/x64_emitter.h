@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andy Taylor
 // Minimal x86-64 machine-code emitter: the instructions the dynamic
-// recompiler needs, with memory operands of the form [base + disp32].
+// recompiler needs, with memory operands of the form [base + index * scale
+// + disp] (the shortest encoding of the displacement).
 #pragma once
 
 #include <cstddef>
@@ -17,6 +18,8 @@ enum Reg : unsigned { rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8, r9, r10, r11, 
 struct Mem {
     Reg base;
     s32 disp;
+    Reg index = rsp;  // (rsp: none)
+    u8 scale = 0;     // log2: index * 1, 2, 4 or 8
 };
 
 enum class Alu : unsigned { Add = 0, Or = 1, Adc = 2, Sbb = 3, And = 4, Sub = 5, Xor = 6, Cmp = 7 };
@@ -84,11 +87,14 @@ public:
     // ALU
     void alu(Alu op, Reg dst, Mem m, bool w = true) { op_mem(w, 0x03 + (static_cast<unsigned>(op) << 3), dst, m); }
     void alu(Alu op, Reg dst, Reg src, bool w = true) { op_rr(w, 0x01 + (static_cast<unsigned>(op) << 3), src, dst); }
+    void alu(Alu op, Mem m, Reg src, bool w = true) { op_mem(w, 0x01 + (static_cast<unsigned>(op) << 3), src, m); }  // [m] op= src
     void alu_imm(Alu op, Reg dst, s32 imm, bool w = true) {
         rex_opt(w, 0, dst);
-        byte(0x81);
+        const bool small = imm >= -128 && imm <= 127;
+        byte(small ? 0x83 : 0x81);
         byte(0xC0 | (static_cast<unsigned>(op) << 3) | (dst & 7));
-        u32v(static_cast<u32>(imm));
+        if (small) byte(static_cast<u8>(imm));
+        else u32v(static_cast<u32>(imm));
     }
     void alu8(Alu op, Reg dst, Mem m) { op_mem(false, 0x02 + (static_cast<unsigned>(op) << 3), dst, m); }  // r8, [m]
     void shift_imm(Shift op, Reg r, u8 n, bool w) {
@@ -116,7 +122,7 @@ public:
         byte(0x0F), byte(0xAF), byte(0xC0 | ((dst & 7) << 3) | (src & 7));
     }
     void imul(Reg dst, Mem m) {  // 64-bit, low half
-        rex(true, dst, m.base);
+        rex_mem(true, dst, m, true);
         byte(0x0F);
         modrm_mem(0xAF, dst, m);
     }
@@ -133,6 +139,7 @@ public:
         rex(true, 0, r);
         byte(0xF7), byte(0xC0 | (2 << 3) | (r & 7));
     }
+    void lea(Reg dst, Mem m) { op_mem(true, 0x8D, dst, m); }  // dst = the address (the flags kept)
     void cmov(Cond c, Reg dst, Reg src) {  // 64-bit
         rex(true, dst, src);
         byte(0x0F), byte(0x40 + static_cast<unsigned>(c)), byte(0xC0 | ((dst & 7) << 3) | (src & 7));
@@ -140,21 +147,22 @@ public:
     void setcc(Cond c, Reg r) {  // r must be al/cl/dl/bl
         byte(0x0F), byte(0x90 + static_cast<unsigned>(c)), byte(0xC0 | (r & 7));
     }
-    void movzx8(Reg dst, Reg src) {  // dst32 <- src8 (al/cl/dl/bl)
+    void movzx8(Reg dst, Reg src) {  // dst32 <- src8 (REX for spl-dil and r8b-r15b)
+        if (src >= 4 || dst >= 8) rex(false, dst, src);
         byte(0x0F), byte(0xB6), byte(0xC0 | ((dst & 7) << 3) | (src & 7));
     }
     void movzx8(Reg dst, Mem m) {  // dst32 <- byte [m]
-        rex_opt(false, dst, m.base);
+        rex_mem(false, dst, m);
         byte(0x0F);
         modrm_mem(0xB6, dst, m);
     }
     void movsx8(Reg dst, Mem m) {  // dst64 <- sign-extended byte [m]
-        rex(true, dst, m.base);
+        rex_mem(true, dst, m, true);
         byte(0x0F);
         modrm_mem(0xBE, dst, m);
     }
     void movzx16(Reg dst, Mem m) {  // dst32 <- word [m]
-        rex_opt(false, dst, m.base);
+        rex_mem(false, dst, m);
         byte(0x0F);
         modrm_mem(0xB7, dst, m);
     }
@@ -172,8 +180,10 @@ public:
     }
     // op qword/dword [m], imm32
     void alu_imm(Alu op, Mem m, s32 imm, bool w = true) {
-        op_mem(w, 0x81, Reg(static_cast<unsigned>(op)), m);
-        u32v(static_cast<u32>(imm));
+        const bool small = imm >= -128 && imm <= 127;
+        op_mem(w, small ? 0x83 : 0x81, Reg(static_cast<unsigned>(op)), m);
+        if (small) byte(static_cast<u8>(imm));
+        else u32v(static_cast<u32>(imm));
     }
     // One-operand multiply and divide of rax (rdx:rax) by r (w: 64-bit).
     void mul(Reg r, bool w) { group3(4, r, w); }
@@ -248,12 +258,12 @@ public:
     void fmsub231(bool dbl, unsigned dst, unsigned a, unsigned b) { fma(dbl, 0xBB, dst, a, b); }
     void fnmadd231(bool dbl, unsigned dst, unsigned a, unsigned b) { fma(dbl, 0xBD, dst, a, b); }
     void ldmxcsr(Mem m) {
-        rex_opt(false, 0, m.base);
+        rex_mem(false, Reg(0), m);
         byte(0x0F);
         modrm_mem(0xAE, Reg(2), m);
     }
     void stmxcsr(Mem m) {
-        rex_opt(false, 0, m.base);
+        rex_mem(false, Reg(0), m);
         byte(0x0F);
         modrm_mem(0xAE, Reg(3), m);
     }
@@ -277,6 +287,10 @@ public:
         byte(0xE9);
         u32v(static_cast<u32>(static_cast<s64>(target) - static_cast<s64>(n_ + 4)));
     }
+    void jcc_to(Cond c, std::size_t target) {
+        byte(0x0F), byte(0x80 + static_cast<unsigned>(c));
+        u32v(static_cast<u32>(static_cast<s64>(target) - static_cast<s64>(n_ + 4)));
+    }
     void call_to(std::size_t target) {
         byte(0xE8);
         u32v(static_cast<u32>(static_cast<s64>(target) - static_cast<s64>(n_ + 4)));
@@ -296,9 +310,10 @@ public:
         u32v(0);
         return n_;
     }
-    // Points the jump ending at `site` to the current position.
-    void bind(std::size_t site) {
-        const u32 rel = static_cast<u32>(n_ - site);
+    // Points the jump ending at `site` to the current position (or `target`).
+    void bind(std::size_t site) { bind_to(site, n_); }
+    void bind_to(std::size_t site, std::size_t target) {
+        const u32 rel = static_cast<u32>(static_cast<s64>(target) - static_cast<s64>(site));
         for (int i = 0; i < 4; ++i) buf_[site - 4 + i] = static_cast<u8>(rel >> (8 * i));
     }
 
@@ -329,16 +344,26 @@ private:
     void rex_opt(bool w, unsigned reg, unsigned rm) {
         if (w || reg >= 8 || rm >= 8) rex(w, reg, rm);
     }
-    // op reg, [base + disp32]
+    // REX for reg and a memory operand (`force`: even when nothing needs it).
+    void rex_mem(bool w, Reg reg, Mem m, bool force = false) {
+        if (force || w || reg >= 8 || m.base >= 8 || m.index >= 8)
+            byte(0x40 | (w << 3) | ((reg >> 3) << 2) | ((m.index >> 3) << 1) | (m.base >> 3));
+    }
+    // op reg, [base + index * scale + disp]
     void op_mem(bool w, unsigned opcode, Reg reg, Mem m) {
-        rex_opt(w, reg, m.base);
+        rex_mem(w, reg, m);
         modrm_mem(opcode, reg, m);
     }
     void modrm_mem(unsigned opcode, Reg reg, Mem m) {
         byte(opcode);
-        byte(0x80 | ((reg & 7) << 3) | (m.base & 7));
-        if ((m.base & 7) == rsp) byte(0x24);  // SIB: base only
-        u32v(static_cast<u32>(m.disp));
+        // No displacement, or 8 bits of one, where they will do (mod 00
+        // with base rbp or r13 means rip-relative or no base instead).
+        const unsigned mod = m.disp == 0 && (m.base & 7) != rbp ? 0x00 : m.disp >= -128 && m.disp <= 127 ? 0x40 : 0x80;
+        const bool sib = (m.base & 7) == rsp || m.index != rsp;
+        byte(mod | ((reg & 7) << 3) | (sib ? 4 : (m.base & 7)));
+        if (sib) byte((m.scale << 6) | ((m.index & 7) << 3) | (m.base & 7));
+        if (mod == 0x40) byte(static_cast<u8>(m.disp));
+        else if (mod == 0x80) u32v(static_cast<u32>(m.disp));
     }
     // [prefix] [REX] 0F op /r, register direct (reg field `reg`, rm field `rm`).
     void xmm_rr(unsigned prefix, bool w, unsigned op, unsigned reg, unsigned rm) {
@@ -355,7 +380,7 @@ private:
     }
     void xmm_mem(unsigned prefix, unsigned op, unsigned x, Mem m) {
         byte(prefix);
-        rex_opt(false, x, m.base);
+        rex_mem(false, Reg(x), m);
         byte(0x0F);
         modrm_mem(op, Reg(x), m);
     }

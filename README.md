@@ -6,12 +6,12 @@
 # UltraViolet
 
 An open-source emulator for Sun **UltraSPARC** workstations, starting with the
-**Ultra 5** and **Ultra 10**: the UltraSPARC IIi processor with its on-chip
-memory controller and PCI host bridge, the PCI I/O chipset, onboard ATI Rage
-graphics and, on the Ultra 10, the UPA slot. The aim is to run the original
-OpenBoot PROM and Solaris unmodified, at or above the speed of the real
-machine, with a just-in-time compiler for the UltraSPARC IIi. It runs on
-Linux, macOS and Windows.
+**Ultra 5** and **Ultra 10**: the sun4u (sparc64) platform's UltraSPARC IIi
+processor with its on-chip memory controller and PCI host bridge, the PCI
+I/O chipset, onboard ATI Rage graphics and, on the Ultra 10, the UPA slot.
+The aim is to run the original OpenBoot PROM and Solaris unmodified, at or
+above the speed of the real machine, with a just-in-time compiler for the
+UltraSPARC IIi. It runs on Linux, macOS and Windows.
 
 ## Status
 
@@ -66,39 +66,40 @@ multiple of QEMU's: above 1x is faster, below 1x slower.
 
 | Test | What it does | QEMU 10.0 | UltraViolet | Relative to QEMU |
 |---|---|---:|---:|---:|
-| Process start | 300 runs of `/bin/echo` from the shell | 3.58 | 2.87 | 1.25x |
-| awk | a 2-million-step integer loop | 17.09 | 9.11 | 1.88x |
-| gzip | `gzip -6` of the kernel (10 MB) | 2.89 | 4.29 | 0.67x |
-| md5 | `md5` of the kernel, three times | 1.55 | 1.24 | 1.25x |
-| sort | sort the word list, forwards and in reverse | 2.41 | 1.69 | 1.43x |
-| C compile | `cc -O2` of a 100-function source file | 18.89 | 15.63 | 1.21x |
-| FP matrix | 160 x 160 double-precision matrix multiply, 20 times | 2.08 | 1.38 | 1.51x |
-| FP library | 2 million rounds of `sin`, `cos` and `sqrt` | 3.37 | 2.54 | 1.33x |
-| Page faults | touch every page of 32 MB, 8 times | 2.00 | 1.58 | 1.27x |
-| memcpy | 8 MB copies, 120 times | 2.41 | 0.71 | 3.39x |
-| Large fork | 300 forks of a 32 MB process | 2.76 | 2.06 | 1.34x |
-| Disk write | 64 MB written with `dd`, then `sync` | 1.28 | 0.92 | 1.39x |
-| Disk read | 128 MB read from the raw disk with `dd` | 1.47 | 0.93 | 1.58x |
-| tar | `/usr/include` copied with `tar`, then `sync` | 10.28 | 6.30 | 1.63x |
+| Process start | 300 runs of `/bin/echo` from the shell | 3.58 | 2.58 | 1.39x |
+| awk | a 2-million-step integer loop | 17.09 | 7.64 | 2.24x |
+| gzip | `gzip -6` of the kernel (10 MB) | 2.89 | 3.06 | 0.94x |
+| md5 | `md5` of the kernel, three times | 1.55 | 0.86 | 1.80x |
+| sort | sort the word list, forwards and in reverse | 2.41 | 1.31 | 1.84x |
+| C compile | `cc -O2` of a 100-function source file | 18.89 | 12.33 | 1.53x |
+| FP matrix | 160 x 160 double-precision matrix multiply, 20 times | 2.08 | 1.24 | 1.68x |
+| FP library | 2 million rounds of `sin`, `cos` and `sqrt` | 3.37 | 2.01 | 1.68x |
+| Page faults | touch every page of 32 MB, 8 times | 2.00 | 1.44 | 1.39x |
+| memcpy | 8 MB copies, 120 times | 2.41 | 0.55 | 4.38x |
+| Large fork | 300 forks of a 32 MB process | 2.76 | 1.87 | 1.48x |
+| Disk write | 64 MB written with `dd`, then `sync` | 1.28 | 0.85 | 1.51x |
+| Disk read | 128 MB read from the raw disk with `dd` | 1.47 | 0.87 | 1.69x |
+| tar | `/usr/include` copied with `tar`, then `sync` | 10.28 | 5.57 | 1.85x |
 | sleep | `sleep 10` | 10.01 | 10.00 | 1.00x |
 
 ### Apple M4 (arm64 Linux)
 
 | Test | QEMU 10.0 | UltraViolet | Relative to QEMU |
 |---|---:|---:|---:|
-| Process start | 1.81 | 1.05 | 1.72x |
-| awk | 9.45 | 3.90 | 2.42x |
-| gzip | 2.03 | 3.29 | 0.62x |
-| md5 | 0.93 | 0.90 | 1.03x |
-| sort | 1.38 | 0.74 | 1.86x |
-| C compile | 9.56 | 7.85 | 1.22x |
-| FP matrix | 1.29 | 0.72 | 1.79x |
-| memcpy | 1.47 | 0.49 | 3.00x |
+| Process start | 1.87 | 0.90 | 2.08x |
+| awk | 11.86 | 3.06 | 3.88x |
+| gzip | 2.08 | 1.90 | 1.09x |
+| md5 | 1.05 | 0.40 | 2.63x |
+| sort | 1.61 | 0.59 | 2.73x |
+| C compile | 9.44 | 6.47 | 1.46x |
+| FP matrix | 1.28 | 0.64 | 2.00x |
+| memcpy | 1.45 | 0.45 | 3.22x |
 
-On both hosts UltraViolet is faster than QEMU in all but one of the timed
-tests (sleep only checks the clock): gzip, which takes about half as long
-again. Its time goes on short blocks of translated code, most of it on the
-loads of the data being compressed and on going from one block to the next.
+UltraViolet is faster than QEMU in every timed test on the M4 (sleep only
+checks the clock), and in all but one on the x86-64 host: gzip, which takes
+about 6% longer there. Its time goes on short loops of translated code, most
+of it on the loads of the data being compressed, each waiting on the one
+before.
 
 Both kept the guest's clock to the wall clock, to within a second over each
 whole run. With Fast disk turned off in the settings (the disks at an

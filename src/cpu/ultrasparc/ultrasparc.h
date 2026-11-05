@@ -335,7 +335,34 @@ private:
     };
     static constexpr u16 kJitThreshold = 16;  // runs before a block is translated
     bool jit_compile(Block& b);
+    // One translation of b (jit_x64.cpp, jit_a64.cpp), with the cache
+    // registers taken as changed at the start of each of its blocks given
+    // in label_dirty; those changed along the jumps into each in edge_dirty.
+    // 1: made; 0: none can be; 2: edge_dirty has more than label_dirty (to
+    // be made again with them).
+    int jit_compile_pass(Block& b, const unsigned* label_dirty, unsigned* edge_dirty);
     static bool jit_compile_supported();
+    // The guest registers worth keeping in host registers through the
+    // translation of blocks[0] (with the count - 1 blocks it takes in, see
+    // jit_region()): at most `max` of them, best first, into regs; with
+    // load[k] false for one the block writes before anything may read it
+    // (so not loaded as the translation starts).
+    static unsigned jit_cache_choice(const Block* const* blocks, unsigned count, unsigned max, u8* regs, bool* load);
+    // The blocks the translation of block s takes in with it (s first, then
+    // their offsets from its pc in off): the blocks of its code page that
+    // known branches from it reach and that lead back to it, so that a loop
+    // of several blocks runs in one translation without leaving it; only
+    // for the loop's first block by address. At most max (just s if there
+    // are none, or s is not the first).
+    static constexpr unsigned kRegionBlocks = 4;
+    unsigned jit_region(const Block& s, const Block** blocks, s64* off, unsigned max) const;
+    // The block decoded at `host`, if there is one.
+    const Block* decoded_block(const u8* host) const {
+        const Block* const ways = &blocks_[block_set(host)];
+        for (unsigned w = 0; w < kBlockWays; ++w)
+            if (ways[w].host == host && ways[w].length) return &ways[w];
+        return nullptr;
+    }
     // An instruction the translated code does not do itself; true if the
     // block must end after it (trap, attention or halt).
     static bool jit_execute(UltraSparc* cpu, u32 insn);
@@ -375,6 +402,11 @@ private:
     // called from translations, changing nothing but the host's flags (and
     // on AArch64 x16 and x17).
     const void* jit_stub_ccr_ = nullptr;
+    // The way on into another translation, by looking its block up (when
+    // no link to it is known yet), and the way out of a translation with a
+    // pc to go on from (see jit_x64.cpp and jit_a64.cpp).
+    const void* jit_stub_link_ = nullptr;
+    const void* jit_stub_out_ = nullptr;
     bool jit_make_stubs();
     u64 jit_compiles_ = 0;
     u64 jit_flushes_ = 0;  // times the buffer filled and was emptied
@@ -418,7 +450,6 @@ private:
         u64 pa = 0;
     };
     static constexpr unsigned kFetchEntries = 256;
-    std::array<FetchEntry, kFetchEntries> fetch_cache_{};
     u16 fetch_mode() const { return static_cast<u16>((pstate_ & (pstate::RED | pstate::PRIV)) | (tl_ > 0 ? 0x8000 : 0)); }
     // The first slot of the set for a block starting at `host`: its
     // instruction's address with the bits above the set's folded in (so
@@ -542,21 +573,35 @@ private:
     // completed to host memory, so it allows only what translate_data()
     // allowed; pages whose TTE.IE reverses the byte order get none.
     //
+    // An entry's fields are each in an array of their own, so that
+    // translated code reaches one as [table + index * 8]: key, (va >> 13) |
+    // fast_key_[its class]; the key again where loads (read) and plain
+    // stores (write) may use the entry, else 0 (no key is 0); addend, host
+    // address - va; code, the code flags of the page's two 4 KiB halves; and
+    // perms, kFastRead, kFastWrite, kFastAtomic: what execute() has done
+    // there.
+    //
     // An entry for a page that is not host memory (a device) instead holds
     // its translation for load() and store(), which then need not
     // translate again: addend is the physical address - va, and the perms
     // are kFastDevRead and kFastDevWrite (kFastDevSide: side effects),
     // which translated code does not take for its own.
-    struct FastEntry {
-        u64 key = 0;               // (va >> 13) | fast_key_[its class]
-        s64 addend = 0;            // host address - va
-        const u8* code = nullptr;  // the code flags of the page's two 4 KiB halves
-        u8 perms = 0;              // kFastRead, kFastWrite, kFastAtomic: what execute() has done there
-    };
     static constexpr u8 kFastRead = 1, kFastWrite = 2, kFastAtomic = 4;
     static constexpr u8 kFastDevRead = 8, kFastDevWrite = 16, kFastDevSide = 32, kFastDev = kFastDevRead | kFastDevWrite;
     static constexpr unsigned kFastEntries = 512, kFastClasses = 6;
-    std::array<std::array<FastEntry, kFastEntries>, kFastClasses> fast_{};
+    struct FastTable {
+        std::array<u64, kFastEntries> key{}, read{}, write{};
+        std::array<s64, kFastEntries> addend{};
+        std::array<const u8*, kFastEntries> code{};
+        std::array<u8, kFastEntries> perms{};
+        void clear(unsigned i) { key[i] = read[i] = write[i] = 0, addend[i] = 0, code[i] = nullptr, perms[i] = 0; }
+        void make(unsigned i, u64 k, s64 a) { clear(i), key[i] = k, addend[i] = a; }
+        void allow(unsigned i, u8 p) {
+            perms[i] |= p;
+            read[i] = perms[i] & kFastRead ? key[i] : 0;
+            write[i] = perms[i] & kFastWrite ? key[i] : 0;
+        }
+    };
     // A page's entry: its low bits with the next ones folded in, so that
     // buffers a power of two apart (4 MiB, 8 MiB...) do not share entries
     // while consecutive pages still take consecutive ones.
@@ -597,7 +642,7 @@ private:
         // when those wrap, the table is emptied and its contexts forgotten.)
         if ((++fast_gen_[c] & 0x1FFF) == 0) {
             ++fast_gen_[c];
-            fast_[c].fill(FastEntry{});
+            fast_[c] = FastTable{};
             r.n = 0;
         }
         const u16 gen = static_cast<u16>(fast_gen_[c] & 0x1FFF);
@@ -644,7 +689,7 @@ private:
         return (pstate_ & pstate::PRIV) ? 1 : 0;
     }
     void fast_fill(u64 va, u8 asi, const Access& acc, AccessKind kind);
-    // The device entries (see FastEntry): a translation already made for a
+    // The device entries (see FastTable): a translation already made for a
     // load or store, and the entry made after one.
     bool fast_device(u64 va, u8 asi, AccessKind kind, Access& acc) const;
     void fast_fill_device(u64 va, u8 asi, const Access& acc, AccessKind kind);
@@ -743,7 +788,6 @@ private:
     };
     static constexpr unsigned kSoftTlbSize = 1024;
     static unsigned soft_tlb_index(u64 page) { return static_cast<unsigned>(page ^ (page >> 10)) & (kSoftTlbSize - 1); }  // (as fast_index())
-    std::array<std::array<SoftTlbEntry, kSoftTlbSize>, 2> soft_tlb_{};
     u32 tlb_gen_ = 1;
     // The generation of the fetch cache, which knows neither the context
     // nor the TLB entry its translations came from.
@@ -819,6 +863,13 @@ private:
     u64 idle_retry_ = 0;                           // the step from which another place may be watched
     u64 idle_instructions_ = 0, idle_time_fx_ = 0;
     std::string halt_reason_;
+
+    // The large tables, last: translated code then reaches every member
+    // above with an offset an AArch64 load or store takes in itself (up to
+    // 32 KiB).
+    std::array<FetchEntry, kFetchEntries> fetch_cache_{};
+    std::array<FastTable, kFastClasses> fast_{};
+    std::array<std::array<SoftTlbEntry, kSoftTlbSize>, 2> soft_tlb_{};
 };
 
 }  // namespace uv::usparc

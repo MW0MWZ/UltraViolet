@@ -15,12 +15,20 @@
 // Guest registers are reached through three host registers holding the
 // current global set, the current window's outs, and its ins (its locals
 // follow them); they are loaded again after every call to execute(), which
-// may change the window or the global set.
+// may change the window or the global set. The guest registers a block uses
+// most are also kept in host registers (kCache) through its translation:
+// loaded as it starts if it reads them before writing them, changed there
+// only, and written back to memory on the way out and before anything that
+// may read them there (execute(), a call to C that does, a move of the
+// window), then loaded again after anything that may change them there.
+// The condition codes of a compare or the like feed a conditional branch or
+// move straight after it from the host's flags.
 #include "cpu/ultrasparc/ultrasparc.h"
 
 #if defined(__x86_64__) || defined(_M_X64)
 
 #include <cstddef>
+#include <optional>
 #include <vector>
 
 #include "cpu/ultrasparc/vis.h"
@@ -40,6 +48,11 @@ constexpr Reg kNpc = r13;  // npc chosen by a control transfer
 constexpr Reg kG = r14;    // the current global set: %g0-%g7
 constexpr Reg kO = r15;    // the current window's outs: %o0-%o7
 constexpr Reg kI = rbp;    // the current window's ins, then its locals
+
+// Guest registers kept in host registers (caller-saved, so loaded again
+// after any call; on Windows rsi and rdi are saved by the prologue).
+constexpr Reg kCache[] = {rsi, rdi, r10, r11};
+constexpr unsigned kCacheRegs = sizeof(kCache) / sizeof(kCache[0]);
 
 #if defined(_WIN32)
 constexpr Reg kArg0 = rcx, kArg1 = rdx, kArg2 = r8, kArg3 = r9;
@@ -65,9 +78,10 @@ bool delayed_cti(u32 insn) {
 
 // The frame of a translation: the callee-saved registers, then (from rsp)
 // any shadow space for calls, cycles_ and instret_ as they were on entry,
-// the instructions started in the blocks before the current one (when one
-// went on into another), the budget given on entry, and room for MXCSR.
-constexpr s32 kCycles0 = kShadow, kInstret0 = kShadow + 8, kTotal = kShadow + 16, kBudget = kShadow + 24;
+// what is left of the budget once the blocks before the current one (when
+// one went on into another) are taken from it, the budget given on entry,
+// and room for MXCSR.
+constexpr s32 kCycles0 = kShadow, kInstret0 = kShadow + 8, kLeft = kShadow + 16, kBudget = kShadow + 24;
 constexpr s32 kMxcsr = kShadow + 32;  // the host's MXCSR, and the guest's at + 4, around an FPop
 constexpr s32 kFrame = 40 + kShadow;  // (with the pushes, keeps calls 16-byte aligned)
 
@@ -136,7 +150,8 @@ bool UltraSparc::jit_make_stubs() {
         e.call_to(ccr);  // the condition codes, for execute()
         e.sub_rsp(kStubFrame);
         e.mov(index, rcx);
-        e.alu(Alu::Add, rcx, Mem{rsp, kUp + kTotal});
+        e.alu(Alu::Add, rcx, Mem{rsp, kUp + kBudget});  // (the instructions started before)
+        e.alu(Alu::Sub, rcx, Mem{rsp, kUp + kLeft});
         e.mov(rax, Mem{rsp, kUp + kCycles0});
         e.alu(Alu::Add, rax, rcx);
         e.mov(at(cycles_), rax);
@@ -166,7 +181,8 @@ bool UltraSparc::jit_make_stubs() {
         for (std::size_t site : out) e.bind(site);
         e.mov(rax, index);
         e.alu_imm(Alu::Add, rax, 1);
-        e.alu(Alu::Add, rax, Mem{rsp, kUp + kTotal});
+        e.alu(Alu::Add, rax, Mem{rsp, kUp + kBudget});
+        e.alu(Alu::Sub, rax, Mem{rsp, kUp + kLeft});
         e.add_rsp(kUp);
         epilogue(e);
     };
@@ -234,15 +250,65 @@ bool UltraSparc::jit_make_stubs() {
     e.alu_imm(Alu::Add, rax, 4);
     e.mov(at(npc_), rax);
     body(true);
+    // Out of the translation with pc_ = rdx and npc_ = pc_ + 4 (at out),
+    // or first (at link) on into the translation of the block run_blocks()
+    // would run next, if its Block (at rax, the block's host address; rcx =
+    // the first slot of its set) has one for the same mode (r10) that it
+    // enters at the budget check; r9: where to note it, to go straight
+    // there next time while no code has been written (or 0).
+    static_assert(sizeof(JitLink) == 16 && offsetof(JitLink, gen) == 0 && offsetof(JitLink, target) == 8);
+    const std::size_t link = e.size();
+    {
+        std::vector<std::size_t> hit, no;
+        for (unsigned w = 0; w < kBlockWays; ++w) {
+            const s32 d = static_cast<s32>(w * sizeof(Block));
+            e.alu(Alu::Cmp, rax, Mem{rcx, d + static_cast<s32>(offsetof(Block, host))});
+            const std::size_t next = e.jcc(Cond::Ne);
+            if (d) e.alu_imm(Alu::Add, rcx, d);
+            hit.push_back(e.jmp());
+            e.bind(next);
+        }
+        no.push_back(e.jmp());
+        for (std::size_t site : hit) e.bind(site);
+        e.mov(r8, Mem{rcx, static_cast<s32>(offsetof(Block, code))});
+        e.test(r8, r8);
+        no.push_back(e.jcc(Cond::E));
+        e.movzx8(r11, Mem{rcx, static_cast<s32>(offsetof(Block, jit_mode))});
+        e.alu(Alu::Cmp, r11, r10, false);
+        no.push_back(e.jcc(Cond::Ne));
+        e.alu(Alu::Add, r8, at(jit_link_offset_));
+        e.test(r9, r9);
+        const std::size_t no_link = e.jcc(Cond::E);
+        e.alu_imm(Alu::Cmp, Mem{rcx, static_cast<s32>(offsetof(Block, loop))}, 0, false);
+        const std::size_t loop = e.jcc(Cond::Ne);  // (not into a delay loop, which looks up its block from C++)
+        e.mov(rax, at(code_gen_), false);
+        e.mov(Mem{r9, 0}, rax, false);
+        e.mov(Mem{r9, 8}, r8);
+        e.bind(no_link);
+        e.bind(loop);
+        e.mov(kPc, rdx);
+        e.jmp(r8);
+        for (std::size_t site : no) e.bind(site);
+    }
+    const std::size_t out = e.size();
+    e.mov(at(pc_), rdx);
+    e.lea(rax, Mem{rdx, 4});
+    e.mov(at(npc_), rax);
+    e.mov(rax, Mem{rsp, kBudget});  // the instructions started
+    e.alu(Alu::Sub, rax, Mem{rsp, kLeft});
+    e.call_to(ccr);  // the codes, for what follows in C++
+    epilogue(e);
     const auto* code = static_cast<const u8*>(jit_buf_->add(e.code(), e.size()));
     if (!code) return false;
     jit_stub_dyn_ = code + dyn;
     jit_stub_seq_ = code + seq;
     jit_stub_ccr_ = code + ccr;
+    jit_stub_link_ = code + link;
+    jit_stub_out_ = code + out;
     return true;
 }
 
-bool UltraSparc::jit_compile(Block& b) {
+int UltraSparc::jit_compile_pass(Block& b, const unsigned* label_dirty, unsigned* edge_dirty) {
     if (!jit_stub_dyn_ && !jit_make_stubs()) return false;
     const u8* const base = jit_buf_->next();  // where this code will be (calls to the stubs are relative)
     Emitter e;
@@ -265,13 +331,115 @@ bool UltraSparc::jit_compile(Block& b) {
         if (r < 24) return {kI, static_cast<s32>(64 + 8 * (r - 16))};
         return {kI, static_cast<s32>(8 * (r - 24))};
     };
+    // The blocks translated together (see jit_region()): b, then any that
+    // go round a loop with it, each at its offset from b's pc; the one
+    // being made, its offset and its length.
+    const Block* region[kRegionBlocks] = {&b};
+    s64 region_off[kRegionBlocks] = {0};
+    const unsigned regions = jit_check_ ? 1 : jit_region(b, region, region_off, kRegionBlocks);
+    const std::size_t links_before = jit_links_used_;
+    const Block* cur = &b;
+    s64 cur_off = 0;
+    unsigned n = b.length;
+    // The registers kept in kCache (see jit_cache_choice()).
+    int slot_of[32];
+    u8 cached[kCacheRegs];
+    bool cache_load[kCacheRegs];
+    const unsigned cache_used = jit_cache_choice(region, regions, kCacheRegs, cached, cache_load);
+    for (int& slot : slot_of) slot = -1;
+    for (unsigned slot = 0; slot < cache_used; ++slot) slot_of[cached[slot]] = static_cast<int>(slot);
+    auto cache_reg = [&](unsigned r) { return kCache[slot_of[r]]; };
+    bool r10_scratch = false;  // (an FPop's code using r10: its register already in memory)
+    // What the code being made has in the cache (a bit for each slot): the
+    // registers that hold their guest register's value, and those changed
+    // since it was in memory (as the instruction being made began, too, for
+    // its paths to execute(), which leave before it changes any). A block
+    // that goes back to its own start, or blocks translated together, load
+    // all of them first and write all of them out, as one time round may
+    // leave before another changes them again; each of the blocks starts
+    // with them all.
+    bool self_loop = regions > 1;
+    for (unsigned i = 0; i < b.length && !self_loop; ++i) {
+        const u32 insn = b.insns[i];
+        const unsigned op = insn >> 30, op2 = (insn >> 22) & 7;
+        const s64 here = 4 * static_cast<s64>(i);
+        if (op == 1) self_loop = here + (sext(insn, 30) << 2) == 0;
+        else if (op == 0 && (op2 == 1 || op2 == 5)) self_loop = here + (sext(insn, 19) << 2) == 0;
+        else if (op == 0 && (op2 == 2 || op2 == 6)) self_loop = here + (sext(insn, 22) << 2) == 0;
+        else if (op == 0 && op2 == 3) self_loop = here + (sext((((insn >> 20) & 3) << 14) | (insn & 0x3FFF), 16) << 2) == 0;
+    }
+    const unsigned cache_all = (1u << cache_used) - 1;
+    unsigned cache_valid = 0, cache_dirty = 0, pre_dirty = 0;
+    auto slot_bit = [&](unsigned r) { return 1u << slot_of[r]; };
+    // The changed registers to memory (before anything there may read them,
+    // and on the way out), and registers from memory (after a change
+    // there, or of window).
+    auto flush_cache = [&](bool windowed_only = false, unsigned which = ~0u) {
+        if (which == ~0u) which = cache_dirty;
+        for (unsigned s = 0; s < cache_used; ++s)
+            if ((which >> s & 1) && (!windowed_only || cached[s] >= 8) && !(r10_scratch && kCache[s] == r10))
+                e.mov(reg_mem(cached[s]), kCache[s]);
+    };
+    auto reload_cache = [&](bool windowed_only = false) {
+        for (unsigned s = 0; s < cache_used; ++s) {
+            if (windowed_only && cached[s] < 8) continue;
+            e.mov(kCache[s], reg_mem(cached[s]));
+            cache_valid |= 1u << s;
+            cache_dirty &= ~(1u << s);
+        }
+    };
+    // A cached register read before the code has it, which the choice of
+    // registers rules out: the translation is not used.
+    bool cache_miss = false;
+    auto have = [&](unsigned r) {
+        if (cache_valid & slot_bit(r)) return;
+        cache_miss = true;
+        e.mov(cache_reg(r), reg_mem(r));
+        cache_valid |= slot_bit(r);
+    };
+    auto changed = [&](unsigned r) { cache_valid |= slot_bit(r), cache_dirty |= slot_bit(r); };
     // (Loads leave the host flags alone.)
     auto load_reg = [&](Reg dst, unsigned r) {
         if (r == 0) e.mov_imm32(dst, 0);
+        else if (slot_of[r] >= 0) {
+            have(r);
+            if (dst != cache_reg(r)) e.mov(dst, cache_reg(r));
+        } else e.mov(dst, reg_mem(r));
+    };
+    // From memory, for arguments to C (which may be cache registers; the
+    // cache written out first).
+    auto load_reg_mem = [&](Reg dst, unsigned r) {
+        if (r == 0) e.mov_imm32(dst, 0);
         else e.mov(dst, reg_mem(r));
     };
+    auto add_reg = [&](Reg dst, unsigned r) {
+        if (r == 0) return;
+        if (slot_of[r] >= 0) have(r), e.alu(Alu::Add, dst, cache_reg(r));
+        else e.alu(Alu::Add, dst, reg_mem(r));
+    };
     auto store_reg = [&](unsigned r, Reg src) {
-        if (r != 0) e.mov(reg_mem(r), src);
+        if (r == 0) return;
+        if (slot_of[r] < 0) {
+            e.mov(reg_mem(r), src);
+            return;
+        }
+        if (src != cache_reg(r)) e.mov(cache_reg(r), src);
+        changed(r);
+    };
+    // A guest register as an operand: its cache register (which must not be
+    // changed), or loaded into `scratch`.
+    auto use_reg = [&](unsigned r, Reg scratch) -> Reg {
+        if (r != 0 && slot_of[r] >= 0) return have(r), cache_reg(r);
+        load_reg(scratch, r);
+        return scratch;
+    };
+    // Where to make a result for rd: its cache register, or `scratch`, which
+    // put_reg() then stores.
+    auto def_reg = [&](unsigned rd, Reg scratch) -> Reg { return rd != 0 && slot_of[rd] >= 0 ? cache_reg(rd) : scratch; };
+    auto put_reg = [&](unsigned rd, Reg r) {
+        if (rd == 0) return;
+        if (slot_of[rd] < 0) e.mov(reg_mem(rd), r);
+        else changed(rd);
     };
     auto load_imm = [&](Reg dst, s64 v) {
         if (v >= 0 && v <= 0xFFFFFFFF) e.mov_imm32(dst, static_cast<u32>(v));
@@ -288,12 +456,15 @@ bool UltraSparc::jit_compile(Block& b) {
         e.mov(kO, at(base_[1]));
         e.mov(kI, at(base_[3]));
     };
-    // r = the pc of the block's first instruction + off (r11 is scratch).
+    // r = the pc of the block's first instruction + off.
     auto pc_plus = [&](Reg r, s64 off) {
-        if (r != kPc) e.mov(r, kPc);
         if (off >= INT32_MIN && off <= INT32_MAX) {
-            if (off) e.alu_imm(Alu::Add, r, static_cast<s32>(off));
-        } else {
+            if (r != kPc) e.lea(r, Mem{kPc, static_cast<s32>(off)});
+            else if (off) e.alu_imm(Alu::Add, r, static_cast<s32>(off));
+        } else if (r != kPc) {
+            e.mov_imm64(r, static_cast<u64>(off));
+            e.alu(Alu::Add, r, kPc);
+        } else {  // (only on the way into another translation, which loads its own cache)
             e.mov_imm64(r11, static_cast<u64>(off));
             e.alu(Alu::Add, r, r11);
         }
@@ -302,15 +473,24 @@ bool UltraSparc::jit_compile(Block& b) {
         if (am) e.mov32(r, r);
     };
 
-    // On the stack: cycles_ and instret_ as they were on entry; the
-    // instructions started in the blocks before this one (when one went on
-    // into another); and the budget given on entry.
-    const Mem m_cycles0{rsp, kCycles0}, m_instret0{rsp, kInstret0}, m_total{rsp, kTotal}, m_budget{rsp, kBudget};
+    // On the stack: cycles_ and instret_ as they were on entry; what is
+    // left of the budget given on entry, once the blocks before this one
+    // (when one went on into another) are taken from it; and that budget.
+    const Mem m_cycles0{rsp, kCycles0}, m_instret0{rsp, kInstret0}, m_left{rsp, kLeft}, m_budget{rsp, kBudget};
+    auto add_total = [&](Reg r) {  // r += the instructions started in the blocks before this one
+        e.alu(Alu::Add, r, m_budget);
+        e.alu(Alu::Sub, r, m_left);
+    };
+    auto total_into = [&](Reg r) {
+        e.mov(r, m_budget);
+        e.alu(Alu::Sub, r, m_left);
+    };
 
     std::vector<std::size_t> exits;
     auto leave = [&](u32 started) {  // with this block's first `started` instructions started
+        flush_cache();
         e.mov_imm32(rax, started);
-        e.alu(Alu::Add, rax, m_total);
+        add_total(rax);
         exits.push_back(e.jmp());
     };
     auto store_pc_npc = [&](s64 off) {  // pc_ = block pc + off, npc_ = pc_ + 4
@@ -333,7 +513,16 @@ bool UltraSparc::jit_compile(Block& b) {
     bool dynamic = false;
     bool known_target = false, may_fall = false;
     s64 target = 0, fall = 0;
-    const unsigned n = b.length;
+    // A known npc (that offset from the block's pc) not yet put in kNpc:
+    // only the ways to execute() and out of the block read it there.
+    bool npc_lazy = false;
+    s64 npc_off = 0;
+    auto set_npc = [&](s64 off) { npc_lazy = true, npc_off = off; };
+    auto npc_ready = [&] {
+        if (!npc_lazy) return;
+        pc_plus(kNpc, npc_off);
+        mask(kNpc);
+    };
 
     // The block is done: go on into the translation of the block run_blocks()
     // would run next, if it has one for the same mode that fits in the
@@ -346,53 +535,23 @@ bool UltraSparc::jit_compile(Block& b) {
     // to its own start needs only the budget checked.
     const u8 mode = static_cast<u8>(jit_mode());
     const u16 fmode_fetch = fetch_mode();
-    const s64 page_off = static_cast<s64>(pc_ & 0x1FFF);  // (the same for every virtual alias)
+    const s64 first_page_off = static_cast<s64>(pc_ & 0x1FFF);  // (the same for every virtual alias)
+    s64 page_off = first_page_off;  // (the block being made's)
     static_assert(sizeof(FetchEntry) == 32);
     static_assert(offsetof(FetchEntry, va_page) == 0 && offsetof(FetchEntry, gen) == 8 && offsetof(FetchEntry, mode) == 12 &&
                   offsetof(FetchEntry, host) == 16);
-    // Jumps to the translation in r8 for the block at rdx if its Block
-    // (rcx) is for the same mode and fits in the budget; else to `no`.
-    // rax = a block's host address, rcx = the first slot of its set: rcx =
-    // the way holding it and r8 = its translation, or out through `no`.
-    auto find_way = [&](std::vector<std::size_t>& no) {
-        std::vector<std::size_t> hit;
-        for (unsigned w = 0; w < kBlockWays; ++w) {
-            const s32 d = static_cast<s32>(w * sizeof(Block));
-            e.alu(Alu::Cmp, rax, Mem{rcx, d + static_cast<s32>(offsetof(Block, host))});
-            const std::size_t next = e.jcc(Cond::Ne);
-            if (d) e.alu_imm(Alu::Add, rcx, d);
-            hit.push_back(e.jmp());
-            e.bind(next);
-        }
-        no.push_back(e.jmp());
-        for (std::size_t site : hit) e.bind(site);
-        e.mov(r8, Mem{rcx, static_cast<s32>(offsetof(Block, code))});
-        e.test(r8, r8);
-        no.push_back(e.jcc(Cond::E));
-    };
-    // (A translation entered checks for itself that it fits the budget.)
-    // `link`: where to note the translation, to go straight there next
-    // time (see chain_to()).
-    static_assert(sizeof(JitLink) == 16 && offsetof(JitLink, gen) == 0 && offsetof(JitLink, target) == 8);
-    auto enter = [&](std::vector<std::size_t>& no, JitLink* link = nullptr) {
-        e.cmp8_imm(Mem{rcx, static_cast<s32>(offsetof(Block, jit_mode))}, mode);
-        no.push_back(e.jcc(Cond::Ne));
-        e.alu_imm(Alu::Add, r8, static_cast<s32>(jit_link_offset_));
-        if (link) {  // (not into a delay loop, which looks up its block from C++)
-            e.alu_imm(Alu::Cmp, Mem{rcx, static_cast<s32>(offsetof(Block, loop))}, 0, false);
-            const std::size_t no_link = e.jcc(Cond::Ne);
-            e.mov_imm64(r9, reinterpret_cast<u64>(link));
-            e.mov(rax, at(code_gen_), false);
-            e.mov(Mem{r9, 0}, rax, false);
-            e.mov(Mem{r9, 8}, r8);
-            e.bind(no_link);
-        }
-        e.mov(kPc, rdx);
-        e.jmp(r8);
+    // On through jit_stub_link_ to the block at rdx (its host address in
+    // rax, its set at rcx), noting it at `link` (in r9 already) if there
+    // is one.
+    auto look_up = [&](JitLink* link) {
+        if (!link) e.alu(Alu::Xor, r9, r9, false);
+        e.mov_imm32(r10, mode);
+        e.jmp_abs(static_cast<const u8*>(jit_stub_link_), base);
     };
     // (`count`: how many of this block's instructions were started.)
     auto chain = [&](unsigned count) {
-        e.alu_imm(Alu::Add, m_total, static_cast<s32>(count));
+        flush_cache();
+        e.alu_imm(Alu::Sub, m_left, static_cast<s32>(count));
         std::vector<std::size_t> no;
         e.mov(rax, rdx);
         e.alu(Alu::Xor, rax, kPc);
@@ -400,7 +559,7 @@ bool UltraSparc::jit_compile(Block& b) {
         const std::size_t other_page = e.jcc(Cond::Ne);
         e.mov(rax, rdx);  // its host address
         e.alu(Alu::Sub, rax, kPc);
-        e.mov_imm64(rcx, reinterpret_cast<u64>(b.host));
+        e.mov_imm64(rcx, reinterpret_cast<u64>(cur->host));
         e.alu(Alu::Add, rax, rcx);
         const std::size_t found = e.jmp();
         e.bind(other_page);
@@ -435,14 +594,18 @@ bool UltraSparc::jit_compile(Block& b) {
         e.imul_imm(rcx, rcx, static_cast<s32>(kBlockWays * sizeof(Block)));
         e.mov_imm64(r8, reinterpret_cast<u64>(blocks_.data()));
         e.alu(Alu::Add, rcx, r8);
-        find_way(no);
-        enter(no);
+        look_up(nullptr);
         for (std::size_t site : no) e.bind(site);
-        store_pc_npc_from(rdx);
-        e.mov(rax, m_total);
-        exits.push_back(e.jmp());
+        e.jmp_abs(static_cast<const u8*>(jit_stub_out_), base);
     };
-    std::size_t body = 0;  // where the translation of this block's instructions starts
+    // Where the code of each block's instructions starts (0 until made), and
+    // the jumps to one not made yet.
+    std::size_t body[kRegionBlocks] = {};
+    struct Ahead {
+        std::size_t site;
+        unsigned to;
+    };
+    std::vector<Ahead> ahead;
     auto chain_to = [&](s64 delta, unsigned count) {
         if (page_off + delta < 0 || page_off + delta >= 0x2000) {
             pc_plus(rdx, delta);
@@ -450,39 +613,52 @@ bool UltraSparc::jit_compile(Block& b) {
             chain(count);
             return;
         }
-        e.alu_imm(Alu::Add, m_total, static_cast<s32>(count));
+        e.alu_imm(Alu::Sub, m_left, static_cast<s32>(count));
         std::vector<std::size_t> no;
+        const unsigned valid = cache_valid, dirty_now = cache_dirty;  // (as the code after, on another path, has them)
         // The back edge of a delay loop (to this block's start, or to an
         // earlier block of a polling loop ending here): the iterations that
         // fit at once.
-        const s64 loop_back = (b.loop >> 30) == 3 ? -4 * static_cast<s64>((b.loop >> kLoopBackShift) & kLoopBackMask) : 0;
-        if (b.loop && delta == loop_back && count == n) {
+        const s64 loop_back = (cur->loop >> 30) == 3 ? -4 * static_cast<s64>((cur->loop >> kLoopBackShift) & kLoopBackMask) : 0;
+        if (cur->loop && delta == loop_back && count == n) {
             e.call_abs(static_cast<const u8*>(jit_stub_ccr_), base);  // (the loop runs in C++)
+            flush_cache();
             e.mov(kArg0, kCpu);
-            e.mov_imm32(kArg1, b.loop);
-            e.mov(kArg2, m_budget);
-            e.alu(Alu::Sub, kArg2, m_total);
+            e.mov_imm32(kArg1, cur->loop);
+            e.mov(kArg2, m_left);
             e.mov(kArg3, m_cycles0);  // the next instruction's step
-            e.alu(Alu::Add, kArg3, m_total);
+            add_total(kArg3);
             e.mov_imm64(rax, reinterpret_cast<u64>(&jit_loop_at_once));
             e.call(rax);
+            reload_cache();
             e.test(rax, rax);
             const std::size_t none = e.jcc(Cond::E);
-            e.alu(Alu::Add, rax, m_total);
-            e.mov(m_total, rax);
+            e.alu(Alu::Sub, m_left, rax);
             e.cmp8_imm(at(delay_charged_), 0);  // charged other than the usual rate: out (so the check below leaves)
             const std::size_t usual = e.jcc(Cond::E);
+            total_into(rax);
             e.mov(m_budget, rax);
+            e.mov_store_imm(m_left, 0);
             e.bind(usual);
             e.bind(none);
         }
-        if (delta == 0 && count == n) {
-            e.mov(r9, m_total);
-            e.alu_imm(Alu::Add, r9, static_cast<s32>(n));
-            e.alu(Alu::Cmp, r9, m_budget);
-            no.push_back(e.jcc(Cond::A));
-            e.jmp_to(body);
+        unsigned to = 0;  // (a block translated with this one, if it goes there)
+        while (to < regions && region_off[to] != cur_off + delta) ++to;
+        if (to < regions) {
+            // Straight on to its code, the registers kept, while it fits
+            // (past the cache's loads: it holds the registers); the pc is
+            // its either way.
+            if (delta) pc_plus(kPc, delta);
+            e.alu_imm(Alu::Cmp, m_left, static_cast<s32>(region[to]->length));
+            edge_dirty[to] |= cache_dirty;
+            if (body[to]) e.jcc_to(Cond::Ge, body[to]);
+            else ahead.push_back({e.jcc(Cond::Ge), to});
+            flush_cache();
+            store_pc_npc(0);
+            total_into(rax);
+            exits.push_back(e.jmp());
         } else {
+            flush_cache();
             // Straight into the translation found the last time, while no
             // code has been written since; otherwise looked up, and noted.
             JitLink* const link = new_jit_link();
@@ -496,17 +672,13 @@ bool UltraSparc::jit_compile(Block& b) {
                 e.jmp(Mem{r9, 8});
                 e.bind(look);
             }
-            const u8* host = b.host + delta;
+            const u8* host = cur->host + delta;
             e.mov_imm64(rcx, reinterpret_cast<u64>(&blocks_[block_set(host)]));
             e.mov_imm64(rax, reinterpret_cast<u64>(host));
-            find_way(no);
             pc_plus(rdx, delta);
-            enter(no, link);
+            look_up(link);
         }
-        for (std::size_t site : no) e.bind(site);
-        store_pc_npc(delta);
-        e.mov(rax, m_total);
-        exits.push_back(e.jmp());
+        cache_valid = valid, cache_dirty = dirty_now;
     };
     bool self = true;  // no instruction goes to execute()
 
@@ -516,9 +688,35 @@ bool UltraSparc::jit_compile(Block& b) {
     // a block it goes on into).
     auto call_execute = [&](unsigned i, u32 insn) {
         self = false;
+        if (dynamic) npc_ready();
+        flush_cache(false, pre_dirty);
         e.mov_imm32(rcx, i);
         e.mov_imm32(rdx, insn);
         e.call_abs(static_cast<const u8*>(dynamic ? jit_stub_dyn_ : jit_stub_seq_), base);
+        const unsigned valid = cache_valid, dirty_now = cache_dirty;  // (this path's own; the code after goes on from the other's)
+        reload_cache();
+        cache_valid = valid, cache_dirty = dirty_now;
+    };
+    // The way to execute() of an instruction done here most of the time,
+    // from the jumps at `sites`: made after the end of the block, so that
+    // the usual path runs straight on, then back to where the usual path
+    // goes on from (or `then`: npc from npc_ first, or out of the block).
+    enum class Then { Back, Npc, Leave };
+    struct Cold {
+        std::vector<std::size_t> sites;
+        unsigned i;
+        u32 insn;
+        std::size_t back;
+        Then then;
+        bool dynamic, r10, npc_lazy;
+        s64 npc_off;
+        unsigned pre_dirty, valid, dirty;
+    };
+    std::vector<Cold> cold;
+    auto out_of_line = [&](std::vector<std::size_t> sites, unsigned i, u32 insn, Then then = Then::Back) {
+        self = false;
+        cold.push_back({std::move(sites), i, insn, e.size(), then, dynamic, r10_scratch, npc_lazy, npc_off, pre_dirty, cache_valid,
+                        cache_dirty});
     };
 
     // The condition codes from the host flags of a 32-bit operation (in
@@ -563,9 +761,42 @@ bool UltraSparc::jit_compile(Block& b) {
         e.mov8_imm(at(cc_op_), static_cast<u8>(kind));
         codes = kind;
     };
-    // The instruction whose code comes next, if the operands (or result) of
-    // the lazy codes are also in rax and rcx for it.
-    int codes_in_regs = -1;
+    // The instruction that reads the lazy codes straight from the host's
+    // flags, as the operation before it left them (for icc, or xcc).
+    int flags_at = -1;
+    bool flags_xcc = false;
+    // A conditional branch one way of which is made after the rest (see
+    // cond_branch): the jump to it, its target, whether that is out of the
+    // block with the delay slot annulled (after `count` instructions) or the
+    // delay slot made again, and what the code had at the jump.
+    struct Split {
+        std::size_t taken;
+        s64 target;
+        bool annulled;
+        unsigned count;
+        unsigned valid, dirty;
+        bool r10;
+        Cc codes;
+    };
+    std::optional<Split> split;
+    // Whether instruction i + 1 is a conditional branch or move on icc (1)
+    // or xcc (2) that may take the codes from the host's flags.
+    auto flags_user = [&](unsigned i) -> int {
+        if (dynamic || i + 1 >= n) return 0;
+        const u32 next = cur->insns[i + 1];
+        const unsigned op = next >> 30, cond = (next >> 25) & 15;
+        if (op == 0) {
+            const unsigned op2 = (next >> 22) & 7;
+            if (op2 == 2 && (cond & 7)) return 1;                          // Bicc
+            if (op2 == 1 && (cond & 7) && !((next >> 20) & 1)) return (next >> 21) & 1 ? 2 : 1;  // BPcc
+            return 0;
+        }
+        if (op == 2 && ((next >> 19) & 0x3F) == 0x2C && ((next >> 18) & 1)) {  // MOVcc
+            const unsigned cc = (next >> 11) & 3;
+            if (!(cc & 1) && (((next >> 14) & 15) & 7)) return cc == 2 ? 2 : 1;
+        }
+        return 0;
+    };
     auto store_ccr = [&](Reg f32, Reg f64) {
         ccr_into(f32, f64);
         write_ccr(f64);
@@ -585,22 +816,20 @@ bool UltraSparc::jit_compile(Block& b) {
     // host's SF ZF OF CF, so each icc/xcc condition is one of the host's.
     static constexpr Cond kIccHost[16] = {Cond::E, Cond::E, Cond::Le, Cond::L, Cond::Be, Cond::B, Cond::S, Cond::O,
                                           Cond::E, Cond::Ne, Cond::G, Cond::Ge, Cond::A, Cond::Ae, Cond::Ns, Cond::No};
-    // eax = 1 if icc/xcc condition `cond` holds, else 0 (ZF set if not):
-    // from the operands again while the codes are lazy. Clobbers rcx.
-    auto eval_icc = [&](unsigned cond, bool xcc, int i = -1) {
+    // The host condition that holds when icc/xcc condition `cond` (not
+    // always or never) does, for instruction i: the host's flags as the
+    // operation before left them, or from the operands again while the codes
+    // are lazy, or from ccr_. Clobbers rax and rcx.
+    auto icc_cond = [&](unsigned cond, bool xcc, int i) -> Cond {
         if (lazy()) {
-            if (i < 0 || codes_in_regs != i) {
-                e.mov(rax, at(cc_a_));
-                if (codes != Cc::Logic) e.mov(rcx, at(cc_b_));
-            }
+            if (i >= 0 && flags_at == i && flags_xcc == xcc) return kIccHost[cond];
+            e.mov(rax, at(cc_a_));
+            if (codes != Cc::Logic) e.mov(rcx, at(cc_b_));
             if (codes == Cc::Sub) e.alu(Alu::Cmp, rax, rcx, xcc);
             else if (codes == Cc::Add) e.alu(Alu::Add, rax, rcx, xcc);
             else if (xcc) e.test(rax, rax);
             else e.test32(rax, rax);
-            e.setcc(kIccHost[cond], rax);
-            e.movzx8(rax, rax);
-            e.test32(rax, rax);
-            return;
+            return kIccHost[cond];
         }
         ccr_ready();
         e.movzx8(rax, m_ccr);
@@ -609,7 +838,19 @@ bool UltraSparc::jit_compile(Block& b) {
         e.mov32(rcx, rax);
         e.mov_imm32(rax, icc_table[cond]);
         e.shift_cl(Shift::Shr, rax, false);
-        e.alu_imm(Alu::And, rax, 1, false);
+        e.test_imm(rax, 1);
+        return Cond::Ne;
+    };
+    // eax = 1 if icc/xcc condition `cond` holds, else 0 (ZF set if not).
+    // Clobbers rcx.
+    auto eval_icc = [&](unsigned cond, bool xcc) {
+        if (cond == 0 || cond == 8) {
+            e.mov_imm32(rax, cond == 8);
+        } else {
+            e.setcc(icc_cond(cond, xcc, -1), rax);
+            e.movzx8(rax, rax);
+        }
+        e.test32(rax, rax);
     };
     // eax = 1 if register rcond `rcond` holds for r, else 0.
     auto eval_rcond = [&](unsigned rcond, unsigned r) {
@@ -672,35 +913,84 @@ bool UltraSparc::jit_compile(Block& b) {
             const unsigned kind = op3 & 7;
             const bool cc = op3 & 0x10;
             if (!cc && rd == 0) return true;
-            load_reg(rax, rs1);
-            load_op2(rcx, insn);
-            if (kind == 0 || kind == 4) {
-                const Alu op = kind == 0 ? Alu::Add : Alu::Sub;
-                if (cc) {  // (the result in rdx, the operands kept for a branch next)
-                    e.mov(at(cc_a_), rax);
-                    e.mov(at(cc_b_), rcx);
-                    lazy_codes(kind == 0 ? Cc::Add : Cc::Sub);
-                    if (rd != 0) {
-                        e.mov(rdx, rax);
-                        e.alu(op, rdx, rcx);
-                        store_reg(rd, rdx);
-                    }
-                    if (!dynamic) codes_in_regs = static_cast<int>(i + 1);
-                    return true;
-                } else {
-                    e.alu(op, rax, rcx);
-                }
-            } else {
-                if (kind == 5 || kind == 6) e.not_(rcx);
-                e.alu(kind == 1 || kind == 5 ? Alu::And : kind == 2 || kind == 6 ? Alu::Or : Alu::Xor, rax, rcx);
-                if (kind == 7) e.not_(rax);
-                if (cc) {
-                    e.mov(at(cc_a_), rax);
-                    lazy_codes(Cc::Logic);
-                    if (!dynamic) codes_in_regs = static_cast<int>(i + 1);
+            // a = rs1, and operand 2 in b or as v; the result made in d.
+            const bool arith = kind == 0 || kind == 4;
+            const int user = cc ? flags_user(i) : 0;
+            const Alu op = kind == 0 ? Alu::Add : kind == 4 ? Alu::Sub : kind == 1 || kind == 5 ? Alu::And
+                           : kind == 2 || kind == 6 ? Alu::Or : Alu::Xor;
+            const Reg d = def_reg(rd, rdx);
+            const unsigned rs2 = insn & 31;
+            auto in_memory = [&](unsigned r) { return r != 0 && slot_of[r] < 0; };
+            // Without the codes: rs1 from memory straight into d (unless d
+            // is rs2's cache register), and rs2 from memory as an operand.
+            const bool b_mem = !cc && !imm && kind != 5 && kind != 6 && in_memory(rs2);
+            const bool a_in_d = !cc && in_memory(rs1) && !(!imm && rs2 == rd && slot_of[rd] >= 0);
+            Reg a = rax;
+            if (a_in_d) load_reg(d, rs1), a = d;
+            else a = use_reg(rs1, rax);
+            Reg bv = rcx;
+            const s64 v = imm ? sext(insn, 13) : 0;
+            if (!imm && !b_mem) bv = use_reg(rs2, rcx);
+            if (cc && arith) {  // (the operands kept for the codes)
+                e.mov(at(cc_a_), a);
+                if (imm) e.mov_store_imm(at(cc_b_), static_cast<s32>(v));
+                else e.mov(at(cc_b_), bv);
+                lazy_codes(kind == 0 ? Cc::Add : Cc::Sub);
+                if (user && a == d) e.mov(rax, a), a = rax;
+                if (user && !imm && bv == d) e.mov(rcx, bv), bv = rcx;
+            }
+            if (kind == 5 || kind == 6) {  // ANDN, ORN: operand 2 inverted
+                if (!imm) {
+                    if (bv != rcx) e.mov(rcx, bv);
+                    e.not_(rcx);
+                    bv = rcx;
                 }
             }
-            store_reg(rd, rax);
+            const s64 w = kind == 5 || kind == 6 ? ~v : v;
+            if (cc && arith && rd == 0) {
+                // (only the codes)
+            } else if (!cc && rs1 == 0 && (kind == 0 || kind == 2 || kind == 3)) {  // a move
+                if (imm) load_imm(d, v);
+                else if (b_mem) e.mov(d, reg_mem(rs2));
+                else if (d != bv) e.mov(d, bv);
+            } else if (imm && !cc && kind == 1 && v == 0xFF) {  // the low byte
+                e.movzx8(d, a);
+            } else if (imm) {
+                if (d != a) e.mov(d, a);
+                e.alu_imm(op, d, static_cast<s32>(w));
+            } else if (b_mem) {
+                if (d != a) e.mov(d, a);
+                e.alu(op, d, reg_mem(rs2));
+            } else if (d == bv && d != a) {
+                if (op == Alu::Sub) {
+                    e.mov(r8, a);
+                    e.alu(op, r8, bv);
+                    e.mov(d, r8);
+                } else {
+                    e.alu(op, d, a);
+                }
+            } else {
+                if (d != a) e.mov(d, a);
+                e.alu(op, d, bv);
+            }
+            if (kind == 7) e.not_(d);
+            if (!(cc && arith && rd == 0)) put_reg(rd, d);
+            if (cc && !arith) {
+                e.mov(at(cc_a_), d);
+                lazy_codes(Cc::Logic);
+                if (user == 2) e.test(d, d);
+                else if (user) e.test32(d, d);
+            } else if (user) {  // the codes in the host's flags for the instruction after
+                if (kind == 4) {
+                    if (imm) e.alu_imm(Alu::Cmp, a, static_cast<s32>(v), user == 2);
+                    else e.alu(Alu::Cmp, a, bv, user == 2);
+                } else {
+                    e.mov(r8, a);
+                    if (imm) e.alu_imm(Alu::Add, r8, static_cast<s32>(v), user == 2);
+                    else e.alu(Alu::Add, r8, bv, user == 2);
+                }
+            }
+            if (user) flags_at = static_cast<int>(i + 1), flags_xcc = user == 2;
             return true;
         }
         switch (op3) {
@@ -711,26 +1001,26 @@ bool UltraSparc::jit_compile(Block& b) {
                 const bool cc = op3 & 0x10;
                 const Alu op = op3 & 4 ? Alu::Sbb : Alu::Adc;
                 if (!cc && rd == 0) return true;
-                auto carry_in = [&] {  // CF = icc.C
-                    e.movzx8(r10, m_ccr);
-                    e.shift_imm(Shift::Shr, r10, 1, false);
+                auto carry_in = [&](Reg t) {  // CF = icc.C
+                    e.movzx8(t, m_ccr);
+                    e.shift_imm(Shift::Shr, t, 1, false);
                 };
                 ccr_ready();
                 load_reg(rax, rs1);
                 load_op2(rcx, insn);
                 if (cc) {
                     e.mov(rdx, rax);
-                    carry_in();
+                    carry_in(r8);
                     e.alu(op, rdx, rcx, false);
                     e.pushfq();
                     e.pop(r8);
-                    carry_in();
+                    carry_in(r9);
                     e.alu(op, rax, rcx);
                     e.pushfq();
                     e.pop(r9);
                     store_ccr(r8, r9);
                 } else {
-                    carry_in();
+                    carry_in(r8);
                     e.alu(op, rax, rcx);
                 }
                 store_reg(rd, rax);
@@ -831,10 +1121,7 @@ bool UltraSparc::jit_compile(Block& b) {
                     }
                 }
                 store_reg(rd, rax);
-                const std::size_t done = e.jmp();
-                e.bind(by_zero);
-                call_execute(i, insn);
-                e.bind(done);
+                out_of_line({by_zero}, i, insn);
                 return true;
             }
             case 0x20:    // TADDcc
@@ -844,17 +1131,17 @@ bool UltraSparc::jit_compile(Block& b) {
                 const Alu op = op3 & 1 ? Alu::Sub : Alu::Add;
                 load_reg(rax, rs1);
                 load_op2(rcx, insn);
-                e.mov(r10, rax);
-                e.alu(Alu::Or, r10, rcx);
+                e.mov(r8, rax);  // the tags
+                e.alu(Alu::Or, r8, rcx);
                 e.mov(rdx, rax);
                 e.alu(op, rdx, rcx, false);
                 e.pushfq();
-                e.pop(r8);
+                e.pop(rdx);
                 e.alu(op, rax, rcx);
                 e.pushfq();
                 e.pop(r9);
-                ccr_into(r8, r9);
-                e.test_imm(r10, 3);
+                ccr_into(rdx, r9);
+                e.test_imm(r8, 3);
                 const std::size_t untagged = e.jcc(Cond::E);
                 e.alu_imm(Alu::Or, r9, 2, false);
                 e.bind(untagged);
@@ -866,10 +1153,7 @@ bool UltraSparc::jit_compile(Block& b) {
                 write_ccr(r9);
                 store_reg(rd, rax);
                 if (overflow) {
-                    const std::size_t done = e.jmp();
-                    e.bind(overflow);
-                    call_execute(i, insn);
-                    e.bind(done);
+                    out_of_line({overflow}, i, insn);
                 }
                 return true;
             }
@@ -907,8 +1191,19 @@ bool UltraSparc::jit_compile(Block& b) {
                 ccr_ready();
                 load_reg(rax, rs1);
                 load_op2(rcx, insn);
-                e.mov(r10, at(y_));
-                e.mov(r11, rax);  // rs1, for Y
+                e.mov32(rcx, rcx);
+                e.mov_imm32(rdx, 0);
+                e.test8_imm(at(y_), 1);
+                e.cmov(Cond::E, rcx, rdx);  // op2
+                // Y = Y >> 1 with rs1<0> into bit 31.
+                e.mov(rdx, at(y_));
+                e.mov32(rdx, rdx);
+                e.shift_imm(Shift::Shr, rdx, 1, false);
+                e.mov(r8, rax);
+                e.alu_imm(Alu::And, r8, 1, false);
+                e.shift_imm(Shift::Shl, r8, 31, false);
+                e.alu(Alu::Or, rdx, r8, false);
+                e.mov(at(y_), rdx);
                 e.mov32(rax, rax);
                 e.shift_imm(Shift::Shr, rax, 1, false);
                 e.movzx8(rdx, m_ccr);
@@ -919,10 +1214,6 @@ bool UltraSparc::jit_compile(Block& b) {
                 e.alu_imm(Alu::And, rdx, 1, false);
                 e.shift_imm(Shift::Shl, rdx, 31, false);
                 e.alu(Alu::Or, rax, rdx, false);        // op1
-                e.mov32(rcx, rcx);
-                e.test_imm(r10, 1);
-                e.mov_imm32(rdx, 0);
-                e.cmov(Cond::E, rcx, rdx);              // op2
                 e.mov(rdx, rax);
                 e.alu(Alu::Add, rdx, rcx, false);
                 e.pushfq();
@@ -933,13 +1224,6 @@ bool UltraSparc::jit_compile(Block& b) {
                 store_ccr(r8, r9);
                 e.mov32(rax, rax);
                 store_reg(rd, rax);
-                // Y = Y >> 1 with rs1<0> into bit 31.
-                e.mov32(r10, r10);
-                e.shift_imm(Shift::Shr, r10, 1, false);
-                e.alu_imm(Alu::And, r11, 1, false);
-                e.shift_imm(Shift::Shl, r11, 31, false);
-                e.alu(Alu::Or, r10, r11, false);
-                e.mov(at(y_), r10);
                 return true;
             }
             case 0x09:  // MULX
@@ -955,18 +1239,28 @@ bool UltraSparc::jit_compile(Block& b) {
                 if (rd == 0) return true;
                 const bool x = (insn >> 12) & 1;
                 const Shift sh = op3 == 0x25 ? Shift::Shl : op3 == 0x26 ? Shift::Shr : Shift::Sar;
-                load_reg(rax, rs1);
-                if (!x && op3 == 0x26) e.mov32(rax, rax);
-                if (!x && op3 == 0x27) e.movsxd(rax, rax);
-                if (imm) {
-                    const unsigned count = insn & (x ? 63 : 31);
-                    if (count) e.shift_imm(sh, rax, static_cast<u8>(count), true);
-                } else {
+                if (!imm) {  // the count in cl first (rd may be rs2)
                     load_reg(rcx, insn & 31);
                     e.alu_imm(Alu::And, rcx, x ? 63 : 31, false);
-                    e.shift_cl(sh, rax, true);
                 }
-                store_reg(rd, rax);
+                const Reg d = def_reg(rd, rax);
+                if (rs1 != 0 && slot_of[rs1] < 0) {  // (straight from memory)
+                    if (!x && op3 == 0x26) e.mov(d, reg_mem(rs1), false);
+                    else if (!x && op3 == 0x27) e.movsxd(d, reg_mem(rs1));
+                    else e.mov(d, reg_mem(rs1));
+                } else {
+                    const Reg a = use_reg(rs1, rax);
+                    if (!x && op3 == 0x26) e.mov32(d, a);
+                    else if (!x && op3 == 0x27) e.movsxd(d, a);
+                    else if (d != a) e.mov(d, a);
+                }
+                if (imm) {
+                    const unsigned count = insn & (x ? 63 : 31);
+                    if (count) e.shift_imm(sh, d, static_cast<u8>(count), true);
+                } else {
+                    e.shift_cl(sh, d, true);
+                }
+                put_reg(rd, d);
                 return true;
             }
             case 0x2C: {  // MOVcc on icc/xcc (MOVFcc on fcc_n: fp_disabled from execute())
@@ -982,34 +1276,39 @@ bool UltraSparc::jit_compile(Block& b) {
                     e.test32(rax, rax);
                     e.cmov(Cond::Ne, r8, rdx);
                     store_reg(rd, r8);
-                    const std::size_t done = e.jmp();
-                    for (std::size_t site : off) e.bind(site);
-                    call_execute(i, insn);
-                    e.bind(done);
+                    out_of_line(std::move(off), i, insn);
                     return true;
                 }
                 if (cc & 1) return false;
-                if (rd == 0) return true;
-                eval_icc((insn >> 14) & 15, cc == 2);
+                const unsigned cond = (insn >> 14) & 15;
+                if (rd == 0 || cond == 0) return true;
+                const Cond c = cond == 8 ? Cond::E : icc_cond(cond, cc == 2, static_cast<int>(i));
+                Reg src = rdx;
                 if (imm) load_imm(rdx, sext(insn, 11));
-                else load_reg(rdx, insn & 31);
-                load_reg(r8, rd);
-                e.test32(rax, rax);
-                e.cmov(Cond::Ne, r8, rdx);
-                store_reg(rd, r8);
+                else src = use_reg(insn & 31, rdx);
+                const Reg d = def_reg(rd, r8);
+                if (cond == 8) {
+                    if (d != src) e.mov(d, src);
+                } else {
+                    if (d == r8) load_reg(r8, rd);
+                    e.cmov(c, d, src);
+                }
+                put_reg(rd, d);
                 return true;
             }
             case 0x2F: {  // MOVr
                 const unsigned rcond = (insn >> 10) & 7;
                 if (!rcond_valid(rcond)) return false;
                 if (rd == 0) return true;
+                Reg src = rdx;
                 if (imm) load_imm(rdx, sext(insn, 10));
-                else load_reg(rdx, insn & 31);
-                load_reg(r8, rd);
-                load_reg(rax, rs1);
-                e.test(rax, rax);
-                e.cmov(kRcond[rcond], r8, rdx);
-                store_reg(rd, r8);
+                else src = use_reg(insn & 31, rdx);
+                const Reg d = def_reg(rd, r8);
+                if (d == r8) load_reg(r8, rd);
+                const Reg t = use_reg(rs1, rax);
+                e.test(t, t);
+                e.cmov(kRcond[rcond], d, src);
+                put_reg(rd, d);
                 return true;
             }
             default: return false;
@@ -1038,8 +1337,10 @@ bool UltraSparc::jit_compile(Block& b) {
         e.mov(at(base_[1]), kO);
     };
     // SAVE (to the next window) or RESTORE and RETURN (to the previous one),
-    // once the traps have been ruled out. Clobbers rax and rcx.
+    // once the traps have been ruled out, the cache loaded for the new
+    // window. Clobbers rax and rcx.
     auto move_window = [&](bool save) {
+        flush_cache(true);
         e.alu_imm(save ? Alu::Sub : Alu::Add, at(cansave_), 1, false);
         e.alu_imm(Alu::And, at(cansave_), kWindows - 1, false);
         e.alu_imm(save ? Alu::Add : Alu::Sub, at(canrestore_), 1, false);
@@ -1049,26 +1350,41 @@ bool UltraSparc::jit_compile(Block& b) {
         e.alu_imm(Alu::And, rcx, kWindows - 1, false);
         e.mov(at(cwp_), rcx, false);
         set_window();
+        reload_cache(true);
     };
-    // A conditional branch at block offset `here` whose condition the
-    // caller has put in eax. Returns with npc in kNpc, or leaves the block
-    // (annulled and not taken).
-    auto cond_branch = [&](unsigned i, s64 here, s64 disp, bool annul) {
+    // A conditional branch at block offset `here`, taken when host
+    // condition c holds (on the flags as the caller left them). Returns
+    // with npc in kNpc, or leaves the block (annulled and not taken).
+    auto cond_branch = [&](unsigned i, s64 here, s64 disp, bool annul, Cond c) {
         known_target = true, target = here + disp;
         may_fall = !annul, fall = here + 8;
-        if (!annul) {
-            pc_plus(kNpc, here + 8);
-            pc_plus(rdx, here + disp);
+        // A branch back (a loop's, most often taken) goes on to its target
+        // here, the other way being made at the end of the block; one
+        // forward, the other way round.
+        const bool back = disp <= 0;
+        auto other_way = [&](bool taken, s64 to, bool annulled) {
+            split = Split{e.jcc(taken ? c : static_cast<Cond>(static_cast<unsigned>(c) ^ 1)), to, annulled, i + 1, cache_valid, cache_dirty, r10_scratch, codes};
+        };
+        if (!annul && i + 2 == n) {
+            // The delay slot ends the block: it is made twice, for each way.
+            if (back) other_way(false, here + 8, false);
+            else other_way(true, here + disp, false), target = here + 8;
+            may_fall = false;
+            set_npc(target);
+        } else if (annul && back) {
+            other_way(false, here + 8, true);  // (the delay slot annulled)
+            may_fall = false;
+            set_npc(target);
+        } else if (!annul) {
+            e.lea(kNpc, Mem{kPc, static_cast<s32>(here + 8)});
+            e.lea(rdx, Mem{kPc, static_cast<s32>(here + disp)});
             mask(rdx);
-            e.test32(rax, rax);
-            e.cmov(Cond::Ne, kNpc, rdx);
+            e.cmov(c, kNpc, rdx);
         } else {
-            e.test32(rax, rax);
-            const std::size_t taken = e.jcc(Cond::Ne);
+            const std::size_t taken = e.jcc(c);
             chain_to(here + 8, i + 1);  // the delay slot is annulled
             e.bind(taken);
-            pc_plus(kNpc, here + disp);
-            mask(kNpc);
+            set_npc(here + disp);
         }
         dynamic = true;
     };
@@ -1080,16 +1396,16 @@ bool UltraSparc::jit_compile(Block& b) {
                 chain_to(here + disp, i + 1);
                 return;
             }
-            pc_plus(kNpc, here + disp);
-            mask(kNpc);
+            set_npc(here + disp);
             dynamic = true;
             known_target = true, target = here + disp, may_fall = false;
         } else if (cond == 0) {  // never
             if (annul) chain_to(here + 8, i + 1);
         } else {
-            if (xcc > 1) eval_fcc(cond, xcc - 2);
-            else eval_icc(cond, xcc, static_cast<int>(i));
-            cond_branch(i, here, disp, annul);
+            Cond c = Cond::Ne;
+            if (xcc > 1) eval_fcc(cond, xcc - 2), e.test32(rax, rax);
+            else c = icc_cond(cond, xcc, static_cast<int>(i));
+            cond_branch(i, here, disp, annul, c);
         }
     };
     // Control transfers. False if not done here.
@@ -1101,8 +1417,7 @@ bool UltraSparc::jit_compile(Block& b) {
             pc_plus(rax, here);
             mask(rax);
             store_reg(15, rax);
-            pc_plus(kNpc, here + (sext(insn, 30) << 2));
-            mask(kNpc);
+            set_npc(here + (sext(insn, 30) << 2));
             dynamic = true;
             known_target = true, target = here + (sext(insn, 30) << 2), may_fall = false;
             return true;
@@ -1124,10 +1439,7 @@ bool UltraSparc::jit_compile(Block& b) {
                 case 6: {  // FBfcc: fp_disabled from execute()
                     std::vector<std::size_t> off;
                     fp_check(off);
-                    const std::size_t on = e.jmp();
-                    for (std::size_t site : off) e.bind(site);
-                    call_execute(i, insn);
-                    e.bind(on);
+                    out_of_line(std::move(off), i, insn);
                     const unsigned fcc_n = op2 == 5 ? (insn >> 20) & 3 : 0;
                     icc_branch(i, here, cond, 2 + fcc_n, (op2 == 5 ? sext(insn, 19) : sext(insn, 22)) << 2, annul);
                     return true;
@@ -1135,9 +1447,10 @@ bool UltraSparc::jit_compile(Block& b) {
                 case 3: {  // BPr
                     const unsigned rcond = (insn >> 25) & 7;
                     if (((insn >> 28) & 1) || !rcond_valid(rcond)) return false;
-                    eval_rcond(rcond, (insn >> 14) & 31);
+                    const Reg t = use_reg((insn >> 14) & 31, rax);
+                    e.test(t, t);
                     const u64 d16 = (((insn >> 20) & 3) << 14) | (insn & 0x3FFF);
-                    cond_branch(i, here, sext(d16, 16) << 2, annul);
+                    cond_branch(i, here, sext(d16, 16) << 2, annul, kRcond[rcond]);
                     return true;
                 }
                 default: return false;
@@ -1156,11 +1469,7 @@ bool UltraSparc::jit_compile(Block& b) {
             slow.push_back(e.jcc(Cond::E));  // fill
             e.mov(kNpc, rax);
             move_window(false);
-            const std::size_t done = e.jmp();
-            for (std::size_t site : slow) e.bind(site);
-            call_execute(i, insn);
-            e.mov(kNpc, m_npc);
-            e.bind(done);
+            out_of_line(std::move(slow), i, insn, Then::Npc);
             dynamic = true;
             return true;
         }
@@ -1170,10 +1479,7 @@ bool UltraSparc::jit_compile(Block& b) {
             e.alu(Alu::Add, rax, rcx);
             mask(rax);
             e.test_imm(rax, 3);
-            const std::size_t aligned = e.jcc(Cond::E);
-            call_execute(i, insn);  // it takes the alignment trap
-            leave(i + 1);
-            e.bind(aligned);
+            out_of_line({e.jcc(Cond::Ne)}, i, insn, Then::Leave);  // it takes the alignment trap
             e.mov(kNpc, rax);
             pc_plus(rcx, here);
             mask(rcx);
@@ -1189,9 +1495,7 @@ bool UltraSparc::jit_compile(Block& b) {
     // misalignment, a write to a page with decoded code) goes to execute().
     // False if not done here.
     const unsigned fmode = fast_mode();
-    static_assert(sizeof(FastEntry) == 32);
-    static_assert(offsetof(FastEntry, key) == 0 && offsetof(FastEntry, addend) == 8 && offsetof(FastEntry, code) == 16 &&
-                  offsetof(FastEntry, perms) == 24);
+    static_assert(sizeof(u64) == 8 && sizeof(s64) == 8 && sizeof(const u8*) == 8);
     enum class Kind {
         Load, Store, LoadPair, StorePair, Ldstub, Swap, Cas, FLoad, FStore, BlockLoad, BlockStore,
         FsrLoad, FsrStore, Partial, ShortLoad, ShortStore, Quad
@@ -1223,8 +1527,8 @@ bool UltraSparc::jit_compile(Block& b) {
             load_reg(rax, rs1);
             if (imm) {
                 if (const s64 d = sext(insn, 13)) e.alu_imm(Alu::Add, rax, static_cast<s32>(d));
-            } else if (insn & 31) {
-                e.alu(Alu::Add, rax, reg_mem(insn & 31));
+            } else {
+                add_reg(rax, insn & 31);
             }
             mask(rax);
             std::vector<std::size_t> slow;
@@ -1234,16 +1538,15 @@ bool UltraSparc::jit_compile(Block& b) {
             }
             e.test_imm(rax, 7);
             slow.push_back(e.jcc(Cond::Ne));
+            flush_cache();
             e.mov(kArg2, rax);
             e.mov(kArg0, kCpu);
             e.mov_imm32(kArg1, the_asi);
             e.mov_imm64(rax, reinterpret_cast<u64>(&UltraSparc::jit_internal_read));
             e.call(rax);
+            reload_cache();
             store_reg(rd, rax);
-            const std::size_t done = e.jmp();
-            for (std::size_t site : slow) e.bind(site);
-            call_execute(i, insn);
-            e.bind(done);
+            out_of_line(std::move(slow), i, insn);
             return true;
         }
         unsigned size;
@@ -1300,13 +1603,21 @@ bool UltraSparc::jit_compile(Block& b) {
                                  kind == Kind::ShortStore;
         const u8 perm = kind == Kind::Quad ? kFastAtomic : !writes ? kFastRead : plain_store ? kFastWrite : kFastAtomic;
         self = false;  // (the check mode must not do it twice)
-        load_reg(rax, rs1);
+        auto cached_reg = [&](unsigned r) { return r != 0 && slot_of[r] >= 0; };
         if (kind == Kind::Cas || kind == Kind::Partial) {
-            // [rs1] only (a partial store's rs2 is the mask)
-        } else if (imm) {
-            if (const s64 d = sext(insn, 13)) e.alu_imm(Alu::Add, rax, static_cast<s32>(d));
-        } else if (insn & 31) {
-            e.alu(Alu::Add, rax, reg_mem(insn & 31));
+            load_reg(rax, rs1);  // [rs1] only (a partial store's rs2 is the mask)
+        } else if (imm && cached_reg(rs1)) {
+            e.lea(rax, Mem{use_reg(rs1, rax), static_cast<s32>(sext(insn, 13))});
+        } else if (!imm && cached_reg(rs1) && cached_reg(insn & 31)) {
+            const Reg a = use_reg(rs1, rax);
+            e.lea(rax, Mem{a, 0, use_reg(insn & 31, rcx), 0});
+        } else {
+            load_reg(rax, rs1);
+            if (imm) {
+                if (const s64 d = sext(insn, 13)) e.alu_imm(Alu::Add, rax, static_cast<s32>(d));
+            } else {
+                add_reg(rax, insn & 31);
+            }
         }
         mask(rax);
         std::vector<std::size_t> slow;
@@ -1320,53 +1631,64 @@ bool UltraSparc::jit_compile(Block& b) {
             e.test_imm(rax, size - 1);
             slow.push_back(e.jcc(Cond::Ne));
         }
-        const s32 table = at(fast_[cls][0]).disp;
+        // The entry's fields, at [kCpu + rdx * 8 + the field's array].
+        const FastTable& table = fast_[cls];
+        auto field = [&](const auto& array, u8 scale = 3) { return Mem{kCpu, at(array[0]).disp, rdx, scale}; };
         e.mov(rcx, rax);
         e.shift_imm(Shift::Shr, rcx, 13, true);
-        e.mov32(rdx, rcx);  // rdx = fast_index(): the page with page >> 9 folded in
-        e.shift_imm(Shift::Shr, rdx, 9, false);
+        e.mov32(rdx, rax);  // rdx = fast_index(): the page with page >> 9 folded in (each shifted from the address)
+        e.shift_imm(Shift::Shr, rdx, 22, false);
         e.alu(Alu::Xor, rdx, rcx, false);
         e.alu_imm(Alu::And, rdx, kFastEntries - 1, false);
-        e.shift_imm(Shift::Shl, rdx, 5, false);
-        e.alu(Alu::Add, rdx, kCpu);
         e.alu(Alu::Or, rcx, at(fast_key_[cls]));
-        e.alu(Alu::Cmp, rcx, Mem{rdx, table});
+        // (Loads and plain stores have keys of their own; the rest look at
+        // the perms.)
+        const bool own_key = perm == kFastRead || perm == kFastWrite;
+        e.alu(Alu::Cmp, rcx, field(perm == kFastRead ? table.read : perm == kFastWrite ? table.write : table.key));
         slow.push_back(e.jcc(Cond::Ne));
-        e.test8_imm(Mem{rdx, table + 24}, perm);
-        slow.push_back(e.jcc(Cond::E));
+        if (!own_key) {
+            e.test8_imm(field(table.perms, 0), perm);
+            slow.push_back(e.jcc(Cond::E));
+        }
         if (writes) {
             e.alu_imm(Alu::Add, at(effects_), 1);  // (see idle_visit)
-            e.mov(rcx, Mem{rdx, table + 16});
+            e.mov(rcx, field(table.code));
             e.movzx16(r8, Mem{rcx, 0});  // both halves' code flags
             e.test32(r8, r8);
             slow.push_back(e.jcc(Cond::Ne));
         }
-        e.alu(Alu::Add, rax, Mem{rdx, table + 8});
-        const Mem host{rax, 0};
+        // (Loads and stores go to [rax + rdx], rdx the host address - va;
+        // the rest have the host address in rax.)
+        const bool indexed = kind == Kind::Load || kind == Kind::Store;
+        if (indexed) e.mov(rdx, field(table.addend));
+        else e.alu(Alu::Add, rax, field(table.addend));
+        const Mem host = indexed ? Mem{rax, 0, rdx, 0} : Mem{rax, 0};
         // Big-endian memory to and from host order (nothing to do for a
         // little-endian ASI).
         auto swap64 = [&](Reg r) { if (!little) e.bswap64(r); };
         auto swap32 = [&](Reg r) { if (!little) e.bswap32(r); };
         auto swap16 = [&](Reg r) { if (!little) e.rol16_8(r); };
         switch (kind) {
-            case Kind::Load:
+            case Kind::Load: {
+                const Reg t = def_reg(rd, rcx);
                 switch (size) {
-                    case 8: e.mov(rcx, host), swap64(rcx); break;
+                    case 8: e.mov(t, host), swap64(t); break;
                     case 4:
-                        e.mov(rcx, host, false), swap32(rcx);
-                        if (sign) e.movsxd(rcx, rcx);
+                        e.mov(t, host, false), swap32(t);
+                        if (sign) e.movsxd(t, t);
                         break;
                     case 2:
-                        e.movzx16(rcx, host), swap16(rcx);
-                        if (sign) e.movsx16(rcx, rcx);
+                        e.movzx16(t, host), swap16(t);
+                        if (sign) e.movsx16(t, t);
                         break;
                     default:
-                        if (sign) e.movsx8(rcx, host);
-                        else e.movzx8(rcx, host);
+                        if (sign) e.movsx8(t, host);
+                        else e.movzx8(t, host);
                         break;
                 }
-                store_reg(rd, rcx);
+                put_reg(rd, t);
                 break;
+            }
             case Kind::Store:
                 load_reg(rcx, rd);
                 switch (size) {
@@ -1520,10 +1842,7 @@ bool UltraSparc::jit_compile(Block& b) {
                 break;
             }
         }
-        const std::size_t done = e.jmp();
-        for (std::size_t site : slow) e.bind(site);
-        call_execute(i, insn);
-        e.bind(done);
+        out_of_line(std::move(slow), i, insn);
         return true;
     };
 
@@ -1702,10 +2021,7 @@ bool UltraSparc::jit_compile(Block& b) {
             }
             case F::None: break;
         }
-        const std::size_t done = e.jmp();
-        for (std::size_t site : slow) e.bind(site);
-        call_execute(i, insn);
-        e.bind(done);
+        out_of_line(std::move(slow), i, insn);
         return true;
     };
 
@@ -1730,10 +2046,11 @@ bool UltraSparc::jit_compile(Block& b) {
             e.pop(r9);
             store_ccr(r8, r9);
         }
+        flush_cache();
         auto operand = [&](vis::Src k, unsigned r, Reg to) {
             switch (k) {
                 case vis::Src::R:
-                    load_reg(to, r);
+                    load_reg_mem(to, r);
                     if (o->edge) mask(to);
                     break;
                 case vis::Src::S: e.mov(to, freg(r), false); break;
@@ -1748,6 +2065,7 @@ bool UltraSparc::jit_compile(Block& b) {
         operand(o->c, rd, kArg2);
         e.mov_imm64(rax, reinterpret_cast<u64>(o->fn));
         e.call(rax);
+        reload_cache();
         switch (o->dst) {
             case vis::Src::R: store_reg(rd, rax); break;
             case vis::Src::S:
@@ -1759,10 +2077,7 @@ bool UltraSparc::jit_compile(Block& b) {
                 dirty(rd & 1);
                 break;
         }
-        const std::size_t done = e.jmp();
-        for (std::size_t site : slow) e.bind(site);
-        call_execute(i, insn);
-        e.bind(done);
+        out_of_line(std::move(slow), i, insn);
         return true;
     };
 
@@ -1803,6 +2118,12 @@ bool UltraSparc::jit_compile(Block& b) {
         }
         const Mem host_mxcsr{rsp, kMxcsr}, guest_mxcsr{rsp, kMxcsr + 4};
         const Mem fsr_byte2{kCpu, at(fsr_).disp + 2};  // NS (bit 22)
+        for (unsigned s = 0; s < cache_used; ++s)  // (r10 is scratch here)
+            if (kCache[s] == r10 && (cache_dirty >> s & 1)) {
+                e.mov(reg_mem(cached[s]), r10);
+                cache_dirty &= ~(1u << s), pre_dirty &= ~(1u << s);
+            }
+        r10_scratch = true;
         std::vector<std::size_t> slow;
         fp_check(slow);
         e.test8_imm(fsr_byte2, 0x40);
@@ -2164,10 +2485,10 @@ bool UltraSparc::jit_compile(Block& b) {
             case T::I64: store_double(rd, rax); break;
         }
         dirty((dst == T::F64 || dst == T::I64) && (rd & 1));
-        const std::size_t done = e.jmp();
-        for (std::size_t site : slow) e.bind(site);
-        call_execute(i, insn);
-        e.bind(done);
+        for (unsigned s = 0; s < cache_used; ++s)  // (r10 was scratch here)
+            if (kCache[s] == r10) e.mov(r10, reg_mem(cached[s])), cache_valid |= 1u << s;
+        out_of_line(std::move(slow), i, insn);
+        r10_scratch = false;
         return true;
     };
 
@@ -2175,7 +2496,7 @@ bool UltraSparc::jit_compile(Block& b) {
     // then, through the CPU's time base and charge per step. Clobbers rcx.
     auto tick_time = [&](unsigned i) {
         e.mov(rax, m_cycles0);
-        e.alu(Alu::Add, rax, m_total);
+        add_total(rax);
         if (i) e.alu_imm(Alu::Add, rax, static_cast<s32>(i));
         e.alu(Alu::Sub, rax, at(step_base_));
         e.imul(rax, at(cpi_fx_));
@@ -2208,10 +2529,7 @@ bool UltraSparc::jit_compile(Block& b) {
             e.alu(Alu::Add, rdx, rcx);
             move_window(save);
             store_reg(rd, rdx);
-            const std::size_t done = e.jmp();
-            for (std::size_t site : slow) e.bind(site);
-            call_execute(i, insn);
-            e.bind(done);
+            out_of_line(std::move(slow), i, insn);
             return true;
         }
         const bool priv = pstate_ & pstate::PRIV;  // (part of the mode)
@@ -2289,10 +2607,7 @@ bool UltraSparc::jit_compile(Block& b) {
                 e.shift_imm(Shift::Shr, rax, 1, true);
                 store_reg(rd, rax);
             }
-            const std::size_t done = e.jmp();
-            e.bind(npt);
-            call_execute(i, insn);
-            e.bind(done);
+            out_of_line({npt}, i, insn);
             return true;
         }
         if ((op3 == 0x28 && rs1 == 19) || (op3 == 0x30 && rd == 19)) {  // RD, WR %gsr: fp_disabled from execute()
@@ -2310,10 +2625,7 @@ bool UltraSparc::jit_compile(Block& b) {
                 e.alu_imm(Alu::And, rax, 0x7F);
                 e.mov(at(gsr_), rax);
             }
-            const std::size_t done = e.jmp();
-            for (std::size_t site : off) e.bind(site);
-            call_execute(i, insn);
-            e.bind(done);
+            out_of_line(std::move(off), i, insn);
             return true;
         }
         if (op3 == 0x28) {  // RDASR: Y, CCR, ASI, PC, FPRS; STBAR and MEMBAR
@@ -2367,17 +2679,12 @@ bool UltraSparc::jit_compile(Block& b) {
         if (op3 == 0x36 && ((insn >> 5) & 0x1FF) == 0x080 && priv) {  // SHUTDOWN: nothing to do (fp_disabled from execute())
             std::vector<std::size_t> off;
             fp_check(off);
-            const std::size_t done = e.jmp();
-            for (std::size_t site : off) e.bind(site);
-            call_execute(i, insn);
-            e.bind(done);
+            out_of_line(std::move(off), i, insn);
             return true;
         }
         if (op3 == 0x2B) {  // FLUSHW: a spill trap (from execute()) unless only the current window is in use
             e.alu_imm(Alu::Cmp, at(cansave_), kWindows - 2, false);
-            const std::size_t flushed = e.jcc(Cond::E);
-            call_execute(i, insn);
-            e.bind(flushed);
+            out_of_line({e.jcc(Cond::Ne)}, i, insn);
             return true;
         }
         if (op3 == 0x3A) {  // Tcc: the trap from execute()
@@ -2385,10 +2692,8 @@ bool UltraSparc::jit_compile(Block& b) {
             if ((cc & 1) || cond == 8) return false;
             if (cond == 0) return true;
             self = false;
-            eval_icc(cond, cc == 2);
-            const std::size_t not_taken = e.jcc(Cond::E);
-            call_execute(i, insn);
-            e.bind(not_taken);
+            const Cond c = icc_cond(cond, cc == 2, static_cast<int>(i));
+            out_of_line({e.jcc(c)}, i, insn);
             return true;
         }
         if (op3 == 0x31 && priv && rd <= 1) {  // SAVED, RESTORED
@@ -2428,7 +2733,7 @@ bool UltraSparc::jit_compile(Block& b) {
     e.mov(kCpu, kArg0);
     e.mov(kPc, kArg1);
     e.mov(m_budget, kArg2);
-    e.mov_store_imm(m_total, 0);
+    e.mov(m_left, kArg2);
     e.mov(rax, at(cycles_));
     e.mov(m_cycles0, rax);
     e.mov(rax, at(instret_));
@@ -2440,28 +2745,29 @@ bool UltraSparc::jit_compile(Block& b) {
     if (e.size() != jit_link_offset_) return false;
     // The block must fit in the budget (blocks going on from another are
     // not looked at before).
-    e.mov(r9, m_total);
-    e.alu_imm(Alu::Add, r9, static_cast<s32>(n));
-    e.alu(Alu::Cmp, r9, m_budget);
-    const std::size_t no_room = e.jcc(Cond::A);
-    body = e.size();
+    e.alu_imm(Alu::Cmp, m_left, static_cast<s32>(n));
+    const std::size_t no_room = e.jcc(Cond::L);
+    for (unsigned s = 0; s < cache_used; ++s)  // (those read before they are written)
+        if (self_loop || cache_load[s]) e.mov(kCache[s], reg_mem(cached[s])), cache_valid |= 1u << s;
 
     bool last_executed = false;  // the last instruction went to execute()
     bool ended = false;          // the code for the end of the block is out
-    for (unsigned i = 0; i < n; ++i) {
-        const u32 insn = b.insns[i];
+    auto translate = [&](unsigned i) {
+        const u32 insn = cur->insns[i];
         const s64 here = 4 * static_cast<s64>(i);
         const unsigned op = insn >> 30;
         const bool was_dynamic = dynamic;
         if (!was_dynamic) known_target = false;
+        pre_dirty = cache_dirty;
         bool done = false;
         if (delayed_cti(insn)) {
             done = cti(i, insn);
         } else if (op == 0 && ((insn >> 22) & 7) == 4) {  // SETHI
             const unsigned rd = (insn >> 25) & 31;
             if (rd) {
-                e.mov_imm32(rax, (insn & 0x3FFFFF) << 10);
-                store_reg(rd, rax);
+                const Reg d = def_reg(rd, rax);
+                e.mov_imm32(d, (insn & 0x3FFFFF) << 10);
+                put_reg(rd, d);
             }
             done = true;
         } else if (op == 2) {
@@ -2474,6 +2780,7 @@ bool UltraSparc::jit_compile(Block& b) {
                 // A delay slot: pc goes to kNpc.
                 dynamic = false;
                 if (i + 1 < n) {
+                    npc_ready();
                     pc_plus(rax, here + 4);
                     e.alu(Alu::Cmp, rax, kNpc);
                     const std::size_t on = e.jcc(Cond::E);
@@ -2498,44 +2805,90 @@ bool UltraSparc::jit_compile(Block& b) {
                     chain(n);
                     ended = true;
                 }
+                npc_lazy = false;
             }
-            continue;
+            return;
         }
         // execute() runs it.
         last_executed = i + 1 == n;
         call_execute(i, insn);
+        cache_valid = cache_all, cache_dirty = 0;  // (all loaded again)
         codes = Cc::Valid;  // (the stub worked the codes out, and the instruction may change them)
         dynamic = delayed_cti(insn);
-        known_target = false;
+        known_target = false, npc_lazy = false;
         if (dynamic) e.mov(kNpc, m_npc);
-    }
+    };
     // The end of the block.
-    if (ended) {
-    } else if (last_executed) {
-        // execute() left pc_ and npc_ in place.
-        e.mov(rdx, m_pc);
-        e.mov(rax, m_npc);
-        e.alu(Alu::Sub, rax, rdx);
-        e.alu_imm(Alu::Cmp, rax, 4);
-        const std::size_t sequential = e.jcc(Cond::E);
-        leave(n);
-        e.bind(sequential);
-        chain(n);
-    } else if (dynamic) {  // the last instruction was a control transfer: its delay slot is next
-        pc_plus(rax, 4 * static_cast<s64>(n));
-        e.mov(m_pc, rax);
-        e.mov(m_npc, kNpc);
-        leave(n);
-    } else {
-        chain_to(4 * static_cast<s64>(n), n);
+    auto finish = [&] {
+        if (ended) {
+        } else if (last_executed) {
+            // execute() left pc_ and npc_ in place.
+            e.mov(rdx, m_pc);
+            e.mov(rax, m_npc);
+            e.alu(Alu::Sub, rax, rdx);
+            e.alu_imm(Alu::Cmp, rax, 4);
+            const std::size_t sequential = e.jcc(Cond::E);
+            leave(n);
+            e.bind(sequential);
+            chain(n);
+        } else if (dynamic) {  // the last instruction was a control transfer: its delay slot is next
+            npc_ready();
+            pc_plus(rax, 4 * static_cast<s64>(n));
+            e.mov(m_pc, rax);
+            e.mov(m_npc, kNpc);
+            leave(n);
+        } else {
+            chain_to(4 * static_cast<s64>(n), n);
+        }
+    };
+    for (unsigned k = 0; k < regions; ++k) {
+        if (k) {  // the next block, entered with every register in the cache and nothing known of the codes
+            cur = region[k], cur_off = region_off[k], n = cur->length, page_off = first_page_off + cur_off;
+            cache_valid = cache_all, cache_dirty = label_dirty[k], codes = Cc::Unknown, flags_at = -1;
+            dynamic = known_target = npc_lazy = last_executed = ended = false;
+        }
+        if (!k) cache_dirty = label_dirty[0];  // (none when entered from outside, more coming round)
+        body[k] = e.size();
+        for (unsigned i = 0; i < n; ++i) translate(i);
+        finish();
+        if (split) {  // the branch's other way
+            e.bind(split->taken);
+            cache_valid = split->valid, cache_dirty = split->dirty, r10_scratch = split->r10, codes = split->codes;
+            if (split->annulled) {
+                chain_to(split->target, split->count);
+            } else {
+                dynamic = known_target = true, may_fall = false, target = split->target;
+                set_npc(target);
+                last_executed = ended = false;
+                translate(n - 1);
+                finish();
+            }
+            split.reset();
+        }
+    }
+    for (const Ahead& a : ahead) e.bind_to(a.site, body[a.to]);
+    for (Cold& c : cold) {  // (as the code had things where each was asked for)
+        for (std::size_t site : c.sites) e.bind(site);
+        dynamic = c.dynamic, r10_scratch = c.r10, npc_lazy = c.npc_lazy, npc_off = c.npc_off;
+        pre_dirty = c.pre_dirty, cache_valid = c.valid, cache_dirty = c.dirty;
+        call_execute(c.i, c.insn);
+        if (c.then == Then::Npc) e.mov(kNpc, m_npc);
+        if (c.then == Then::Leave) leave(c.i + 1);
+        else e.jmp_to(c.back);
     }
     e.bind(no_room);
     store_pc_npc(0);
-    e.mov(rax, m_total);
+    total_into(rax);
     for (std::size_t site : exits) e.bind(site);
     e.call_abs(static_cast<const u8*>(jit_stub_ccr_), base);  // the codes, for what follows in C++
     epilogue(e);
 
+    if (cache_miss) return 0;  // (the block runs in run_blocks() instead)
+    for (unsigned k = 0; k < regions; ++k)
+        if (edge_dirty[k] & ~label_dirty[k]) {  // (to be made again: none of this pass's links are used)
+            jit_links_used_ = links_before;
+            return 2;
+        }
     const void* code = jit_buf_->add(e.code(), e.size());
     if (!code) {
         // The buffer is full: start again with an empty one, the stubs
@@ -2546,7 +2899,7 @@ bool UltraSparc::jit_compile(Block& b) {
         ++jit_flushes_;
         jit_stub_dyn_ = jit_stub_seq_ = jit_stub_ccr_ = nullptr;
         if (!jit_make_stubs() || jit_buf_->next() == base) return false;  // (nothing more can be done)
-        return jit_compile(b);
+        return jit_compile(b) ? 1 : 0;
     }
     b.code = reinterpret_cast<JitFn>(const_cast<void*>(code));
     b.jit_mode = mode;
@@ -2561,7 +2914,7 @@ bool UltraSparc::jit_compile(Block& b) {
 
 namespace uv::usparc {
 bool UltraSparc::jit_compile_supported() { return false; }
-bool UltraSparc::jit_compile(Block&) { return false; }
+int UltraSparc::jit_compile_pass(Block&, const unsigned*, unsigned*) { return 0; }
 }  // namespace uv::usparc
 
 #endif
