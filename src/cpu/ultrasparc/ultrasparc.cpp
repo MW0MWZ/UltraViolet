@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstdio>
+#include <iterator>
 #include <limits>
 #include <numeric>
 
@@ -968,6 +969,172 @@ u32 UltraSparc::jit_run_checked(Block& b) {
         halted_ = true;
     }
     return k;
+}
+
+// A register is worth keeping when its reads in the block outnumber the
+// loads keeping it takes: one as the translation starts, unless the block
+// first writes it. In a block that goes back to its own start, each read
+// and write saves a load or store every time round, against one load as it
+// starts and one store as it leaves. What an instruction reads is taken
+// widely (any register it may name), what it writes narrowly (only where
+// every translated path writes it, or goes to execute(), after which the
+// cache is loaded again).
+// In a block that moves the window only the globals are kept (the others
+// name different registers on each side of the move). A translation of
+// several blocks (a loop of them) is taken as one going back to its start.
+unsigned UltraSparc::jit_cache_choice(const Block* const* blocks, unsigned count, unsigned max, u8* regs, bool* load) {
+    unsigned reads[32] = {}, written[32] = {};
+    bool seen[32] = {}, read_first[32] = {}, moves = false, self_loop = count > 1;
+    auto read = [&](unsigned r) {
+        ++reads[r];
+        if (!seen[r]) seen[r] = read_first[r] = true;
+    };
+    auto write = [&](unsigned r) { seen[r] = true, ++written[r]; };
+    for (unsigned k = 0; k < count; ++k) {
+        const Block& b = *blocks[k];
+        for (unsigned i = 0; i < b.length; ++i) {
+            const u32 insn = b.insns[i];
+            const unsigned op = insn >> 30, op3 = (insn >> 19) & 0x3F, rd = (insn >> 25) & 31;
+            const unsigned rs1 = (insn >> 14) & 31, rs2 = insn & 31;
+            const bool imm = (insn >> 13) & 1;
+            // (A branch or CALL back to the block's start, as the translations
+            // find it.)
+            auto back_to_start = [&](unsigned bits) {
+                const u64 m = u64{1} << (bits - 1), v = (insn & ((m << 1) - 1)) ^ m;
+                return 4 * static_cast<s64>(i) + (static_cast<s64>(v - m) << 2) == 0;
+            };
+            const unsigned op2 = (insn >> 22) & 7;
+            if (op == 1) self_loop |= back_to_start(30);
+            else if (op == 0 && (op2 == 1 || op2 == 5)) self_loop |= back_to_start(19);
+            else if (op == 0 && (op2 == 2 || op2 == 6)) self_loop |= back_to_start(22);
+            else if (op == 0 && op2 == 3) {
+                const u64 d16 = (((insn >> 20) & 3) << 14) | (insn & 0x3FFF);
+                self_loop |= 4 * static_cast<s64>(i) + (static_cast<s64>((d16 ^ 0x8000) - 0x8000) << 2) == 0;
+            }
+            if (op == 1) {  // CALL
+                write(15);
+            } else if (op == 0) {
+                if (op2 == 4) write(rd);           // SETHI
+                else if (op2 == 3) read(rs1);      // BPr
+            } else if (op == 2) {
+                if (op3 == 0x34) continue;         // FPop1 (FP registers only)
+                if (op3 == 0x3C || op3 == 0x3D || op3 == 0x39) moves = true;  // SAVE, RESTORE, RETURN
+                read(rs1);
+                if (!imm) read(rs2);
+                if (op3 == 0x2C || op3 == 0x2F || op3 == 0x36) read(rd);  // MOVcc, MOVr; IMPDEP1 (VIS)
+                const bool writes = op3 <= 0x28 || op3 == 0x2A || (op3 >= 0x2C && op3 <= 0x2F) || op3 == 0x38;
+                if (writes) write(rd);
+            } else {
+                read(rs1);
+                if (!imm) read(rs2);
+                const bool int_load = (op3 & 0x24) == 0;  // LDUW-LDX and their alternate-space forms
+                const bool pair = (op3 & 0x0F) == 0x03 || (op3 & 0x0F) == 0x07;  // LDD(A), STD(A)
+                if (int_load) {
+                    write(rd);
+                    if (pair) write(rd | 1);
+                } else {
+                    read(rd);
+                    read(rd | 1);
+                }
+            }
+        }
+    }
+    unsigned saved[32] = {};
+    for (unsigned r = 1; r < (moves ? 8u : 32u); ++r) saved[r] = self_loop ? reads[r] + written[r] : reads[r] - read_first[r];
+    unsigned n = 0;
+    while (n < max) {
+        unsigned best = 0;
+        for (unsigned r = 1; r < 32; ++r)
+            if (saved[r] > saved[best]) best = r;
+        if (saved[best] == 0) break;
+        regs[n] = static_cast<u8>(best);
+        load[n++] = read_first[best];
+        saved[best] = 0;
+    }
+    return n;
+}
+
+// A translation is made again until the registers it takes as changed at
+// the start of each of its blocks cover those changed along every jump into
+// them, so that the way out writes back just the ones that may have changed.
+bool UltraSparc::jit_compile(Block& b) {
+    unsigned label_dirty[kRegionBlocks] = {}, edge_dirty[kRegionBlocks];
+    for (unsigned pass = 0;; ++pass) {
+        std::fill(std::begin(edge_dirty), std::end(edge_dirty), 0u);
+        const int made = jit_compile_pass(b, label_dirty, edge_dirty);
+        if (made != 2) return made == 1;
+        for (unsigned k = 0; k < kRegionBlocks; ++k) label_dirty[k] = pass < 6 ? label_dirty[k] | edge_dirty[k] : ~0u;
+    }
+}
+
+unsigned UltraSparc::jit_region(const Block& s, const Block** blocks, s64* off, unsigned max) const {
+    auto sext = [](u64 v, unsigned bits) {
+        const u64 m = u64{1} << (bits - 1);
+        return static_cast<s64>(((v & ((m << 1) - 1)) ^ m) - m);
+    };
+    // A block's known ways on (from its start): a branch or CALL with its
+    // delay slot ending the block (not itself a control transfer).
+    auto ways_on = [&](const Block& x, s64* to) -> unsigned {
+        if (x.length < 2 || x.loop) return 0;
+        const unsigned i = x.length - 2;
+        const u32 insn = x.insns[i], slot = x.insns[i + 1];
+        const unsigned slot_op = slot >> 30, slot_op2 = (slot >> 22) & 7, slot_op3 = (slot >> 19) & 0x3F;
+        if (slot_op == 1 || (slot_op == 0 && slot_op2 != 0 && slot_op2 != 4 && slot_op2 != 7) ||
+            (slot_op == 2 && (slot_op3 == 0x38 || slot_op3 == 0x39)))
+            return 0;
+        const s64 here = 4 * static_cast<s64>(i);
+        const unsigned op = insn >> 30, op2 = (insn >> 22) & 7, cond = (insn >> 25) & 15;
+        if (op == 1) return to[0] = here + (sext(insn, 30) << 2), 1;
+        if (op != 0) return 0;
+        s64 disp;
+        if (op2 == 2 || op2 == 6) disp = sext(insn, 22) << 2;
+        else if (op2 == 1 || op2 == 5) disp = sext(insn, 19) << 2;
+        else if (op2 == 3) disp = sext((((insn >> 20) & 3) << 14) | (insn & 0x3FFF), 16) << 2;
+        else return 0;
+        if (op2 != 3 && cond == 8) return to[0] = here + disp, 1;  // always
+        if (op2 != 3 && cond == 0) return to[0] = here + 8, 1;     // never
+        to[0] = here + disp, to[1] = here + 8;
+        return 2;
+    };
+    // The blocks reached, up to twice as many as are kept, and which of them
+    // each goes on to.
+    constexpr unsigned kLook = 2 * kRegionBlocks;
+    const Block* node[kLook] = {&s};
+    s64 node_off[kLook] = {0};
+    unsigned succ[kLook] = {}, nodes = 1;
+    const s64 page_start = -4 * static_cast<s64>(s.page_off);  // (the code page, from s)
+    for (unsigned q = 0; q < nodes; ++q) {
+        s64 to[2];
+        const unsigned ways = ways_on(*node[q], to);
+        for (unsigned w = 0; w < ways; ++w) {
+            const s64 at = node_off[q] + to[w];
+            if (at < page_start || at >= page_start + 4096) continue;
+            unsigned k = 0;
+            while (k < nodes && node_off[k] != at) ++k;
+            if (k == nodes) {
+                if (nodes == kLook) continue;
+                const Block* x = decoded_block(s.host + at);
+                if (!x || x->loop) continue;
+                node[nodes] = x, node_off[nodes++] = at;
+            }
+            succ[q] |= 1u << k;
+        }
+    }
+    // Those that lead back to s.
+    unsigned back = 1;
+    for (bool more = true; more;) {
+        more = false;
+        for (unsigned q = 0; q < nodes; ++q)
+            if (!(back >> q & 1) && (succ[q] & back)) back |= 1u << q, more = true;
+    }
+    // Only the loop's first block (by address, its head) takes the others
+    // in; each of them is translated on its own, going on into the head.
+    for (unsigned q = 1; q < nodes; ++q)
+        if ((back >> q & 1) && node_off[q] < 0) return 1;
+    unsigned count = 0;
+    for (unsigned q = 0; q < nodes && count < max; ++q)
+        if (back >> q & 1) blocks[count] = node[q], off[count++] = node_off[q];
+    return count;
 }
 
 bool UltraSparc::jit_execute(UltraSparc* cpu, u32 insn) {

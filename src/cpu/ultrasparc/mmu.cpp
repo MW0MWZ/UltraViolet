@@ -443,24 +443,27 @@ void UltraSparc::fast_fill(u64 va, u8 a, const Access& acc, AccessKind kind) {
     const bool write = code != nullptr;
     u8* const host = write ? writable : bus_.host_read_ptr(acc.pa & ~kPage);
     if (!host) return;
-    FastEntry& f = fast_[mode][fast_index(va >> 13)];
+    FastTable& t = fast_[mode];
+    const unsigned i = fast_index(va >> 13);
     const u64 key = (va >> 13) | fast_key_[mode];
     const s64 addend = static_cast<s64>(reinterpret_cast<uintptr_t>(host) - (va & ~kPage));
-    if (f.key != key || f.addend != addend || (f.perms & kFastDev)) f = FastEntry{key, addend, nullptr, 0};
-    if (write) f.code = code;
-    f.perms |= kind == AccessKind::Load ? (write ? kFastRead | kFastWrite : kFastRead)
-               : kind == AccessKind::Store ? kFastWrite : kFastRead | kFastWrite | kFastAtomic;
+    if (t.key[i] != key || t.addend[i] != addend || (t.perms[i] & kFastDev)) t.make(i, key, addend);
+    if (write) t.code[i] = code;
+    t.allow(i, kind == AccessKind::Load ? (write ? kFastRead | kFastWrite : kFastRead)
+               : kind == AccessKind::Store ? kFastWrite : kFastRead | kFastWrite | kFastAtomic);
 }
 
 bool UltraSparc::fast_device(u64 va, u8 a, AccessKind kind, Access& acc) const {
     if (kind != AccessKind::Load && kind != AccessKind::Store) return false;
     const int mode = fast_class(a);  // (none for no-fault loads, which fault on side effects)
     if (mode < 0) return false;
-    const FastEntry& f = fast_[mode][fast_index(va >> 13)];
-    if (f.key != ((va >> 13) | fast_key_[mode]) || !(f.perms & (kind == AccessKind::Load ? kFastDevRead : kFastDevWrite))) return false;
-    acc.pa = static_cast<u64>(static_cast<s64>(va) + f.addend);
+    const FastTable& t = fast_[mode];
+    const unsigned i = fast_index(va >> 13);
+    if (t.key[i] != ((va >> 13) | fast_key_[mode]) || !(t.perms[i] & (kind == AccessKind::Load ? kFastDevRead : kFastDevWrite)))
+        return false;
+    acc.pa = static_cast<u64>(static_cast<s64>(va) + t.addend[i]);
     acc.little = asi_is_little(a);
-    acc.side_effect = f.perms & kFastDevSide;
+    acc.side_effect = t.perms[i] & kFastDevSide;
     return true;
 }
 
@@ -469,11 +472,12 @@ void UltraSparc::fast_fill_device(u64 va, u8 a, const Access& acc, AccessKind ki
     const int mode = fast_class(a);
     if (mode < 0 || acc.little != asi_is_little(a)) return;  // (TTE.IE)
     constexpr u64 kPage = 0x1FFF;
-    FastEntry& f = fast_[mode][fast_index(va >> 13)];
+    FastTable& t = fast_[mode];
+    const unsigned i = fast_index(va >> 13);
     const u64 key = (va >> 13) | fast_key_[mode];
     const s64 addend = static_cast<s64>((acc.pa & ~kPage) - (va & ~kPage));
-    if (f.key != key || f.addend != addend || !(f.perms & kFastDev)) f = FastEntry{key, addend, nullptr, 0};
-    f.perms |= static_cast<u8>((kind == AccessKind::Load ? kFastDevRead : kFastDevWrite) | (acc.side_effect ? kFastDevSide : 0));
+    if (t.key[i] != key || t.addend[i] != addend || !(t.perms[i] & kFastDev)) t.make(i, key, addend);
+    t.allow(i, static_cast<u8>((kind == AccessKind::Load ? kFastDevRead : kFastDevWrite) | (acc.side_effect ? kFastDevSide : 0)));
 }
 
 // Block load: eight doublewords into an aligned group of eight double registers.
@@ -662,8 +666,8 @@ void UltraSparc::forget_translations(MmuRegs& mmu, TlbEntry& e) {
             if (c == 5) continue;  // (physical: no TLB)
             for (u64 k = 0; k < std::min<u64>(count, kFastEntries); ++k) {
                 // (Each page's entry; a range of kFastEntries pages or more, aligned as a TTE's is, takes them all.)
-                FastEntry& f = fast_[c][count >= kFastEntries ? k : fast_index(first + k)];
-                if (in_range(f.key & ((u64{1} << 51) - 1))) f = FastEntry{};
+                const unsigned i = count >= kFastEntries ? static_cast<unsigned>(k) : fast_index(first + k);
+                if (in_range(fast_[c].key[i] & ((u64{1} << 51) - 1))) fast_[c].clear(i);
             }
         }
     } else {

@@ -69,6 +69,9 @@ public:
     Emitter() { code_.reserve(4096); }
     const std::vector<u8>& code() const { return code_; }
     std::size_t size() const { return code_.size(); }
+    // False if a branch was bound to a place out of its reach (the code is
+    // then not to be used).
+    bool in_reach() const { return in_reach_; }
 
     // --- labels: a site is the offset of a branch to patch -----------------
     enum class Fix : u8 { B26, B19, B14, Adr };
@@ -80,6 +83,8 @@ public:
     void bind(const Site& s) { bind_to(s, code_.size()); }
     void bind_to(const Site& s, std::size_t target) {
         const s64 bytes = static_cast<s64>(target) - static_cast<s64>(s.at), delta = bytes / 4;
+        const unsigned bits = s.kind == Fix::B26 ? 26 : s.kind == Fix::B14 ? 14 : 19;  // (ADR: 19 + 2)
+        if (delta < -(s64{1} << (bits - 1)) || delta >= (s64{1} << (bits - 1))) in_reach_ = false;
         u32 w;
         std::memcpy(&w, &code_[s.at], 4);
         switch (s.kind) {
@@ -211,7 +216,9 @@ public:
     void orr(Reg d, Reg n, Reg m, bool w64 = true, Shift sh = Shift::Lsl, unsigned amount = 0) {
         rrr(0x2A000000u, d, n, m, w64, sh, amount);
     }
-    void eor(Reg d, Reg n, Reg m, bool w64 = true) { rrr(0x4A000000u, d, n, m, w64); }
+    void eor(Reg d, Reg n, Reg m, bool w64 = true, Shift sh = Shift::Lsl, unsigned amount = 0) {
+        rrr(0x4A000000u, d, n, m, w64, sh, amount);
+    }
     void mvn(Reg d, Reg m, bool w64 = true) { rrr(0x2A200000u, d, xzr, m, w64); }  // ORN d, zr, m
     void tst(Reg n, Reg m, bool w64 = true) { rrr(0x6A000000u, xzr, n, m, w64); }
     void and_imm(Reg d, Reg n, u64 v, bool w64 = true) { logical_imm(0x12000000u, 0x0A000000u, d, n, v, w64); }
@@ -233,6 +240,7 @@ public:
         emit((w64 ? 0x93C00000u : 0x13800000u) | (u32{n} << 16) | (s << 10) | (u32{n} << 5) | d);
     }
     void sxtw(Reg d, Reg n) { bfm(0x13000000u, d, n, 0, 31, true); }
+    void sbfx(Reg d, Reg n, unsigned lsb, unsigned width) { bfm(0x13000000u, d, n, lsb, lsb + width - 1, true); }
     void sxth(Reg d, Reg n) { bfm(0x13000000u, d, n, 0, 15, true); }
     void sxtb(Reg d, Reg n) { bfm(0x13000000u, d, n, 0, 7, true); }
     void uxth(Reg d, Reg n) { bfm(0x53000000u, d, n, 0, 15, false); }
@@ -419,6 +427,7 @@ private:
     };
     std::vector<u8> code_;
     std::vector<Literal> literals_;
+    bool in_reach_ = true;
 };
 
 }  // namespace uv::jit::a64
