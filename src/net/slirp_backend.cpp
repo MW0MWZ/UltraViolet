@@ -79,7 +79,9 @@ public:
 #if defined(UV_SLIRP_SOCKETS)
         cfg.version = 6;
 #else
-        cfg.version = 4;
+        // Every field set here is in version 1, which every 4.x release
+        // takes (4.6 rejects anything past 3).
+        cfg.version = 1;
 #endif
         cfg.in_enabled = true;
         inet_pton(AF_INET, "10.0.2.0", &cfg.vnetwork);

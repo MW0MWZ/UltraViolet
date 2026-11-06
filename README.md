@@ -106,6 +106,20 @@ whole run. With Fast disk turned off in the settings (the disks at an
 Ultra 10's own speed), on the x86-64 host the disk write takes 4.1 s, the
 read 8.5 s and tar 10.4 s; the other figures do not change.
 
+## Downloads
+
+Ready-built programs are on the
+[releases page](https://github.com/MW0MWZ/UltraViolet/releases). None of them
+include firmware or operating system media: see
+[Firmware and media](#firmware-and-media).
+
+- **Linux** (x86-64 and arm64): an AppImage, for Ubuntu 22.04, Debian 12 or
+  any distribution as new. Make it executable (`chmod +x`) and run it.
+- **Windows** (x64): a zip. Unpack it and run `ultraviolet.exe`.
+- **macOS** (15 or later, Apple silicon): `UltraViolet.app` in a zip. It is not
+  notarized, so before opening it the first time, clear the download mark:
+  `xattr -dr com.apple.quarantine UltraViolet.app`.
+
 ## Building
 
 You need:

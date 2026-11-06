@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andy Taylor
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -118,14 +119,19 @@ TEST(session_hold_is_had_while_the_machine_waits_for_the_wall_clock) {
     if (!session.on()) return;
     session.start_thread();
     wait_ms(30);
-    // Each hold is had at once, not after the machine's waits.
+    // Each hold is had at once, not after the machine's waits. The machine is
+    // mostly waiting, so holds that waited for it would make most of them
+    // slow: the median is checked, as the host can stall any one thread.
+    std::vector<std::chrono::steady_clock::duration> took;
     for (int i = 0; i < 20; ++i) {
         const auto start = std::chrono::steady_clock::now();
         { app::Session::Hold hold(session); }
-        const auto took = std::chrono::steady_clock::now() - start;
-        CHECK(took < std::chrono::milliseconds(20));
+        took.push_back(std::chrono::steady_clock::now() - start);
         wait_ms(3);
     }
+    std::sort(took.begin(), took.end());
+    CHECK(took[took.size() / 2] < std::chrono::milliseconds(20));
+    CHECK(took.back() < std::chrono::milliseconds(500));
 }
 
 TEST(creator3d_prom_prefers_the_whole_prom_to_its_fcode_alone) {
