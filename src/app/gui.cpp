@@ -1445,8 +1445,8 @@ void Gui::draw_settings() {
                 else ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s", pc.text.c_str());
             }
             ImGui::Bullet();
-            ImGui::TextDisabled("Solaris 8 2/04 boots from its DVD to the installer. On-board: ATI Rage Pro graphics "
-                                "(PGX24, 4 MB), Happy Meal Ethernet, CMD646 IDE.");
+            ImGui::TextDisabled("On-board: ATI Rage Pro graphics (PGX24, 4 MB), Happy Meal Ethernet, CMD646 IDE, "
+                                "two serial ports and CS4231 audio.");
             ImGui::PopTextWrapPos();
             ImGui::EndTabItem();
         }
