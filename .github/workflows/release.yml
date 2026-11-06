@@ -1,6 +1,8 @@
-# Builds the downloads for a version tag (vX.Y.Z) and puts them in a draft release, whose notes
-# are the tag's message. The release is made once the Linux and Windows downloads are built; the
-# macOS one, which can wait a while for a runner (see retry.yml), is added when it is ready.
+# Builds the downloads for a version tag (vX.Y.Z) into a draft release, whose notes are the tag's
+# message, and publishes it once it has all of them. The tag must match the version the program
+# shows; one with a stage suffix (v1.1.0-beta) is a pre-release. The draft is made once the Linux
+# and Windows downloads are built; the macOS ones (Apple silicon and Intel), which can wait a
+# while for a runner (see retry.yml), are added when they are ready.
 # Run it by hand to rebuild an existing tag, or with a branch to build the downloads (kept with
 # the run) without releasing them.
 name: Release
@@ -27,7 +29,21 @@ env:
   TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  version:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - name: Check the tag against the version shown
+        if: github.event_name == 'push' || startsWith(inputs.tag, 'v')
+        run: |
+          p=$(sed -n 's/^project(UltraViolet VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          suffix=$(sed -n 's/^set(UV_VERSION "${PROJECT_VERSION}\(.*\)")$/\1/p' CMakeLists.txt)
+          [ "${TAG#v}" = "$p$suffix" ] || { echo "tag $TAG does not match version $p$suffix in CMakeLists.txt"; exit 1; }
+
   linux:
+    needs: version
     strategy:
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
@@ -45,6 +61,7 @@ jobs:
           retention-days: 7
 
   windows:
+    needs: version
     runs-on: windows-latest
     defaults:
       run:
@@ -69,7 +86,11 @@ jobs:
           retention-days: 7
 
   macos:
-    runs-on: macos-15
+    needs: version
+    strategy:
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
     env:
       MACOS_MIN: '15.0'
     steps:
@@ -80,8 +101,8 @@ jobs:
       - run: sh packaging/macos/package.sh
       - uses: actions/upload-artifact@v5
         with:
-          name: macos
-          path: out/*.zip
+          name: macos-${{ runner.arch }}
+          path: out/*.dmg
           retention-days: 7
 
   release:
@@ -104,7 +125,8 @@ jobs:
           if gh release view "$TAG" > /dev/null 2>&1; then
             gh release upload "$TAG" assets/* --clobber
           else
-            gh release create "$TAG" --draft --verify-tag --title "UltraViolet ${TAG#v}" --notes-file notes.md assets/*
+            pre=; case "$TAG" in *-*) pre=--prerelease;; esac
+            gh release create "$TAG" --draft --verify-tag $pre --title "UltraViolet ${TAG#v}" --notes-file notes.md assets/*
           fi
 
   release-macos:
@@ -116,6 +138,18 @@ jobs:
     steps:
       - uses: actions/download-artifact@v5
         with:
-          name: macos
+          pattern: macos-*
           path: assets
+          merge-multiple: true
       - run: gh release upload "$TAG" assets/* --clobber --repo "$GITHUB_REPOSITORY"
+      - name: Publish the release once every download is in
+        run: |
+          have=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          for kind in linux-x86_64.AppImage linux-aarch64.AppImage windows-x86_64.zip macos-arm64.dmg macos-x86_64.dmg; do
+            echo "$have" | grep -q -- "-$kind\$" || { echo "missing $kind: left as it is"; exit 1; }
+          done
+          # (A release published already, rebuilt by hand, is left as it is.)
+          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true ]; then
+            latest=--latest; case "$TAG" in *-*) latest=;; esac
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false $latest
+          fi

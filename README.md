@@ -13,6 +13,24 @@ The aim is to run the original OpenBoot PROM and Solaris unmodified, at or
 above the speed of the real machine, with a just-in-time compiler for the
 UltraSPARC IIi. It runs on Linux, macOS and Windows.
 
+<p align="center">
+  <img src="docs/screenshots/solaris8-cde-creator3d.png" alt="Solaris 8 CDE on the emulated Ultra 10 with a Creator3D: xclock, worms, maze and ico running, and a terminal showing uname, psrinfo and prtdiag" width="100%"><br>
+  <sub>Solaris 8 and CDE on the Ultra 10 with a Creator3D in the UPA slot</sub>
+</p>
+
+<table>
+  <tr>
+    <td width="33%"><img src="docs/screenshots/openboot-3.31.png" alt="OpenBoot 3.31's banner, with .version, probe-ide and show-disks at the ok prompt"></td>
+    <td width="33%"><img src="docs/screenshots/solaris8-cde-rage-pro.png" alt="Solaris 8 CDE on the onboard Rage Pro, with muncher, xclock, worms and maze"></td>
+    <td width="33%"><img src="docs/screenshots/settings.png" alt="UltraViolet's Settings window: processor, memory, UPA slot, console and keyboard"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>OpenBoot 3.31</sub></td>
+    <td align="center"><sub>CDE on the onboard Rage Pro</sub></td>
+    <td align="center"><sub>Machine settings</sub></td>
+  </tr>
+</table>
+
 ## Status
 
 UltraViolet runs the original OpenBoot PROM and real operating systems,
@@ -116,9 +134,10 @@ include firmware or operating system media: see
 - **Linux** (x86-64 and arm64): an AppImage, for Ubuntu 22.04, Debian 12 or
   any distribution as new. Make it executable (`chmod +x`) and run it.
 - **Windows** (x64): a zip. Unpack it and run `ultraviolet.exe`.
-- **macOS** (15 or later, Apple silicon): `UltraViolet.app` in a zip. It is not
-  notarized, so before opening it the first time, clear the download mark:
-  `xattr -dr com.apple.quarantine UltraViolet.app`.
+- **macOS** (15 or later, Apple silicon or Intel): a disk image. Open it and drag
+  `UltraViolet.app` to Applications. It is not notarized, so before opening it
+  the first time, clear the download mark:
+  `xattr -dr com.apple.quarantine /Applications/UltraViolet.app`.
 
 ## Building
 

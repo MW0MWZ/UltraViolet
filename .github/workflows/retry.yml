@@ -1,8 +1,8 @@
 # Keeps at a release until it has every download. GitHub can fail to find a runner for a job
-# (as it can when its macOS runners are short): such jobs are run again, after a pause that grows
-# from 5 to 30 minutes, for as long as it takes. And every hour, a recent release missing a
-# download, with no build of it running, has its build started again. Jobs that ran and failed
-# are not retried: they are left for a person.
+# (as it can when its macOS runners are short; the job is then marked cancelled or failed):
+# such jobs are run again, after a pause that grows from 5 to 30 minutes, for as long as it
+# takes. And every hour, a recent release missing a download, with no build of it running, has
+# its build started again. Jobs that ran and failed are not retried: they are left for a person.
 name: Retry release
 
 on:
@@ -31,7 +31,7 @@ jobs:
         run: |
           repo=$GITHUB_REPOSITORY
           failed=$(gh api "repos/$repo/actions/runs/$RUN/attempts/$ATTEMPT/jobs" --paginate \
-                     --jq '.jobs[] | select(.conclusion == "failure") | .id')
+                     --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled") | .id')
           [ -n "$failed" ] || exit 0
           for id in $failed; do
             gh api "repos/$repo/check-runs/$id/annotations" --jq '.[].message' |
@@ -54,7 +54,7 @@ jobs:
           # The jobs of a run's attempt that ran and failed (not those that found no runner).
           ran_and_failed() {
             gh api "repos/$repo/actions/runs/$1/attempts/$2/jobs" --paginate \
-              --jq '.jobs[] | select(.conclusion == "failure") | .id' | while read -r id; do
+              --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled") | .id' | while read -r id; do
               gh api "repos/$repo/check-runs/$id/annotations" --jq '.[].message' |
                 grep -q 'was not acquired by Runner' || echo "$id"
             done
@@ -62,7 +62,10 @@ jobs:
           for tag in $(gh release list --repo "$repo" --limit 5 --json tagName --jq '.[].tagName'); do
             assets=$(gh release view "$tag" --repo "$repo" --json assets --jq '.assets[].name')
             missing=
-            for kind in linux-x86_64.AppImage linux-aarch64.AppImage windows-x86_64.zip macos-arm64.zip; do
+            kinds='linux-x86_64.AppImage linux-aarch64.AppImage windows-x86_64.zip macos-arm64.dmg macos-x86_64.dmg'
+            # (1.0.0 had the macOS app for Apple silicon only, in a zip.)
+            [ "$tag" = v1.0.0 ] && kinds='linux-x86_64.AppImage linux-aarch64.AppImage windows-x86_64.zip macos-arm64.zip'
+            for kind in $kinds; do
               echo "$assets" | grep -q -- "-$kind\$" || missing="$missing $kind"
             done
             [ -n "$missing" ] || continue
