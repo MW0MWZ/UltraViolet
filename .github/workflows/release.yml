@@ -1,0 +1,121 @@
+# Builds the downloads for a version tag (vX.Y.Z) and puts them in a draft release, whose notes
+# are the tag's message. The release is made once the Linux and Windows downloads are built; the
+# macOS one, which can wait a while for a runner (see retry.yml), is added when it is ready.
+# Run it by hand to rebuild an existing tag, or with a branch to build the downloads (kept with
+# the run) without releasing them.
+name: Release
+run-name: Release ${{ inputs.tag || github.ref_name }}
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag (or branch) to build
+        required: true
+
+permissions:
+  contents: write
+
+# One build of a tag at a time; another waits for it.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  linux:
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - run: docker build -t uv-appimage packaging/linux
+      - run: mkdir out && docker run --rm -v "$PWD:/src:ro" -v "$PWD/out:/out" uv-appimage make-appimage.sh
+      - uses: actions/upload-artifact@v5
+        with:
+          name: linux-${{ runner.arch }}
+          path: out/*.AppImage
+          retention-days: 7
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            zip
+            mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-sdl3 mingw-w64-ucrt-x86_64-libslirp
+      - run: sh packaging/windows/package.sh
+      - uses: actions/upload-artifact@v5
+        with:
+          name: windows
+          path: out/*.zip
+          retention-days: 7
+
+  macos:
+    runs-on: macos-15
+    env:
+      MACOS_MIN: '15.0'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - run: brew install ninja pkgconf sdl3 libslirp
+      - run: sh packaging/macos/package.sh
+      - uses: actions/upload-artifact@v5
+        with:
+          name: macos
+          path: out/*.zip
+          retention-days: 7
+
+  release:
+    needs: [linux, windows]
+    if: github.event_name == 'push' || startsWith(inputs.tag, 'v')
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - run: git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+      - uses: actions/download-artifact@v5
+        with:
+          path: assets
+          merge-multiple: true
+      - run: |
+          git tag -l --format='%(contents:body)' "$TAG" > notes.md
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" assets/* --clobber
+          else
+            gh release create "$TAG" --draft --verify-tag --title "UltraViolet ${TAG#v}" --notes-file notes.md assets/*
+          fi
+
+  release-macos:
+    needs: [macos, release]
+    if: github.event_name == 'push' || startsWith(inputs.tag, 'v')
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: macos
+          path: assets
+      - run: gh release upload "$TAG" assets/* --clobber --repo "$GITHUB_REPOSITORY"

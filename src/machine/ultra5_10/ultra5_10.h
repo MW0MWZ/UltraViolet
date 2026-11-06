@@ -177,7 +177,9 @@ public:
     const Pacer& pacer() const { return pacer_; }
     void set_timing(Pacer::Mode mode);
     void set_fast_disk(bool fast);
-    std::string disc() const { return cd_image_.is_open() ? cd_image_.path() : std::string(); }
+    // The disc in the drive: none once the guest has ejected it (START STOP
+    // UNIT), until it loads it again.
+    std::string disc() const { return cd_image_.is_open() && cdrom_.has_media() ? cd_image_.path() : std::string(); }
     // A diagnostic report: the timing, the CPU, pending interrupts and the
     // IDE controller, as they are now (for a guest that has stopped making
     // progress). Call with the machine stopped.

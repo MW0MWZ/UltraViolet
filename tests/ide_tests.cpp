@@ -283,6 +283,10 @@ TEST(atapi_cdrom_removal_lock_lasts_until_a_hardware_reset) {
     CHECK_EQ(sense[12], 0x29u);
     r.packet({0x1B, 0, 0, 0, 2, 0});  // eject
     CHECK_EQ(r.reg(7) & 0x01, 0x00u);
+    CHECK(!cd.has_media());
+    r.packet({0x1B, 0, 0, 0, 3, 0});  // load: the disc still on the tray goes back in
+    CHECK_EQ(r.reg(7) & 0x01, 0x00u);
+    CHECK(cd.has_media());
 }
 
 TEST(atapi_cdrom_read_cd_builds_raw_sectors_and_dma_reads) {
