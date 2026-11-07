@@ -165,6 +165,54 @@ TEST(mach64_gp_io_pins) {
     CHECK_EQ(r.rd(kRegs + 0x78), 0x00803F5Cu);
 }
 
+// The monitor's DDC on GP_IO: SCL on pin 13, SDA on pin 12, each pulled low
+// by driving it as a 0 and let go by releasing it.
+TEST(mach64_monitor_answers_ddc_on_gp_io) {
+    Rig r;
+    u32 low = 0;  // the pins pulled low
+    auto set = [&](u32 pin, bool high) {
+        low = high ? low & ~pin : low | pin;
+        r.wr(kRegs + 0x78, low << 16);
+    };
+    const u32 scl = 1u << 13, sda = 1u << 12;
+    auto bit_out = [&](bool b) { set(sda, b), set(scl, true), set(scl, false); };
+    auto bit_in = [&] {
+        set(sda, true), set(scl, true);
+        const bool b = r.rd(kRegs + 0x78) & sda;
+        set(scl, false);
+        return b;
+    };
+    auto start = [&] { set(sda, true), set(scl, true), set(sda, false), set(scl, false); };
+    auto stop = [&] { set(sda, false), set(scl, true), set(sda, true); };
+    auto out = [&](u8 v) {
+        for (int i = 7; i >= 0; --i) bit_out(v >> i & 1);
+        return !bit_in();
+    };
+    start();
+    CHECK(!out(0xA0));  // nothing on DDC
+    stop();
+    const MonitorTiming* t = find_timing(Mach64::resolutions(), "1600x1200");
+    CHECK(t != nullptr);
+    CHECK_EQ(t->rate, 60u);
+    r.m.monitor().set_edid(monitor_edid(Mach64::resolutions(), *t));
+    start();
+    CHECK(out(0xA0));
+    CHECK(out(0x00));
+    stop();
+    start();
+    CHECK(out(0xA1));
+    std::vector<u8> e;
+    for (int i = 0; i < 128; ++i) {
+        u8 b = 0;
+        for (int k = 0; k < 8; ++k) b = static_cast<u8>(b << 1 | (bit_in() ? 1 : 0));
+        bit_out(i == 127);
+        e.push_back(b);
+    }
+    stop();
+    CHECK(e == r.m.monitor().edid());
+    CHECK_EQ(e[54] | e[55] << 8, 16200u);  // the preferred timing: 162 MHz
+}
+
 // What a real Ultra 10's Rage Pro reads at power-on, and after OpenBoot's
 // writes (BUS_CNTL written back, DAC_CNTL 0x80010102, GEN_TEST_CNTL 0):
 // the read-only bits stay, as on a real Ultra 10.

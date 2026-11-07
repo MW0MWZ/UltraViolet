@@ -109,6 +109,7 @@ private:
 
     // Machine (power_on: with these Sun keys held for a while)
     void power_on(std::vector<u8> held = {});
+    void fit_window();
     void power_off();
     void reset();
     void stop_a();
@@ -195,7 +196,10 @@ private:
     int step_cx_ = 0, step_cy_ = 0;        // where the cursor was when it was sent
     bool stepped_ = false;
     int still_ = 0;                        // frames the cursor has stood still with the mouse idle
-    float gain_x_ = 1.0f, gain_y_ = 1.0f;  // the guest's pointer acceleration, as seen
+    // The guest's pointer acceleration, as seen (kept from one capture to
+    // the next: the guest's setting stays), and the steps sent this capture.
+    float gain_x_ = 1.0f, gain_y_ = 1.0f;
+    unsigned steps_ = 0;
     // Moving onto the screen may capture the mouse; not again after a release
     // until the pointer has been off the screen.
     bool capture_armed_ = true;
@@ -245,9 +249,11 @@ private:
 
     // The PROM the settings being edited would start with (or why there is
     // none), worked out again only when the folder changes.
+    // Also the Creator3D FCode image there, if any (to offer it).
     struct PromChoice {
         std::string key, text;
         bool ok = false;
+        std::string fcode_text;  // whose, and its file; empty: none
     } prom_choice_;
     const PromChoice& prom_choice(const Settings& s);
 };
@@ -263,6 +269,11 @@ const Gui::PromChoice& Gui::prom_choice(const Settings& s) {
         prom_choice_.text = "Flash PROM: " + file_name(p.path) + " (OpenBoot " + p.version + ", " + p.date + ")";
     else
         prom_choice_.text = error;
+    std::vector<u8> fcode;
+    std::string fcode_path;
+    prom_choice_.fcode_text.clear();
+    if (find_creator3d_fcode(s, fcode, fcode_path))
+        prom_choice_.fcode_text = creator3d_fcode_name(fcode) + " (" + file_name(fcode_path) + ")";
     return prom_choice_;
 }
 
@@ -281,24 +292,7 @@ int Gui::run() {
 
     const SDL_DisplayID display = SDL_GetPrimaryDisplay();
     scale_ = std::clamp(SDL_GetDisplayContentScale(display), 1.0f, 4.0f);
-    // Room for a 1152x900 picture with the bars, shrunk to fit the screen:
-    // the status bar, and the menu bar except on macOS (whose menus are in
-    // the system menu bar).
-#if defined(__APPLE__)
-    constexpr float kBars = 1;
-#else
-    constexpr float kBars = 2;
-#endif
-    const float bars = kBars * (13.0f + 6.0f) * scale_;
-    float w = 1152, h = 900 + bars;
-    SDL_Rect usable;
-    if (SDL_GetDisplayUsableBounds(display, &usable)) {
-        const float fit = std::min({1.0f, usable.w * 0.95f / w, usable.h * 0.9f / h});
-        w *= fit;
-        h = (h - bars) * fit + bars;
-    }
-    window_ = SDL_CreateWindow(kAppName, static_cast<int>(w), static_cast<int>(h),
-                               SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    window_ = SDL_CreateWindow(kAppName, 1152, 900, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     set_window_icon(window_);
     renderer_ = window_ ? SDL_CreateRenderer(window_, nullptr) : nullptr;
     if (!renderer_) {
@@ -312,13 +306,7 @@ int Gui::run() {
     // and drawn at the coordinate size, so it stays sharp.
     density_ = std::max(1.0f, SDL_GetWindowPixelDensity(window_));
     scale_ = std::clamp(SDL_GetWindowDisplayScale(window_) / density_, 1.0f, 4.0f);
-    {
-        // The bars at the window's own scale (the display's may differ): the
-        // picture keeps its size.
-        const float exact = kBars * (13.0f + 6.0f) * scale_;
-        if (std::fabs(exact - bars) >= 1)
-            SDL_SetWindowSize(window_, static_cast<int>(w), static_cast<int>(h - bars + exact));
-    }
+    fit_window();
     ctx_ = ImGui::CreateContext();
     ImGui::SetCurrentContext(ctx_);
     ImGuiIO& io = ImGui::GetIO();
@@ -454,6 +442,41 @@ int Gui::run() {
     return 0;
 }
 
+// Sizes the window for the screen the machine starts with (the resolution
+// set for its card, or 1152 x 900 if the card has no such mode) with the
+// bars, shrunk to fit the desktop: the status bar, and the menu bar except
+// on macOS (whose menus are in the system menu bar). A maximised or full
+// screen window is left as it is.
+void Gui::fit_window() {
+    if (SDL_GetWindowFlags(window_) & (SDL_WINDOW_MAXIMIZED | SDL_WINDOW_FULLSCREEN)) return;
+#if defined(__APPLE__)
+    constexpr float kBars = 1;
+#else
+    constexpr float kBars = 2;
+#endif
+    const Settings& s = session_.settings();
+    const std::vector<MonitorTiming>& list = s.upa == "creator3d" ? Ffb::resolutions() : Mach64::resolutions();
+    const MonitorTiming* t = find_timing(list, s.resolution);
+    const float bars = kBars * (13.0f + 6.0f) * scale_;
+    float w = t ? static_cast<float>(t->width) : 1152, h = t ? static_cast<float>(t->height) : 900;
+    SDL_Rect usable;
+    const bool desktop = SDL_GetDisplayUsableBounds(SDL_GetDisplayForWindow(window_), &usable);
+    if (desktop) {
+        const float fit = std::min({1.0f, usable.w * 0.95f / w, (usable.h * 0.9f - bars) / h});
+        w *= fit;
+        h *= fit;
+    }
+    const int ww = static_cast<int>(w), wh = static_cast<int>(h + bars);
+    SDL_SetWindowSize(window_, ww, wh);
+    // Moved, if need be, so that it stays on the desktop.
+    int x = 0, y = 0;
+    if (desktop && SDL_GetWindowPosition(window_, &x, &y)) {
+        const int nx = std::max(usable.x, std::min(x, usable.x + usable.w - ww));
+        const int ny = std::max(usable.y, std::min(y, usable.y + usable.h - wh));
+        if (nx != x || ny != y) SDL_SetWindowPosition(window_, nx, ny);
+    }
+}
+
 // --- Machine ---------------------------------------------------------------
 
 void Gui::power_on(std::vector<u8> held) {
@@ -463,6 +486,7 @@ void Gui::power_on(std::vector<u8> held) {
         message("The Ultra 5/10 cannot be powered on:\n\n" + error);
         return;
     }
+    fit_window();
     if (auto* m = session_.machine(); m && m->keyboard() && !held.empty()) {
         for (u8 k : held) m->post_key(k, true);
         held_keys_ = std::move(held);
@@ -470,6 +494,7 @@ void Gui::power_on(std::vector<u8> held) {
         status("Holding the keys while OpenBoot starts");
     }
     for (auto& t : terminals_) t.reset();
+    gain_x_ = gain_y_ = 1.0f;  // (another system: its acceleration to learn)
     picture_stale_ = true;
     meter_time_ns_ = 0;
     // With the console on ttya, its terminal is the screen.
@@ -591,7 +616,7 @@ void Gui::capture_at(float x, float y) {
     sent_x_ = sent_y_ = 0;
     stepped_ = false;
     still_ = 0;
-    gain_x_ = gain_y_ = 1.0f;
+    steps_ = 0;
 }
 
 // The pointer moved to (x, y) while the mouse was free: moving onto the screen
@@ -610,7 +635,8 @@ bool Gui::auto_capture(float x, float y) {
     int cx = 0, cy = 0;
     if (!capture_armed_ || !session_.settings().mouse_auto_capture || !m || !m->keyboard() ||
         !m->display().cursor_position(cx, cy) || !(SDL_GetWindowFlags(window_) & SDL_WINDOW_INPUT_FOCUS) ||
-        SDL_GetMouseState(nullptr, nullptr) || ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
+        SDL_GetMouseState(nullptr, nullptr) || settings_open_ ||
+        ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
         return false;
     capture_at(x, y);
     return true;
@@ -643,8 +669,13 @@ void Gui::mouse_frame() {
         // rate), so the steps do not pile up and land all at once; if it
         // still has not, the guest holds the pointer there (a grab), and
         // the steering ends. The guest accelerates larger
-        // steps: how much is learnt from what the last whole step did, and
-        // most of the rest of the way is sent.
+        // steps: how much is learnt from what the last large step did, and
+        // most of the rest of the way is sent. It ends a few pixels short, or
+        // after a few steps: the pointer's image moves with no movement when
+        // its shape changes (its hot spot is elsewhere in the new image), and
+        // the guest takes small steps without acceleration, so chasing the
+        // last pixels would only swing it back and forth.
+        constexpr unsigned kMaxSteps = 6;
         sync_x_ += static_cast<float>(x);
         sync_y_ += static_cast<float>(y);
         x = y = 0;
@@ -654,7 +685,7 @@ void Gui::mouse_frame() {
             syncing_ = false;
         } else if (!stepped_ || still_ >= (moved ? 2 : 60)) {
             auto learn = [](int sent, int got, float& gain) {
-                if (std::abs(sent) >= 4 && got * sent > 0)
+                if (std::abs(sent) >= 8 && got * sent > 0)
                     gain = std::clamp(static_cast<float>(got) / static_cast<float>(sent), 1.0f, 8.0f);
             };
             if (stepped_) {
@@ -667,7 +698,7 @@ void Gui::mouse_frame() {
                 const int sent = std::abs(rest) <= 2 ? rest : static_cast<int>(std::lround(static_cast<float>(rest) * 0.9f / gain));
                 return std::clamp(sent, -112, 127);
             };
-            if (std::abs(rest_x) <= 1 && std::abs(rest_y) <= 1) {
+            if ((std::abs(rest_x) <= 3 && std::abs(rest_y) <= 3) || steps_ >= kMaxSteps) {
                 syncing_ = false;
             } else {
                 x = sent_x_ = step(rest_x, gain_x_);
@@ -676,6 +707,7 @@ void Gui::mouse_frame() {
                 step_cy_ = cy;
                 stepped_ = true;
                 still_ = 0;
+                ++steps_;
             }
         }
     }
@@ -1049,11 +1081,11 @@ std::vector<MenuEntry> Gui::menus() {
         held.push_back(E::item("Stop-N (NVRAM defaults)", [this] { power_on({kSunStop, kSunN}); }));
         machine.push_back(E::submenu("Power On Holding", std::move(held)));
     } else {
+        machine.push_back(E::item("Press Power Button", [this] { power_button(); })
+                              .tip("The front-panel button: the system shuts down and switches off, if its software answers it"));
         machine.push_back(E::item("Power Off Now", [this] { power_off(); })
                               .tip("Cuts the power at once, without shutting down (the NVRAM is kept)"));
         machine.push_back(E::item("Reset", [this] { reset(); }).tip("Restarts the machine from OpenBoot at once"));
-        machine.push_back(E::item("Press Power Button", [this] { power_button(); })
-                              .tip("The front-panel button: the system shuts down and switches off, if its software answers it"));
         machine.push_back(E::separator());
         machine.push_back(E::item(m->keyboard() ? "Send Stop-A" : "Send BREAK (Stop-A)", [this] { stop_a(); })
                               .key('A')
@@ -1290,6 +1322,7 @@ void Gui::draw_status_bar() {
 // --- Settings ------------------------------------------------------------------
 
 void Gui::open_settings() {
+    set_captured(false);  // the dialog is over the screen: the pointer is the host's again
     edit_ = session_.settings();
     net_mode_ = edit_.net == "none" ? 2 : edit_.net.rfind("tap:", 0) == 0 ? 1 : 0;
     tap_name_ = net_mode_ == 1 ? edit_.net.substr(4) : std::string();
@@ -1414,9 +1447,47 @@ void Gui::draw_settings() {
             int upa = edit_.upa == "creator3d" ? 1 : 0;
             if (ImGui::Combo("##upa", &upa, "Empty\0Creator3D (FFB2+, double-buffered)\0"))
                 edit_.upa = upa == 1 ? "creator3d" : "none";
-            ImGui::SetItemTooltip("The Ultra 10's UPA graphics slot. A Creator3D needs its FCode PROM image\n"
-                                  "(ffb2p.fth, read from a real card) in the PROM folder; it is then the\n"
-                                  "screen, and the on-board Rage Pro has no monitor.");
+            ImGui::SetItemTooltip("The Ultra 10's UPA graphics slot. A Creator3D is then the screen, and the\n"
+                                  "on-board Rage Pro has no monitor.");
+            if (edit_.upa == "creator3d") {
+                // Which FCode, when the PROM folder holds one of the card's.
+                const PromChoice& pc = prom_choice(edit_);
+                if (!pc.fcode_text.empty() || edit_.creator3d_fcode == "supplied") {
+                    label("FCode");
+                    ImGui::SetNextItemWidth(-1);
+                    std::string items = creator3d_fcode_name(builtin_creator3d_fcode()) + " (built in)";
+                    items += '\0';
+                    items += pc.fcode_text.empty() ? "From the PROM folder (none there)" : pc.fcode_text;
+                    items += '\0';
+                    int f = edit_.creator3d_fcode == "supplied" ? 1 : 0;
+                    if (ImGui::Combo("##fcode", &f, items.c_str())) edit_.creator3d_fcode = f == 1 ? "supplied" : "builtin";
+                    ImGui::SetItemTooltip("The Creator3D's FCode PROM: UltraViolet's own, built in, or the image in\n"
+                                          "the PROM folder (such as one read from a real card's PROM).");
+                }
+            }
+            {
+                // The screen's size, from the list of the card that is the screen.
+                const bool ffb = edit_.upa == "creator3d";
+                const std::vector<MonitorTiming>& list = ffb ? Ffb::resolutions() : Mach64::resolutions();
+                label("Resolution");
+                ImGui::SetNextItemWidth(160 * scale_);
+                auto text = [](const MonitorTiming& t) {
+                    return std::to_string(t.width) + " x " + std::to_string(t.height) + ", " + std::to_string(t.rate) + " Hz";
+                };
+                const MonitorTiming* now = find_timing(list, edit_.resolution);
+                const std::string shown = now ? text(*now) : edit_.resolution + " (not this card's: 1152 x 900)";
+                if (ImGui::BeginCombo("##resolution", shown.c_str())) {
+                    for (const MonitorTiming& t : list)
+                        if (ImGui::Selectable(text(t).c_str(), &t == now))
+                            edit_.resolution = std::to_string(t.width) + "x" + std::to_string(t.height);
+                    ImGui::EndCombo();
+                }
+                ImGui::SetItemTooltip("The screen from power-on (the %s's): OpenBoot's console and the desktop.\n"
+                                      "It goes in NVRAM's output-device (as screen:r1280x1024x60) when that names\n"
+                                      "the screen, and the monitor prefers it. A mode set in Solaris (such as\n"
+                                      "with ffbconfig or m64config) is kept over it.",
+                                      ffb ? "Creator3D" : "on-board Rage Pro");
+            }
             label("Console");
             ImGui::SetNextItemWidth(-1);
             int con = edit_.console == "ttya" ? 1 : 0;
@@ -1620,6 +1691,11 @@ void Gui::draw_settings() {
                              "Real time: guest clocks follow the host's\0Cycle: one cycle per instruction, reproducible\0"
                              "Maximum: no speed limit, guest clocks follow the host's\0"))
                 edit_.timing = timing == 0 ? Pacer::Mode::Realtime : timing == 1 ? Pacer::Mode::Cycle : Pacer::Mode::Max;
+            ImGui::BeginDisabled(edit_.timing == Pacer::Mode::Max);
+            ImGui::Checkbox("Turbo on at boot", &edit_.turbo_at_boot);
+            ImGui::EndDisabled();
+            ImGui::SetItemTooltip("Powers on with Turbo on: no speed limit, with the guest's clocks still following\n"
+                                  "the host's, so it keeps real time; the Turbo button turns it off");
             ImGui::Spacing();
             ImGui::Checkbox("JIT (translate guest code to host code)", &edit_.jit);
             ImGui::Checkbox("Block cache (decode guest code once)", &edit_.block_cache);

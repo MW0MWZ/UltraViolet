@@ -8,6 +8,8 @@
 #include <fstream>
 #include <iterator>
 
+#include "creator3d_fcode.h"
+
 namespace uv::app {
 
 namespace {
@@ -100,31 +102,74 @@ bool read_prom(const PromImage& p, std::vector<u8>& data, std::string& error) {
     return true;
 }
 
-bool select_creator3d_fcode(const Settings& s, std::vector<u8>& data, std::string& path, std::string& error) {
+namespace {
+
+// What an image is: a Creator3D FCode program (its start token first, and
+// naming itself SUNW,ffb), and whose: 1 the card's own, 0 UltraViolet's
+// open source one, -1 neither; its version ("2.9").
+int creator3d_kind(const std::vector<u8>& d, std::string& version) {
+    static const std::string kName = "SUNW,ffb", kTags[] = {"UltraViolet ffb.fth ", "ffb2p.fth "};
+    if (d.size() < 8 || d[0] < 0xF0 || d[0] > 0xF3 || std::search(d.begin(), d.end(), kName.begin(), kName.end()) == d.end())
+        return -1;
+    for (int kind = 1; kind >= 0; --kind) {
+        const std::string& t = kTags[kind];
+        const auto tag = std::search(d.begin(), d.end(), t.begin(), t.end());
+        if (tag == d.end()) continue;
+        version.clear();
+        for (auto q = tag + static_cast<std::ptrdiff_t>(t.size()); q != d.end() && *q > 0x20 && *q < 0x7F; ++q)
+            version.push_back(static_cast<char>(*q));
+        return kind;
+    }
+    return -1;
+}
+
+}  // namespace
+
+std::vector<u8> builtin_creator3d_fcode() {
+    return std::vector<u8>(std::begin(kCreator3dFcode), std::end(kCreator3dFcode));
+}
+
+std::string creator3d_fcode_name(const std::vector<u8>& data) {
+    std::string v;
+    switch (creator3d_kind(data, v)) {
+        case 1: return "the card's own, ffb2p.fth " + v;
+        case 0: return "UltraViolet's, ffb.fth " + v;
+        default: return "";
+    }
+}
+
+bool find_creator3d_fcode(const Settings& s, std::vector<u8>& data, std::string& path) {
     const std::string folder = prom_folder(s);
-    static const std::string kName = "SUNW,ffb", kTag = "ffb2p.fth ";
+    // The card's over the open source one; the newest version; of the same
+    // version, the longer image (a whole PROM, which also holds the card's
+    // own logo, over its FCode alone).
+    int best_kind = -1;
     std::vector<int> best;
     std::error_code ec;
+    path.clear();
     for (const auto& entry : std::filesystem::directory_iterator(folder, ec)) {
         std::vector<u8> d;
         if (!entry.is_regular_file(ec) || entry.file_size(ec) > (256u << 10) || ec || !read_file(entry.path().string(), d))
             continue;
-        // An FCode program (its start token first) that names itself SUNW,ffb.
-        if (d.size() < 8 || d[0] < 0xF0 || d[0] > 0xF3 || std::search(d.begin(), d.end(), kName.begin(), kName.end()) == d.end())
-            continue;
-        const auto tag = std::search(d.begin(), d.end(), kTag.begin(), kTag.end());
-        if (tag == d.end()) continue;
         std::string v;
-        for (auto q = tag + static_cast<std::ptrdiff_t>(kTag.size()); q != d.end() && *q > 0x20 && *q < 0x7F; ++q)
-            v.push_back(static_cast<char>(*q));
+        const int kind = creator3d_kind(d, v);
+        if (kind < 0) continue;
         const std::vector<int> n = version_numbers(v);
-        // The newest version; of the same version, the longer image (a whole
-        // PROM, which also holds the card's own logo, over its FCode alone).
-        if (path.empty() || n > best || (n == best && d.size() > data.size()))
-            best = n, path = entry.path().string(), data = std::move(d);
+        if (kind > best_kind || (kind == best_kind && (n > best || (n == best && d.size() > data.size()))))
+            best_kind = kind, best = n, path = entry.path().string(), data = std::move(d);
     }
-    if (!path.empty()) return true;
-    error = "no Creator3D FCode PROM image (ffb2p.fth, read from the card's PROM) in " + folder;
+    return !path.empty();
+}
+
+bool select_creator3d_fcode(const Settings& s, std::vector<u8>& data, std::string& path, std::string& error) {
+    if (s.creator3d_fcode != "supplied") {
+        data = builtin_creator3d_fcode();
+        path.clear();
+        return true;
+    }
+    if (find_creator3d_fcode(s, data, path)) return true;
+    error = "no Creator3D FCode PROM image (the card's ffb2p.fth, or a build of UltraViolet's ffb.fc) in " +
+            prom_folder(s) + "; or choose UltraViolet's built-in FCode in Settings";
     return false;
 }
 

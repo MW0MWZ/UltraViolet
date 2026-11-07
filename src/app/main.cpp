@@ -75,8 +75,15 @@ void usage() {
         "  --cpu-mhz MHZ    processor module by clock: 270, 300, 333, 360, 400 or 440\n"
         "                   (default 440); its E-cache goes with it\n"
         "  --ecache-kb KB   E-cache, for 360 MHz, which came with 256 or 2048 (default)\n"
-        "  --upa CARD       the UPA slot: none (the default) or creator3d (a Creator3D, its\n"
-        "                   FCode PROM image from the PROM folder; the screen is then its)\n"
+        "  --upa CARD       the UPA slot: none (the default) or creator3d (a Creator3D; the\n"
+        "                   screen is then its)\n"
+        "  --creator3d-fcode WHICH  the Creator3D's FCode: builtin (UltraViolet's, the\n"
+        "                   default) or supplied (the image in the PROM folder, such as\n"
+        "                   one read from a real card)\n"
+        "  --resolution WxH the screen from power-on (default 1152x900): 640x480, 800x600,\n"
+        "                   1024x768, 1024x800, 1152x900, 1280x800, 1280x1024, 1440x900,\n"
+        "                   1600x1000, 1600x1200, and on a Creator3D 1600x1280, 1920x1080\n"
+        "                   and 1920x1200\n"
         "  --console WHERE  screen (the on-board graphics, a Sun keyboard and mouse, in the\n"
         "                   window; the default) or ttya (no keyboard: OpenBoot and Solaris\n"
         "                   take the first serial port; the default with --headless)\n"
@@ -328,7 +335,9 @@ int main(int argc, char** argv) {
                        {"--cdrom", "cdrom"},         {"--mac", "mac"},         {"--net", "net"},
                        {"--hostfwd", "hostfwd"},     {"--ram", "ram_mb"},      {"--cpu-mhz", "cpu_mhz"},
                        {"--ecache-kb", "ecache_kb"}, {"--console", "console"}, {"--keyboard", "keyboard"},
-                       {"--timing", "timing"},       {"--log", "log"},         {"--upa", "upa"}};
+                       {"--timing", "timing"},       {"--log", "log"},         {"--upa", "upa"},
+                       {"--resolution", "resolution"},
+                       {"--creator3d-fcode", "creator3d_fcode"}};
         static const struct {
             const char* flag;
             const char* key;

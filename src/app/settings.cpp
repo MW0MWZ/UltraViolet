@@ -77,6 +77,7 @@ Ultra5_10::Options Settings::options() const {
     o.flash_write_enable = flash_write_enable;
     o.keyboard = console == "screen";
     o.keyboard_layout = keyboard_layout(keyboard);
+    o.screen_resolution = resolution;
     return o;
 }
 
@@ -170,6 +171,9 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
     else if (key == "ecache_kb") ok = parse_number(v, n) && n == static_cast<unsigned>(n) &&
                                      (s.ecache_kb = static_cast<unsigned>(n), true);
     else if (key == "upa") ok = (v == "none" || v == "creator3d") && (s.upa = v, true);
+    else if (key == "creator3d_fcode") ok = (v == "builtin" || v == "supplied") && (s.creator3d_fcode = v, true);
+    else if (key == "resolution")
+        ok = (find_timing(Ffb::resolutions(), v) || find_timing(Mach64::resolutions(), v)) && (s.resolution = v, true);
     else if (key == "console") ok = (v == "screen" || v == "ttya") && (s.console = v, true);
     else if (key == "keyboard") {
         char* end = nullptr;
@@ -184,6 +188,7 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
         net::PortForward f;
         ok = parse_forward(v, f) && (s.forwards.push_back(f), true);
     } else if (key == "timing") ok = parse_timing(v, s.timing);
+    else if (key == "turbo_at_boot") ok = parse_bool(v, s.turbo_at_boot);
     else if (key == "block_cache") ok = parse_bool(v, s.block_cache);
     else if (key == "jit") ok = parse_bool(v, s.jit);
     else if (key == "idle_skip") ok = parse_bool(v, s.idle_skip);
@@ -269,10 +274,10 @@ bool save_settings(const std::string& path, const Settings& s, std::string& erro
         f << "prom_dir=" << s.prom_dir << "\nnvram=" << s.nvram << "\ndisk=" << s.disk << "\n";
         for (const auto& c : s.cdroms) f << "cdrom=" << c << "\n";
         f << "ram_mb=" << s.ram_mb << "\ncpu_mhz=" << s.cpu_mhz << "\necache_kb=" << s.ecache_kb
-          << "\nupa=" << s.upa << "\nconsole=" << s.console << "\nkeyboard=" << s.keyboard << "\nmac=" << (s.mac ? mac_text(*s.mac) : "")
+          << "\nupa=" << s.upa << "\ncreator3d_fcode=" << s.creator3d_fcode << "\nresolution=" << s.resolution << "\nconsole=" << s.console << "\nkeyboard=" << s.keyboard << "\nmac=" << (s.mac ? mac_text(*s.mac) : "")
           << "\nnet=" << s.net << "\n";
         for (const auto& fw : s.forwards) f << "hostfwd=" << forward_text(fw) << "\n";
-        f << "timing=" << timing_name(s.timing) << "\nblock_cache=" << (s.block_cache ? 1 : 0)
+        f << "timing=" << timing_name(s.timing) << "\nturbo_at_boot=" << (s.turbo_at_boot ? 1 : 0) << "\nblock_cache=" << (s.block_cache ? 1 : 0)
           << "\njit=" << (s.jit ? 1 : 0) << "\nidle_skip=" << (s.idle_skip ? 1 : 0)  << "\nfast_disk=" << (s.fast_disk ? 1 : 0) << "\nflash_write_enable=" << (s.flash_write_enable ? 1 : 0) << "\nlog=" << s.log << "\nmouse_auto_capture=" << (s.mouse_auto_capture ? 1 : 0)
           << "\nwheel_keys=" << s.wheel_keys << "\nsound=" << (s.sound ? 1 : 0) << "\nvolume=" << s.volume << "\n";
         if (!f) {

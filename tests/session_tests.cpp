@@ -152,7 +152,58 @@ TEST(creator3d_prom_prefers_the_whole_prom_to_its_fcode_alone) {
     s.prom_dir = dir.string();
     std::vector<u8> data;
     std::string path, error;
-    CHECK(app::select_creator3d_fcode(s, data, path, error));
+    CHECK(app::find_creator3d_fcode(s, data, path));
     CHECK_EQ(data.size(), 0x10000u);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(creator3d_fcode_is_built_in) {
+    // UltraViolet's own, its logo after it at PROM byte 0x4000 (a Sun
+    // raster file).
+    const std::vector<u8> d = app::builtin_creator3d_fcode();
+    CHECK(app::creator3d_fcode_name(d).rfind("UltraViolet's, ffb.fth ", 0) == 0);
+    CHECK(d.size() > 0x4004);
+    CHECK_EQ(d[0x4000], 0x59u);
+    CHECK_EQ(d[0x4001], 0xA6u);
+    app::Settings s;
+    s.prom_dir = (std::filesystem::temp_directory_path() / "uv_no_such_folder").string();
+    s.creator3d_fcode = "supplied";
+    std::vector<u8> data;
+    std::string path, error;
+    CHECK(!app::select_creator3d_fcode(s, data, path, error));
+    CHECK(!error.empty());
+}
+
+TEST(creator3d_prom_takes_the_free_fcode_only_without_the_cards) {
+    const auto dir = std::filesystem::temp_directory_path() / "uv_ffb_free_tests";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    auto fcode = [](const std::string& body) {
+        std::vector<u8> d = {0xF3, 0x08, 0x00, 0x00};
+        d.insert(d.end(), body.begin(), body.end());
+        return d;
+    };
+    auto put = [&](const char* name, const std::vector<u8>& d) {
+        std::ofstream(dir / name, std::ios::binary).write(reinterpret_cast<const char*>(d.data()),
+                                                          static_cast<std::streamsize>(d.size()));
+    };
+    put("free.fc", fcode("SUNW,ffb UltraViolet ffb.fth 0.1 "));
+    app::Settings s;
+    s.prom_dir = dir.string();
+    std::vector<u8> data;
+    std::string path, error;
+    CHECK(app::find_creator3d_fcode(s, data, path));
+    CHECK(path.find("free.fc") != std::string::npos);
+    put("card.bin", fcode("SUNW,ffb @(#)ffb2p.fth 2.9 98/07/14 "));
+    CHECK(app::find_creator3d_fcode(s, data, path));
+    CHECK(path.find("card.bin") != std::string::npos);
+    // Taken only when chosen: the built-in one otherwise.
+    CHECK(app::select_creator3d_fcode(s, data, path, error));
+    CHECK(path.empty());
+    CHECK(data == app::builtin_creator3d_fcode());
+    s.creator3d_fcode = "supplied";
+    CHECK(app::select_creator3d_fcode(s, data, path, error));
+    CHECK(path.find("card.bin") != std::string::npos);
+    CHECK(app::creator3d_fcode_name(data) == "the card's own, ffb2p.fth 2.9");
     std::filesystem::remove_all(dir);
 }

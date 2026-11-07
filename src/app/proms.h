@@ -29,9 +29,19 @@ std::string prom_folder(const Settings& s);
 bool select_prom(const Settings& s, PromImage& out, std::string& error);
 bool read_prom(const PromImage& p, std::vector<u8>& data, std::string& error);
 
-// A Creator3D's FCode PROM image (FFB2+, ffb2p.fth) in the PROM folder:
-// the newest version's contents and the file's path; false, with a message,
-// if there is none.
+// A Creator3D's FCode PROM image: UltraViolet's open source one, built in (the
+// default), or, with creator3d_fcode "supplied", the best in the PROM folder
+// (find_creator3d_fcode), and its path (empty for the built-in one); false,
+// with a message, if there is none.
 bool select_creator3d_fcode(const Settings& s, std::vector<u8>& data, std::string& path, std::string& error);
+std::vector<u8> builtin_creator3d_fcode();
+// The best Creator3D FCode image in the PROM folder: the card's own (read
+// from its PROM) over a build of the open source one; the newest version;
+// of the same version, the longer image (a whole PROM, with the card's
+// logo).
+bool find_creator3d_fcode(const Settings& s, std::vector<u8>& data, std::string& path);
+// Whose an image is, and its version, to show ("the card's own, ffb2p.fth
+// 2.9"); empty if it is not a Creator3D FCode image.
+std::string creator3d_fcode_name(const std::vector<u8>& data);
 
 }  // namespace uv::app

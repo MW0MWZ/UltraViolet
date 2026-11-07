@@ -18,3 +18,6 @@ disks/
 *.qcow2
 *.nvram
 *.orig
+
+# The FCode before build.sh adds the logo
+firmware/creator3d/ffb.fcode

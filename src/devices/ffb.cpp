@@ -24,10 +24,9 @@ constexpr u8 kPromLanes[3] = {0x00, 0x01, 0x2C};
 // The expansion space: the board's strapping in byte 0 (0x33: FFB2+,
 // double-buffered, as a real card reads), and the monitor's sense
 // lines in bits 24-26 of the word at 0x10. With nothing to sense (all three
-// lines high) the FCode takes 1152 x 900 at 66 Hz, as it does on a real
-// card with a monitor that has no sense or DDC lines.
+// lines high, the default) the FCode takes 1152 x 900 at 66 Hz, as it does
+// on a real card with a monitor that has no sense or DDC lines.
 constexpr u32 kStrap = 0x33;
-constexpr u32 kMonitorSense = 7;
 
 constexpr u32 kFbcDevId = 0x3241906D;  // FBC_reg_ID, as a real card reads
 // UCSR when idle: the FIFO's free entries in bits 0-11. (A real card's
@@ -53,7 +52,7 @@ constexpr u32 kDacPpll = 0x0000, kDacGpll = 0x0001, kDacPfctrl = 0x1000, kDacUct
               kDacTghc = 0x6010, kDacDid = 0x8000, kDacMpdata = 0x8001, kDacMpsense = 0x8002;
 constexpr u32 kDacDidValue = 0xA236E1AD;  // BT498 (part 0x236E), revision 0xA
 constexpr u32 kDacManRev = 1;             // UCTRL bits 8-11 (RamDAC_rev 1, as a real card's)
-constexpr u32 kTgenVideo = 1, kTgenTiming = 2;
+constexpr u32 kTgenVideo = 1, kTgenTiming = 2, kTgenInterlaced = 0x40;
 // Window transfer control (the X driver's names): DS busy, TCMD transfer,
 // TE at the next frame (else field).
 constexpr u32 kWtctrlBusy = 1, kWtctrlTransfer = 2;
@@ -86,6 +85,7 @@ void Ffb::reset() {
     ppll_ = gpll_ = pfctrl_ = uctrl_ = wtctrl_ = tmctrl_ = tcolorkey_ = wamask_ = 0;
     sanal_ = dacctrl_ = tgen_ = 0;
     mpdata_ = 3;
+    monitor_.drive(true, true);
     tregs_.fill(0);
     cursor_ctrl_ = 3;
     cursor_pos_ = 0;
@@ -110,7 +110,7 @@ bool Ffb::read(u64 offset, unsigned size, u64& value) {
     auto word = [&](u64 a) -> u32 {
         if (a < kDac) {
             const u64 e = a - kExp;
-            return e == 0 ? kStrap << 24 : e == 0x10 ? kMonitorSense << 24 : 0;
+            return e == 0 ? kStrap << 24 : e == 0x10 ? monitor_.sense() << 24 : 0;
         }
         if (a < kFbc) {
             switch ((a - kDac) & 0xC) {
@@ -192,9 +192,9 @@ u32 Ffb::dac_read(u32 a) {
         }
         case kDacDid: return kDacDidValue;
         case kDacMpdata: return mpdata_;
-        // The monitor port's lines as they are: what the card drives, with
-        // nothing on the other end pulling either low (no DDC monitor).
-        case kDacMpsense: return mpdata_ & 3;
+        // The monitor port's lines as they are: what the card drives, and
+        // the monitor's pulling SDA low.
+        case kDacMpsense: return (monitor_.scl() ? 1 : 0) | (monitor_.sda() ? 2 : 0);
         default: break;
     }
     engine_unmodelled(2, "a DAC register read", a);
@@ -222,8 +222,8 @@ void Ffb::dac_write(u32 a, u32 v) {
             case kDacUctrl: uctrl_ = v; break;
             case kDacWtctrl:
                 // The shadow window lookups to the active ones, at the next
-                // vertical blank (frame and field are the same, not
-                // interlaced); busy till then.
+                // vertical blank (interlaced, the next field's, whether TE
+                // asks for a frame or a field); busy till then.
                 wtctrl_ = v & ~(kWtctrlTransfer | kWtctrlBusy);
                 if (v & kWtctrlTransfer) {
                     transfer_pending_ = true;
@@ -236,7 +236,10 @@ void Ffb::dac_write(u32 a, u32 v) {
             case kDacSanal: sanal_ = v; return;
             case kDacDacctrl: dacctrl_ = v; break;
             case kDacTgen: tgen_ = v; break;
-            case kDacMpdata: mpdata_ = v & 3; return;
+            case kDacMpdata:
+                mpdata_ = v & 3;
+                monitor_.drive(v & 1, v & 2);
+                return;
             case kDacTgvc:
             case kDacTghc:
             case kDacDid: return;  // (read only)
@@ -264,6 +267,29 @@ void Ffb::cursor_write(u32 a, u32 v) {
     else if (a == 0x104) cursor_pos_ = v;
     else return;
     cursor_version_ = ++version_;
+}
+
+// --- The monitor --------------------------------------------------------------
+
+const std::vector<MonitorTiming>& Ffb::resolutions() {
+    // The card's own timings for these modes (its FCode's PLL and timing
+    // generator settings): pixel clock; front porch, sync and back porch.
+    static const std::vector<MonitorTiming> kList = {
+        {640, 480, 60, 25125, 16, 96, 48, 10, 2, 33, false},
+        {800, 600, 75, 49500, 16, 80, 160, 1, 3, 21, true},
+        {1024, 768, 60, 64800, 24, 136, 160, 3, 6, 29, false},
+        {1024, 800, 84, 94500, 16, 128, 152, 2, 4, 31, false},
+        {1152, 900, 66, 94500, 40, 128, 208, 2, 4, 31, false},
+        {1280, 800, 76, 101250, 20, 114, 156, 3, 7, 36, false},
+        {1280, 1024, 60, 108000, 48, 112, 248, 1, 3, 38, true},
+        {1440, 900, 76, 135000, 40, 160, 240, 2, 3, 39, false},
+        {1600, 1000, 66, 135000, 40, 136, 192, 2, 5, 32, false},
+        {1600, 1200, 75, 202500, 64, 192, 304, 1, 3, 46, true},
+        {1600, 1280, 76, 216000, 24, 216, 280, 2, 8, 50, false},
+        {1920, 1080, 72, 216000, 48, 216, 376, 3, 3, 86, false},
+        {1920, 1200, 70, 219375, 24, 228, 344, 1, 3, 36, false},
+    };
+    return kList;
 }
 
 // --- FBC registers -----------------------------------------------------------------
@@ -485,19 +511,28 @@ bool Ffb::fb_write(u64 off, unsigned size, u64 value) {
 Ffb::Timing Ffb::timing() const {
     Timing t;
     // tregs_: VBNP, VBAP, VSNP, VSAP, HSNP, HBNP, HBAP, HSYNCNP, HSYNCAP, ...
-    // Vertical in lines, horizontal in pairs of pixels (the DAC takes two
-    // a clock): blank ends at VBNP/HBNP and starts at VBAP/HBAP; the line
-    // ends at HSYNCAP, the frame at VSAP.
+    // Vertical in lines, horizontal in pixels by two (4/2:1 pixel format)
+    // or by four (8/2:1, the card's high resolutions): blank ends at
+    // VBNP/HBNP and starts at VBAP/HBAP; the line ends at HSYNCAP, the
+    // frame at VSAP. (The FCode's 1600 x 1200 at 75 Hz, 8/2:1, comes out as
+    // VESA's timing only with four: 202.5 MHz, 2160 pixels a line.)
     const unsigned m = ppll_ & 0x7F, d = (ppll_ >> 7) & 0xF, pfd = (ppll_ >> 11) & 3;
+    const unsigned per = (pfctrl_ & 3) == 3 ? 4 : 2;
     if (!(tgen_ & kTgenTiming) || !m || !d || tregs_[1] <= tregs_[0] || tregs_[6] <= tregs_[5] || !tregs_[3] ||
         !tregs_[8])
         return t;
     t.on = true;
-    t.width = std::min((tregs_[6] - tregs_[5]) * 2, kLine);
+    // Interlaced, the counters run in half-lines: a line is two of the
+    // horizontal count, and a field the vertical count's half-lines (the
+    // frame's lines, VBNP-VBAP the frame's picture). The picture starts
+    // at HBNP of one half-line and ends at HBAP of the next (NTSC's 640
+    // pixels in 780, PAL's 768 in 936).
+    const bool interlaced = tgen_ & kTgenInterlaced;
+    t.width = std::min((interlaced ? tregs_[8] + 1 - tregs_[5] + tregs_[6] : tregs_[6] - tregs_[5]) * per, kLine);
     t.height = std::min(tregs_[1] - tregs_[0], kLines);
     t.total = tregs_[3] + 1;
     const double pclk = kDacRefHz * m / d / (1u << pfd);
-    t.line_cycles = cpu_hz_ * 2.0 * (tregs_[8] + 1) / pclk;
+    t.line_cycles = cpu_hz_ * per * (tregs_[8] + 1) / pclk;
     return t;
 }
 
@@ -670,6 +705,10 @@ void Ffb::describe(std::string& out) const {
     appendf(out, "ffb: uctrl %x wamask %x tmctrl %x tcolorkey %x tgen %x ppll %x pfctrl %x interrupts %x retraces %llu\n",
             uctrl_, wamask_, tmctrl_, tcolorkey_, tgen_, ppll_, pfctrl_, interrupts_,
             static_cast<unsigned long long>(debug_retraces_));
+    appendf(out, "ffb: timing (vbnp vbap vsnp vsap hsnp hbnp hbap hsyncnp hsyncap hscen hscenap epeqv eieqv eineqv)");
+    for (u32 r : tregs_) appendf(out, " %u", r);
+    appendf(out, "\nffb: dacctrl %x sanal %x\n", dacctrl_, sanal_);
+    if (!monitor_.trace().empty()) out += "ffb: ddc" + monitor_.trace() + "\n";
     appendf(out, "ffb: owlut %x %x %x %x  cursor ctrl %x pos %x colours %x %x %x\n", owlut_[0], owlut_[1], owlut_[2],
             owlut_[3], cursor_ctrl_, cursor_pos_, cursor_colour_[0], cursor_colour_[1], cursor_colour_[2]);
     out += "ffb: pwlut";
@@ -677,6 +716,9 @@ void Ffb::describe(std::string& out) const {
     out += "\nffb: fbc";
     for (u32 off = 0x200; off < 0x400; off += 4)
         if (regs_[off / 4] && (off < 0x380 || off >= 0x400)) appendf(out, " %03x=%08x", off, regs_[off / 4]);
+    out += "\nffb: fbc kernel";
+    for (u32 i = 0; i < kregs_.size(); ++i)
+        if (kregs_[i]) appendf(out, " %05x=%08x", 0x10000 + i * 4, kregs_[i]);
     out += "\n";
     out += "ffb: dac reads";
     for (auto [a, n] : debug_dac_reads_) appendf(out, " %x(%u)", a, n);
@@ -710,6 +752,9 @@ void Ffb::describe(std::string& out) const {
         for (std::size_t i = 0; i < std::min<std::size_t>(by.size(), 12); ++i) appendf(out, " %06x(%u)", by[i].second, by[i].first);
         out += "\n";
     }
+    out += "ffb: palette 0 in full:";
+    for (unsigned i = 0; i < 256; ++i) appendf(out, "%s%06x", i % 16 ? " " : "\n  ", clut_[i]);
+    out += "\n";
     for (unsigned p = 0; p < 4; ++p) {
         unsigned lit = 0;
         for (unsigned i = 0; i < 256; ++i) lit += clut_[p * 256 + i] != 0;

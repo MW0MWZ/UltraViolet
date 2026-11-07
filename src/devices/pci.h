@@ -85,6 +85,9 @@ public:
     // paths through this function's decode).
     std::function<void()> on_config_write;
     u32 bar_address(unsigned bar) const;
+    // The expansion ROM's contents (a function that declares the ROM BAR);
+    // empty: no ROM answers in it.
+    void set_rom(std::vector<u8> image) { rom_ = std::move(image); }
 
     // Where a memory or I/O cycle at `addr` goes in this function, for a
     // bus's decode cache: Plain (a BAR: `bar`, its base and size), None (not
@@ -103,7 +106,8 @@ protected:
     // `reset_address` is its value at power-on (normally 0).
     void define_bar(unsigned bar, u32 size, bool io, u32 reset_address = 0, bool prefetchable = false);
     // Declares the expansion ROM BAR: `size` a power of two. Its address
-    // and enable bit are stored; no ROM answers in it.
+    // and enable bit are stored; the ROM (set_rom) answers in it when both
+    // its enable bit and memory space are on.
     void define_rom(u32 size) { set_wmask(kRomBase, 4, ~(size - 1) | 1u); }
     // Accesses that fall in an enabled BAR, at `offset` into it.
     virtual bool bar_read(unsigned bar, u32 offset, unsigned size, u64& value);
@@ -144,9 +148,12 @@ private:
     };
     // The BAR containing `addr` of the given kind, or -1.
     int decode(u32 addr, bool io) const;
+    // `addr`'s offset in the expansion ROM, or false if it is not there.
+    bool rom_offset(u32 addr, u32& offset) const;
 
     std::array<Bar, 6> bars_{};
     std::array<u8, 256> reset_cfg_{};
+    std::vector<u8> rom_;
     std::function<void(bool)> irq_;
     DmaRead dma_read_;
     DmaWrite dma_write_;

@@ -43,6 +43,7 @@
 
 #include "core/scheduler.h"
 #include "devices/display.h"
+#include "devices/monitor.h"
 #include "mem/bus.h"
 
 namespace uv {
@@ -71,6 +72,14 @@ public:
 
     // A report of the DAC's state and the FBC's main registers (debugging).
     void describe(std::string& out) const;
+
+    // The monitor on the card's connector: its sense lines and DDC.
+    Monitor& monitor() { return monitor_; }
+
+    // The resolutions a screen is given at power-on: each size the card's
+    // modes have, at 60 Hz or the next rate up the card has (not its
+    // stereo or interlaced modes), with the timing the card gives it.
+    static const std::vector<MonitorTiming>& resolutions();
 
 private:
     // The DAC (dac.cpp's part of ffb.cpp): indirect registers.
@@ -158,6 +167,7 @@ private:
     std::array<u32, 4> owlut_shadow_{}, owlut_{};
     u32 ppll_ = 0, gpll_ = 0, pfctrl_ = 0, uctrl_ = 0, wtctrl_ = 0, tmctrl_ = 0, tcolorkey_ = 0, wamask_ = 0;
     u32 sanal_ = 0, dacctrl_ = 0, tgen_ = 0, mpdata_ = 3;
+    Monitor monitor_;
     std::array<u32, 14> tregs_{};  // 0x6001-0x600E
     std::array<u32, 0x100> cursor_bits_{};
     u32 cursor_ctrl_ = 3, cursor_pos_ = 0;

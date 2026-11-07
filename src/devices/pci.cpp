@@ -86,20 +86,40 @@ int Function::decode(u32 addr, bool io) const {
     return -1;
 }
 
+bool Function::rom_offset(u32 addr, u32& offset) const {
+    const u32 rom = cfg32(kRomBase), mask = u32{wmask_[kRomBase + 1]} << 8 | u32{wmask_[kRomBase + 2]} << 16 |
+                                                u32{wmask_[kRomBase + 3]} << 24;
+    if (rom_.empty() || !(rom & 1) || !mask || !(command() & kCmdMemory)) return false;
+    const u32 base = rom & mask;
+    if ((addr & mask) != base) return false;
+    offset = addr - base;
+    return true;
+}
+
 Function::Claim Function::claim(u32 addr, bool io, Decoded& d) const {
     const int b = decode(addr, io);
-    if (b < 0) return Claim::None;
+    if (b < 0) {
+        u32 offset;
+        return !io && rom_offset(addr, offset) ? Claim::Special : Claim::None;
+    }
     d = {static_cast<unsigned>(b), bar_address(static_cast<unsigned>(b)), bars_[static_cast<unsigned>(b)].size};
     return Claim::Plain;
 }
 
 bool Function::mem_read(u32 addr, unsigned size, u64& value) {
     const int b = decode(addr, false);
+    if (u32 offset; b < 0 && rom_offset(addr, offset)) {
+        value = 0;  // bytes in PCI order: the first the least significant
+        for (unsigned i = 0; i < size; ++i)
+            if (offset + i < rom_.size()) value |= u64{rom_[offset + i]} << (8 * i);
+        return true;
+    }
     return b >= 0 && bar_read(static_cast<unsigned>(b), addr - bar_address(static_cast<unsigned>(b)), size, value);
 }
 
 bool Function::mem_write(u32 addr, unsigned size, u64 value) {
     const int b = decode(addr, false);
+    if (u32 offset; b < 0 && rom_offset(addr, offset)) return true;  // read-only
     return b >= 0 && bar_write(static_cast<unsigned>(b), addr - bar_address(static_cast<unsigned>(b)), size, value);
 }
 

@@ -104,6 +104,12 @@ public:
         // A Creator3D in the UPA slot (Ultra 10), given its FCode PROM's
         // image (a byte each, as read); none if empty.
         std::vector<u8> creator3d_fcode;
+        // The screen's size at power-on ("1280x1024": one of the Creator3D's
+        // resolutions(), or the Rage Pro's without one): its monitor answers
+        // DDC, preferring it, and NVRAM's output-device names its mode (when
+        // it names the screen); 1152 x 900 if the card has no such size.
+        // Empty: a monitor without DDC, and output-device as it is.
+        std::string screen_resolution;
         // The host clock guest time keeps to (default: the system's), as
         // the pacer takes it.
         Pacer::HostClock host_clock;
@@ -206,6 +212,7 @@ private:
     void apply_fast_io();
     bool nvram_blank() const;
     void write_new_nvram();
+    void set_screen_mode(const std::string& mode);
     u64 prom_pa_ = 0, prom_map_size_ = 0;
 
     Options opt_;
