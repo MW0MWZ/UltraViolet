@@ -21,3 +21,6 @@ disks/
 
 # The FCode before build.sh adds the logo
 firmware/creator3d/ffb.fcode
+
+# The OpenBoot build
+firmware/openboot/build/

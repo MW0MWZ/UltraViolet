@@ -29,6 +29,15 @@ std::string prom_folder(const Settings& s);
 bool select_prom(const Settings& s, PromImage& out, std::string& error);
 bool read_prom(const PromImage& p, std::vector<u8>& data, std::string& error);
 
+// UltraViolet's OpenBoot (firmware/openboot, built in): the 1 MiB flash
+// image, and what it is ("UltraViolet's OpenBoot 4.23.0").
+std::vector<u8> builtin_prom();
+PromImage builtin_prom_image();
+// The flash image to run, as the settings choose it: the built-in one (the
+// default), or with prom "supplied" the PROM folder's newest; false, with
+// a message, if there is none.
+bool select_flash(const Settings& s, PromImage& image, std::vector<u8>& data, std::string& error);
+
 // A Creator3D's FCode PROM image: UltraViolet's open source one, built in (the
 // default), or, with creator3d_fcode "supplied", the best in the PROM folder
 // (find_creator3d_fcode), and its path (empty for the built-in one); false,

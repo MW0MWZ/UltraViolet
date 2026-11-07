@@ -230,9 +230,11 @@ opens the window with the machine off and the settings from last time
 (Machine > Settings: processor clock, memory, console, keyboard layout, the
 PROM folder, NVRAM, hard disk and CD-ROM images, network, timing). The
 settings, a log and folders for ROMs, disk images and NVRAM are kept in
-an UltraViolet folder in the user's Documents folder. The newest Ultra 5/10
-flash PROM image in the PROM folder (`roms` beside the program, else the
-UltraViolet folder's `roms`) is used.
+an UltraViolet folder in the user's Documents folder. The flash PROM is
+UltraViolet's own OpenBoot, built in; Machine > Settings (Flash PROM) or
+`--prom supplied` takes the newest Ultra 5/10 image in the PROM folder
+instead (`roms` beside the program, else the UltraViolet folder's `roms`),
+such as Sun's OpenBoot 3.31.
 
 Given a machine on the command line it powers on at once:
 
@@ -289,12 +291,18 @@ it has set the one DHCP gave it. Other names go to the host's resolver.
 
 ## Firmware and media
 
-UltraViolet runs the Ultra 5/10's own OpenBoot PROM, with Solaris (or
-another sparc64 operating system) from its media. Neither is included:
-[roms/README.md](roms/README.md) says which images it expects, where they
-come from, and how to make them from the original Sun files with the
-`sunrom` tool. The `roms/`, `iso/` and `disks/` folders are ignored by git
-(but for that page).
+UltraViolet runs OpenBoot, with Solaris (or another sparc64 operating
+system) from its media. Its own OpenBoot is included and built in by
+default: open source, built from Sun's OpenBoot 4.23.0 release for the
+Ultra 5 and 10 ([firmware/openboot](firmware/openboot)). It is still being
+completed (the Solaris 8 and 10 installation DVDs boot with it; its
+diagnostics are to come); the Ultra 5/10's own Sun
+OpenBoot (3.31) is chosen under Settings (Flash PROM) or with `--prom
+supplied`. Sun's images and the operating systems are not included:
+[roms/README.md](roms/README.md) says which images UltraViolet expects,
+where they come from, and how to make them from the original Sun files with
+the `sunrom` tool. The `roms/`, `iso/` and `disks/` folders are ignored by
+git (but for that page).
 
 For the Creator3D, open source FCode is included: UltraViolet's own
 ([firmware/creator3d](firmware/creator3d)), built into the program and used
@@ -317,6 +325,10 @@ version. See [LICENSE](LICENSE).
 The FCode in `firmware/creator3d` (the Creator3D's) and `firmware/rage`
 (the Rage Pro's) is under the MIT licence; see their LICENSE files
 ([Creator3D](firmware/creator3d/LICENSE), [Rage Pro](firmware/rage/LICENSE)).
+
+OpenBoot in `firmware/openboot` is Sun Microsystems' release of OpenBoot
+4.23.0 under Sun's BSD-style licence, with UltraViolet's additions under the
+same terms; see [its LICENSE](firmware/openboot/LICENSE).
 
 The logos, UltraViolet's (in `graphics`) and those of the two FCode
 programs (in `firmware/creator3d` and `firmware/rage`), are &copy; Andy

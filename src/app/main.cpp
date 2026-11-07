@@ -64,8 +64,10 @@ void usage() {
         "  --version        print the version and exit\n"
         "  --settings FILE  start from a settings file saved by the window (options after it\n"
         "                   override it)\n"
-        "  --prom-dir DIR   folder of flash PROM images; the newest Ultra 5/10 one is used\n"
-        "                   (default: ./roms, else roms in the UltraViolet folder)\n"
+        "  --prom WHICH     the flash PROM: builtin (UltraViolet's OpenBoot, the default)\n"
+        "                   or supplied (the newest Ultra 5/10 image in the PROM folder)\n"
+        "  --prom-dir DIR   folder of flash PROM images (default: ./roms, else roms in\n"
+        "                   the UltraViolet folder)\n"
         "  --nvram FILE     M48T59 NVRAM image, loaded at start and saved when it changes\n"
         "  --disk FILE      ATA disk image (primary master)\n"
         "  --disk-size MB   create the disk image at this size if it does not exist\n"
@@ -331,7 +333,7 @@ int main(int argc, char** argv) {
         static const struct {
             const char* flag;
             const char* key;
-        } kValued[] = {{"--prom-dir", "prom_dir"},   {"--nvram", "nvram"},     {"--disk", "disk"},
+        } kValued[] = {{"--prom", "prom"},           {"--prom-dir", "prom_dir"},   {"--nvram", "nvram"},     {"--disk", "disk"},
                        {"--cdrom", "cdrom"},         {"--mac", "mac"},         {"--net", "net"},
                        {"--hostfwd", "hostfwd"},     {"--ram", "ram_mb"},      {"--cpu-mhz", "cpu_mhz"},
                        {"--ecache-kb", "ecache_kb"}, {"--console", "console"}, {"--keyboard", "keyboard"},
@@ -410,7 +412,8 @@ int main(int argc, char** argv) {
         }
         // A machine described here needs its PROM: say so before anything starts.
         app::PromImage prom;
-        if ((real_args > 0 || headless) && !app::select_prom(settings, prom, error)) {
+        std::vector<u8> flash;
+        if ((real_args > 0 || headless) && !app::select_flash(settings, prom, flash, error)) {
             std::fprintf(stderr, "error: %s\n", error.c_str());
             return 2;
         }

@@ -1,0 +1,61 @@
+\ Copyright (C) 2026 Andy Taylor. Distributed under the same terms as the
+\ OpenBoot release it is part of (see LICENSE).
+id: @(#)flashprom.tok 1.0 26/11/07
+purpose: The flash PROM's drop-ins, read as a device (flashprom@10,0)
+copyright: Copyright 2026 Andy Taylor
+
+\ What the release's sun4v flash PROM device (dev/sun4v-devices/flashprom)
+\ gives /packages/dropins, which reads drop-ins through a device opened with
+\ a drop-in's name: open finds it in the PROM, read and size give its
+\ contents. The PROM is the EBus's first window (1 MB).
+
+Fcode-Version3
+
+headerless
+
+h# 10.0000 constant /romsize
+
+\ (The PROM is a byte device: its words are read a byte at a time, in
+\ address order, whatever the PCI probe has made of rl@.)
+: rl@ ( adr -- l )  >r  r@ 3 + c@  r@ 2+ c@  r@ 1+ c@  r> c@  bljoin  ;
+
+fload ${BP}/dev/flash/dropins/misc.fth
+fload ${BP}/pkg/dropins/finder.fth
+
+0 instance value di-base
+0 instance value di-ptr
+0 instance value di-size
+
+: map-prom ( -- )
+   0 h# 10 /romsize " map-in" $call-parent to di-base
+   di-base /romsize + to di-limit
+;
+: unmap-prom ( -- )  di-base /romsize " map-out" $call-parent  0 to di-base  ;
+
+: set-pointers ( base size -- )  to di-size  to di-ptr  ;
+
+external
+
+: open ( -- flag )
+   map-prom
+   my-args ?dup if				( name$ )
+      di-base find-drop-in? if			( header )
+         dup >di-image  swap >di-size rl@	( base len )
+         set-pointers true			( true )
+      else
+         unmap-prom false			( false )
+      then
+   else						( adr )
+      drop di-base /romsize set-pointers true	( true )
+   then
+;
+
+: read ( adr len -- len' )
+   di-size min tuck  di-ptr -rot  move		( len' )
+;
+
+: size ( -- n )  di-size  ;
+
+: close ( -- )  unmap-prom  ;
+
+end0

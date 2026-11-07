@@ -1,0 +1,11 @@
+\ Copyright (C) 2026 Andy Taylor. Distributed under the same terms as the
+\ OpenBoot release it is part of (see LICENSE).
+id: @(#)simba.tok 1.0 26/11/07
+purpose: Load file for the Advanced PCI Bridge (APB, "Simba")
+copyright: Copyright 2026 Andy Taylor
+
+FCode-version2
+
+fload ${BP}/dev/pci-bridge/simba/simba.fth
+
+end0

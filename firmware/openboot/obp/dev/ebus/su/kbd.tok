@@ -1,0 +1,139 @@
+\ Copyright (C) 2026 Andy Taylor. Distributed under the same terms as the
+\ OpenBoot release it is part of (see LICENSE).
+id: @(#)kbd.tok 1.0 26/11/07
+purpose: The keyboard's port (su@14,3083f8) and the Sun Type 5 keyboard
+copyright: Copyright 2026 Andy Taylor
+
+\ The node as the other SuperIO UART's (su.tok), with the keyboard's
+\ driver: the release's USB keyboard driver (dev/usb-devices/kbd/usbkbd.tok)
+\ with the Type 5's serial protocol (kbd.fth) for USB's.
+
+Fcode-Version3
+
+headerless
+h# 8            constant tty-size
+h# 1            constant #channels
+my-address      constant tty-base
+
+" su"		name
+" serial"	device-type
+
+: en+ ( xdr,len int -- xdr',len' ) encode-int encode+ ;
+
+my-space encode-int  tty-base en+  tty-size en+  " reg" property
+1 encode-int " interrupts" property
+0 0 " port-a-ignore-cd" property
+
+: default-tty-mode     " 1200,8,n,1,-" ;
+defer default-ttya-mode
+defer default-ttyb-mode
+: init-tty ( -- )
+   ['] default-tty-mode to default-ttya-mode
+   ['] default-tty-mode to default-ttyb-mode
+;
+init-tty
+
+fload ${BP}/dev/serial/mode-data.fth
+fload ${BP}/dev/ebus/su/io.fth
+fload ${BP}/dev/serial/mode-decode.fth
+fload ${BP}/dev/serial/ttydriver.fth		\ (open): the UART mapped and set up
+
+headerless
+
+0 instance value kbd-package
+
+: .call-kbd ( str,len -- XXX? ) kbd-package $call-method ;
+: kbd-convert ( key# alt shft -- entry )  " convert" .call-kbd  ;
+
+: $= ( adr,len adr,len -- flag )
+   rot tuck = if  comp 0=  else  3drop false  then
+;
+
+: silent-type-cr  diagnostic-mode? if type cr else  2drop  then  ;
+
+fload ${BP}/dev/serial/keyboard/buffer.fth
+fload ${BP}/dev/serial/keyboard/options.fth
+fload ${BP}/dev/serial/keyboard/mutex.fth
+fload ${BP}/pkg/keyboard/keycodes.fth
+
+fload ${BP}/dev/usb-devices/kbd/usbdefs.fth
+fload ${BP}/dev/usb-devices/kbd/usbkeyin.fth
+fload ${BP}/dev/ebus/su/kbd.fth
+fload ${BP}/dev/usb-devices/kbd/kbdutils.fth
+
+instance variable kbd-alarm-running?
+
+: poll-input ( -- )
+   mutex-enter if exit then
+   poll-usb if
+     false to forced-keyboard-mode?
+     clear-keyboard
+     mutex-exit
+     user-abort
+   else
+     mutex-exit
+   then
+;
+
+: set-alarm ( interval -- )
+  kbd-alarm-running? over if on else off then
+  ['] poll-input swap alarm
+;
+
+\ The UART set up, the keyboard reset (present if it answers, or if the
+\ "forcemode" argument says to take it as there), its layout asked for.
+: serial-keyboard-open ( -- okay? )
+   false to forced-keyboard-mode?
+   kbd-alarm-running? off
+   mutex-enter drop mutex-exit
+   my-args dup if
+      2dup " forcemode" $= if
+         " Force Keyboard Mode: Using input device keyboard anyway."
+         silent-type-cr
+         true to forced-keyboard-mode?
+      then
+   then 2drop
+   " " (open) 0= if  false exit  then		\ 1200,8,n,1
+   alloc-vaddr-buffs
+   set-oftused-buf-offsets
+   clear-keyboard
+   h# 21 to layout
+   kbd-reset? if  kbd-get-layout true  else  forced-keyboard-mode?  then
+   dup 0= if  dealloc-vaddr-buffs  then
+;
+
+: init-kbd-package  ( -- okay? )
+   my-args  " kbd-translator" $open-package to kbd-package
+   kbd-package 0<>
+;
+
+external
+
+: read  ( adr len -- #read )  read-bytes ;
+: write  ( adr len -- #written )  nip ;
+
+: open  ( -- ok? )
+   serial-keyboard-open if  init-kbd-package  else  false  then
+;
+
+: close  ( -- )
+   kbd-package ?dup if  close-package  then
+   dealloc-vaddr-buffs
+;
+
+: reset  ( -- )  ;
+: selftest  ( -- error )  false  ;
+
+: remove-abort  ( -- ) kbd-alarm-running? @ if 0 set-alarm then ;
+: install-abort  ( -- ) remove-abort d# 10 set-alarm ;
+
+: ring-bell  ( -- )  ring-keyboard-bell ;
+
+: kbd-dropin&id ( -- magic$ dropin$ layoutid )
+   " UKBD" " usbkbds" get-kbd-cntry-id
+;
+
+: init-convert ( -- )  ['] kbd-convert to convert  ;
+init-convert
+
+end0

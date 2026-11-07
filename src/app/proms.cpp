@@ -9,6 +9,7 @@
 #include <iterator>
 
 #include "creator3d_fcode.h"
+#include "openboot_prom.h"
 
 namespace uv::app {
 
@@ -43,10 +44,22 @@ PromImage identify_prom(const std::string& path) {
     if (std::filesystem::file_size(path, ec) != kFlashSize || ec) return p;
     std::vector<u8> data;
     if (!read_file(path, data)) return p;
-    // "@(#) Sun Ultra 5/10 UPA/PCI 3.31 Version 0 created 2001/07/25 20:36"
-    static const std::string kTag = "@(#) Sun Ultra 5/10 UPA/PCI ";
+    // "@(#) Sun Ultra 5/10 UPA/PCI 3.31 Version 0 created 2001/07/25 20:36",
+    // or UltraViolet's OpenBoot's "@(#)OBP 4.23.0 2026/11/07 20:34 Sun Ultra
+    // 5/10 UPA/PCI ..."
+    static const std::string kTag = "@(#) Sun Ultra 5/10 UPA/PCI ", kOurs = "@(#)OBP ", kOursMachine = "Ultra 5/10";
     auto it = std::search(data.begin(), data.end(), kTag.begin(), kTag.end());
-    if (it == data.end()) return p;
+    if (it == data.end()) {
+        it = std::search(data.begin(), data.end(), kOurs.begin(), kOurs.end());
+        if (it == data.end()) return p;
+        std::string text;
+        for (auto q = it + static_cast<std::ptrdiff_t>(kOurs.size()); q != data.end() && *q >= 0x20 && *q < 0x7F; ++q)
+            text.push_back(static_cast<char>(*q));
+        if (text.find(kOursMachine) == std::string::npos) return p;
+        p.version = text.substr(0, text.find(' '));
+        if (text.size() > p.version.size() + 1) p.date = text.substr(p.version.size() + 1, 10);
+        return p;
+    }
     std::string text;
     for (auto q = it + static_cast<std::ptrdiff_t>(kTag.size()); q != data.end() && *q >= 0x20 && *q < 0x7F; ++q)
         text.push_back(static_cast<char>(*q));
@@ -100,6 +113,29 @@ bool read_prom(const PromImage& p, std::vector<u8>& data, std::string& error) {
         return false;
     }
     return true;
+}
+
+std::vector<u8> builtin_prom() {
+    // The image as built, then the rest of the flash erased (0xFF).
+    std::vector<u8> d(std::begin(kOpenbootProm), std::end(kOpenbootProm));
+    d.resize(kFlashSize, 0xFF);
+    return d;
+}
+
+PromImage builtin_prom_image() {
+    PromImage p;
+    p.version = kOpenbootVersion;
+    p.date = kOpenbootDate;
+    return p;  // (no path: built in)
+}
+
+bool select_flash(const Settings& s, PromImage& image, std::vector<u8>& data, std::string& error) {
+    if (s.prom != "supplied") {
+        image = builtin_prom_image();
+        data = builtin_prom();
+        return true;
+    }
+    return select_prom(s, image, error) && read_prom(image, data, error);
 }
 
 namespace {

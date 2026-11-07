@@ -1,0 +1,22 @@
+\ Copyright (C) 2026 Andy Taylor. Distributed under the same terms as the
+\ OpenBoot release it is part of (see LICENSE).
+id: @(#)sabre.tok 1.0 26/11/07
+purpose: The UltraSPARC IIi's PCI bus module (Sabre): /pci@1f,0
+copyright: Copyright 2026 Andy Taylor
+
+\ The host bridge of the Ultra 5 and 10: the IIi's own PCI bus module, with
+\ its IOMMU, and the Advanced PCI Bridge (APB, "Simba") at device 1 of its
+\ bus, whose two secondary buses carry everything else. Built on the
+\ release's PCI bus package (obp/dev/pci), as its sun4v host bridge
+\ (obp/dev/sun4v-devices/vpci) is.
+
+fcode-version3
+
+headerless
+
+fload ${BP}/dev/sabre/regs.fth
+fload ${BP}/dev/sabre/iommu.fth
+fload ${BP}/dev/pci/pcibus.fth
+fload ${BP}/dev/sabre/methods.fth
+
+end0

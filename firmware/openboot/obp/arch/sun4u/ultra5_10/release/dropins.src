@@ -1,0 +1,145 @@
+# Copyright (C) 2026 Andy Taylor. Distributed under the same terms as the
+# OpenBoot release it is part of (see LICENSE).
+#
+# The Ultra 5/10's drop-ins: the Forth image, the drivers of its devices
+# (found by name in /packages/SUNW,builtin-drivers) and the support
+# packages. The format is the release's (see its platforms' dropins.src).
+version2
+
+# The code that runs FCode drop-ins
+source{
+" /packages/SUNW,builtin-drivers" find-device
+
+   headerless
+   : load-driver ( str$ -- )
+      find-drop-in  if		( adr,len )
+         >r dup >r  1 byte-load	(  )
+	 r> r> free-drop-in	(  )
+      then			(  )
+   ;
+   headers
+
+   : interrupt-property ( n -- )  " interrupts" integer-property  ;
+
+   : get-fcode  ( adr1 len1 adr2 len2 -- true | false )
+      find-drop-in  if
+         2dup >r >r
+         rot min  rot swap  move
+         r> r> free-drop-in
+         true
+      else  2drop false
+      then
+   ;
+}source
+
+build		${MAKEDI}
+
+target		bootprom.bin	bootprom
+
+# The UltraSPARC IIi's PCI bus module: /pci@1f,0
+depend		${BP}/dev/sabre/depend.mk
+target		sabre.fc	SUNW,sabre
+source{
+   : root-devices ( -- )
+      0 0 " 1f,0" " /" begin-package
+         " SUNW,sabre" load-driver
+      end-package
+   ;
+}source
+
+# The Advanced PCI Bridge: /pci@1f,0/pci@1 and pci@1,1
+depend		${BP}/dev/pci-bridge/simba/depend.mk
+target		simba.fc	SUNW,simba
+source{
+   : pci108e,5000 ( -- )  " SUNW,simba" load-driver  ;
+}source
+
+# The RIO's EBus: /pci@1f,0/pci@1,1/ebus@1, and its devices
+depend		${BP}/dev/ebus/rio/depend.mk
+target		ebus.fc		SUNW,ebus
+source{
+   : pci108e,1000 ( -- )  " SUNW,ebus" load-driver  ;
+}source
+
+depend		${BP}/dev/ebus/se/depend.mk
+target		se.fc		ebus-se
+source{
+   : ebus-se ( -- )  " ebus-se" load-driver  ;
+}source
+
+depend		${BP}/dev/ebus/su/depend.mk
+target		su.fc		ebus-su
+target		kbd.fc		ebus-su-kbd
+source{
+   : ebus-su ( -- )  " ebus-su" load-driver  ;
+   : ebus-su-kbd ( -- )  " ebus-su-kbd" load-driver  ;
+}source
+
+# The RIO's Ethernet (Happy Meal)
+depend		${BP}/dev/network/hme/depend.mk
+target		hme.fc		SUNW,hme
+source{
+   : pci108e,1001 ( -- )  " SUNW,hme" load-driver  ;
+}source
+
+# The on-board ATI Rage Pro (or Rage II)
+depend		${BP}/dev/m64/m64.mk
+external	m64.di
+source{
+   : pci1002,4750 ( -- )  " ati-m64" load-driver  ;
+   alias pci1002,4754 pci1002,4750
+}source
+
+depend		${BP}/dev/ebus/flashprom/depend.mk
+target		flashprom.fc	ebus-flashprom
+source{
+   : ebus-flashprom ( -- )  " ebus-flashprom" load-driver  ;
+}source
+
+# Other PCI-PCI bridges (on cards in the slots)
+depend		${BP}/dev/pci-bridge/dec21152/depend.mk
+target		dec21152.fc	class060400
+source{
+   : class060400 ( -- )  " class060400" load-driver  ;
+}source
+
+# The IDE controller (CMD646)
+depend		${BP}/dev/ide/pci/depend.mk
+target		ide.fc		class010100
+source{
+   : class010100 ( -- )  " class010100" load-driver ;
+
+   \ The Ultra 5/10's CMD646 (subsystem 1095,646) comes out of reset with
+   \ both channels at the legacy ports; its BARs decode once each channel
+   \ is switched to native mode (programming interface bits 0 and 2).
+   : pci1095,646.1095.646 ( -- )
+      h# 8f  my-space 9 +  " config-b!" $call-parent
+      class010100
+   ;
+   alias class01018a class010100
+   alias class01018f class010100
+   alias class0101ff class010100
+}source
+
+# Fonts
+depend		${BP}/pkg/termemu/fonts.mk
+external	font.di
+
+# Sun logo
+depend		${BP}/pkg/sunlogo/logo.mk
+external	sun-logo.di
+
+# Keyboard translator package, and the keyboard tables (by USB usage)
+depend		${BP}/pkg/keyboard/translator/kbdtrans.mk
+external	kbdtrans.di
+depend          ${BP}/pkg/keyboard/tables/usb/keyboard.mk
+external        usbkbds.di
+
+# Network boot support package
+depend		${BP}/pkg/netinet/obptftp.mk
+external	obptftp.di
+
+# finish the drop-ins
+source{
+device-end
+}source

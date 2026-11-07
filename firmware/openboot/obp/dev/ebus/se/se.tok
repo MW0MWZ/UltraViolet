@@ -1,0 +1,68 @@
+\ Copyright (C) 2026 Andy Taylor. Distributed under the same terms as the
+\ OpenBoot release it is part of (see LICENSE).
+id: @(#)se.tok 1.0 26/11/07
+purpose: The SAB82532 (ESCC2): ttya and ttyb, /pci@1f,0/pci@1,1/ebus@1/se
+copyright: Copyright 2026 Andy Taylor
+
+\ Built as the release's serial driver (dev/southbridge/isa-devices/serial)
+\ is, on its tty driver (dev/serial), with the ESCC2's own I/O (io.fth).
+\ The node's arguments choose the channel: "a" (ttya) or "b" (ttyb).
+
+Fcode-Version3
+
+headerless
+h# 80		constant tty-size
+2		constant #channels
+my-address	constant tty-base
+
+" se"		name
+" serial"	device-type
+
+: en+ ( xdr,len int -- xdr',len' ) encode-int encode+ ;
+
+my-space encode-int  tty-base en+  tty-size en+  " reg" property
+1 encode-int " interrupts" property
+
+fload ${BP}/dev/utilities/get-option.fth
+
+: default-tty-mode     " 9600,8,n,1,-" ;
+: (default-ttya-mode)  " ttya-mode" default-tty-mode  get-string-option ;
+: (default-ttyb-mode)  " ttyb-mode" default-tty-mode  get-string-option ;
+defer default-ttya-mode
+defer default-ttyb-mode
+: init-tty ( -- )
+   ['] (default-ttya-mode) to default-ttya-mode
+   ['] (default-ttyb-mode) to default-ttyb-mode
+;
+init-tty
+
+: $=  ( adr1 len1 adr2 len2 -- equal? )
+   rot tuck  <>  if  3drop false exit  then   ( adr1 adr2 len1 )
+   comp 0=
+;
+
+\ The options that are properties of the ports (as Solaris's se driver
+\ reads them). /options's "properties" are its variables, run to get them:
+\ a flag's is the flag itself.
+: option-set? ( flag-option$ -- flag )
+   " /options" find-package 0= if  2drop false exit  then
+   get-package-property if  false  then
+;
+
+: option-flag ( option$ prop$ -- )
+   2swap option-set? if  0 0 2swap property  else  2drop  then
+;
+" ttya-ignore-cd"   " port-a-ignore-cd"   option-flag
+" ttyb-ignore-cd"   " port-b-ignore-cd"   option-flag
+" ttya-rts-dtr-off" " port-a-rts-dtr-off" option-flag
+" ttyb-rts-dtr-off" " port-b-rts-dtr-off" option-flag
+
+fload ${BP}/dev/serial/mode-data.fth
+fload ${BP}/dev/ebus/se/io.fth
+fload ${BP}/dev/serial/mode-decode.fth
+d# 115200 is max-baud
+fload ${BP}/dev/serial/ttydriver.fth
+
+: write ( adr len -- #written ) uwrite ;
+
+end0

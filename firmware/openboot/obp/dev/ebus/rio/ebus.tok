@@ -1,0 +1,18 @@
+\ Copyright (C) 2026 Andy Taylor. Distributed under the same terms as the
+\ OpenBoot release it is part of (see LICENSE).
+id: @(#)ebus.tok 1.0 26/11/07
+purpose: The RIO's EBus (PCI 108e,1000): /pci@1f,0/pci@1,1/ebus@1
+copyright: Copyright 2026 Andy Taylor
+
+fcode-version3
+
+headerless
+
+fload ${BP}/dev/utilities/misc.fth
+fload ${BP}/dev/utilities/get-option.fth
+fload ${BP}/dev/ebus/rio/ebus.fth
+fload ${BP}/dev/ebus/rio/children.fth
+
+make-children
+
+end0
