@@ -17,6 +17,10 @@
 namespace uv::app {
 
 struct Settings {
+    // The flash PROM: "builtin" (UltraViolet's OpenBoot, built from Sun's
+    // OpenBoot 4.23.0 release) or "supplied" (the newest Ultra 5/10 image in
+    // the PROM folder, such as Sun's OpenBoot 3.31).
+    std::string prom = "builtin";
     std::string prom_dir;  // folder of flash PROM images; empty: see prom_folder()
     std::string nvram, disk;
     std::vector<std::string> cdroms;  // a set of discs: the first in the drive at power-on

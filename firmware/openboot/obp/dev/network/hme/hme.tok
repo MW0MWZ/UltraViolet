@@ -1,0 +1,38 @@
+\ Copyright (C) 2026 Andy Taylor. Distributed under the same terms as the
+\ OpenBoot release it is part of (see LICENSE).
+id: @(#)hme.tok 1.0 26/11/07
+purpose: The RIO's Ethernet ("Happy Meal", pci108e,1001): network@1,1
+copyright: Copyright 2026 Andy Taylor
+
+\ Built as the release's Ethernet driver (dev/network/ophir) is, on its
+\ common network code (dev/network/common), for the Happy Meal.
+
+Fcode-version3
+
+" network"	encode-string " name"			property
+" network"	encode-string " device_type"		property
+" SUNW,hme"	encode-string " compatible"		property
+d# 48		encode-int    " address-bits"		property
+h# 4000		encode-int    " max-frame-size"		property
+1		encode-int    " interrupts"		property
+
+headerless
+
+: encode-reg ( addr space size -- adr len )
+   >r encode-phys 0 encode-int encode+ r> encode-int encode+
+;
+my-address my-space 0 encode-reg
+my-address my-space h# 0200.0010 or h# 7020 encode-reg encode+
+" reg" property
+
+fload ${BP}/dev/pci/config-access.fth
+h# c0 8 my-b@ or encode-int " hm-rev" property
+
+fload ${BP}/dev/network/common/link-params.fth
+fload ${BP}/dev/network/hme/regs.fth
+fload ${BP}/dev/network/common/mif/mii-h.fth
+fload ${BP}/dev/network/common/devargs.fth
+fload ${BP}/dev/network/hme/core.fth
+fload ${BP}/dev/network/hme/pkg.fth
+
+end0

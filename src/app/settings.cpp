@@ -161,7 +161,8 @@ bool parse_number(const std::string& v, double& out) {
 bool set_option(Settings& s, const std::string& key, const std::string& v, std::string& error) {
     double n = 0;
     bool ok = true;
-    if (key == "prom_dir") s.prom_dir = v;
+    if (key == "prom") ok = (v == "builtin" || v == "supplied") && (s.prom = v, true);
+    else if (key == "prom_dir") s.prom_dir = v;
     else if (key == "nvram") s.nvram = v;
     else if (key == "disk") s.disk = v;
     else if (key == "cdrom") s.cdroms.push_back(v);
@@ -271,7 +272,7 @@ bool save_settings(const std::string& path, const Settings& s, std::string& erro
     {
         std::ofstream f(tmp, std::ios::trunc);
         f << "# UltraViolet settings\n";
-        f << "prom_dir=" << s.prom_dir << "\nnvram=" << s.nvram << "\ndisk=" << s.disk << "\n";
+        f << "prom=" << s.prom << "\nprom_dir=" << s.prom_dir << "\nnvram=" << s.nvram << "\ndisk=" << s.disk << "\n";
         for (const auto& c : s.cdroms) f << "cdrom=" << c << "\n";
         f << "ram_mb=" << s.ram_mb << "\ncpu_mhz=" << s.cpu_mhz << "\necache_kb=" << s.ecache_kb
           << "\nupa=" << s.upa << "\ncreator3d_fcode=" << s.creator3d_fcode << "\nresolution=" << s.resolution << "\nconsole=" << s.console << "\nkeyboard=" << s.keyboard << "\nmac=" << (s.mac ? mac_text(*s.mac) : "")

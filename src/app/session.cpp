@@ -98,11 +98,12 @@ bool Session::power_on(std::string& error) {
     const Settings& s = settings_;
     if (!check_hardware(s, error)) return false;
     PromImage prom;
-    if (!select_prom(s, prom, error)) return false;
-    apply_log_level(s.log);
-
     Ultra5_10::Options o = s.options();
-    if (!read_prom(prom, o.prom, error)) return false;
+    if (!select_flash(s, prom, o.prom, error)) return false;
+    apply_log_level(s.log);
+    // OpenBoot 3.x's NVRAM layout (which the machine's screen setting writes);
+    // UltraViolet's OpenBoot keeps its own.
+    o.nvram_obp3 = !prom.version.empty() && prom.version[0] == '3';
     std::string fcode_path;
     if (s.upa == "creator3d" && !select_creator3d_fcode(s, o.creator3d_fcode, fcode_path, error)) return false;
     if (s.net == "user") {
@@ -127,7 +128,8 @@ bool Session::power_on(std::string& error) {
         error = e.what();
         return false;
     }
-    UV_LOG(Info, "session", "flash PROM: %s (OpenBoot %s)", prom.path.c_str(), prom.version.c_str());
+    UV_LOG(Info, "session", "flash PROM: %s (OpenBoot %s)",
+           prom.path.empty() ? "UltraViolet's, built in" : prom.path.c_str(), prom.version.c_str());
     if (s.upa == "creator3d")
         UV_LOG(Info, "session", "Creator3D FCode PROM: %s", fcode_path.empty() ? "UltraViolet's, built in" : fcode_path.c_str());
     machine_->cpu().set_block_cache(s.block_cache);

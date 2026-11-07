@@ -131,6 +131,28 @@ string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," UV_FFB_BYTES "${UV_FFB_HEX}")
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/generated/creator3d_fcode.h
   "// Generated from firmware/creator3d/ffb.fc.\n#pragma once\n"
   "constexpr unsigned char kCreator3dFcode[] = {${UV_FFB_BYTES}};\n")
+# UltraViolet's OpenBoot (firmware/openboot/ultra5_10.prom, made by its
+# build.sh: the flash PROM's contents before the erased rest) as a C array:
+# the flash PROM unless another is chosen. It must be a build of the release
+# beside it (obp/firmware.rel).
+set(UV_OBP_PROM ${CMAKE_CURRENT_SOURCE_DIR}/firmware/openboot/ultra5_10.prom)
+set(UV_OBP_REL ${CMAKE_CURRENT_SOURCE_DIR}/firmware/openboot/obp/firmware.rel)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${UV_OBP_PROM} ${UV_OBP_REL})
+file(STRINGS ${UV_OBP_REL} UV_OBP_RELEASE LIMIT_COUNT 1)
+file(STRINGS ${UV_OBP_PROM} UV_OBP_ID REGEX "@\\(#\\)OBP [0-9.]+ [0-9/]+" LIMIT_COUNT 1)
+string(REGEX MATCH "OBP ([0-9.]+) ([0-9/]+)" UV_OBP_ID "${UV_OBP_ID}")
+if(NOT CMAKE_MATCH_1 STREQUAL UV_OBP_RELEASE)
+  message(FATAL_ERROR "firmware/openboot/ultra5_10.prom (${CMAKE_MATCH_1}) is not a build of OpenBoot "
+                      "${UV_OBP_RELEASE}: run firmware/openboot/build.sh tools kernel ultra5_10")
+endif()
+set(UV_OBP_DATE ${CMAKE_MATCH_2})
+file(READ ${UV_OBP_PROM} UV_OBP_HEX HEX)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," UV_OBP_BYTES "${UV_OBP_HEX}")
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/generated/openboot_prom.h
+  "// Generated from firmware/openboot/ultra5_10.prom.\n#pragma once\n"
+  "constexpr char kOpenbootVersion[] = \"${UV_OBP_RELEASE}\";\n"
+  "constexpr char kOpenbootDate[] = \"${UV_OBP_DATE}\";\n"
+  "constexpr unsigned char kOpenbootProm[] = {${UV_OBP_BYTES}};\n")
 target_include_directories(uv_app PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 if(WIN32)
   target_link_libraries(uv_app PRIVATE shell32 ole32)  # the Documents folder

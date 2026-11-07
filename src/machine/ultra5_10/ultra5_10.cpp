@@ -248,7 +248,7 @@ Ultra5_10::Ultra5_10(const Options& options)
             t = find_timing(list, "1152x900");
         }
         (ffb_ ? ffb_->monitor() : mach64_.monitor()).set_edid(monitor_edid(list, *t));
-        set_screen_mode(std::to_string(t->width) + "x" + std::to_string(t->height) + "x" + std::to_string(t->rate));
+        if (opt_.nvram_obp3) set_screen_mode(std::to_string(t->width) + "x" + std::to_string(t->height) + "x" + std::to_string(t->rate));
     }
 
     bus_.set_rom_write_handler([this](u64 pa, unsigned size, u64 value) {

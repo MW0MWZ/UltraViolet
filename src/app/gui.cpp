@@ -253,22 +253,32 @@ private:
     struct PromChoice {
         std::string key, text;
         bool ok = false;
+        std::string builtin_text;  // UltraViolet's OpenBoot
+        std::string folder_text;   // the PROM folder's newest image, or why there is none
+        bool folder_ok = false;
         std::string fcode_text;  // whose, and its file; empty: none
     } prom_choice_;
     const PromChoice& prom_choice(const Settings& s);
 };
 
 const Gui::PromChoice& Gui::prom_choice(const Settings& s) {
-    const std::string key = prom_folder(s);
+    const std::string key = s.prom + '\n' + prom_folder(s);
     if (key == prom_choice_.key) return prom_choice_;
     prom_choice_.key = key;
+    const PromImage b = builtin_prom_image();
+    prom_choice_.builtin_text = "UltraViolet's OpenBoot " + b.version + " (built in, " + b.date + ")";
     PromImage p;
     std::string error;
-    prom_choice_.ok = select_prom(s, p, error);
-    if (prom_choice_.ok)
-        prom_choice_.text = "Flash PROM: " + file_name(p.path) + " (OpenBoot " + p.version + ", " + p.date + ")";
-    else
-        prom_choice_.text = error;
+    prom_choice_.folder_ok = select_prom(s, p, error);
+    prom_choice_.folder_text =
+        prom_choice_.folder_ok ? file_name(p.path) + " (OpenBoot " + p.version + ", " + p.date + ")" : error;
+    if (s.prom == "supplied") {
+        prom_choice_.ok = prom_choice_.folder_ok;
+        prom_choice_.text = prom_choice_.ok ? "Flash PROM: " + prom_choice_.folder_text : error;
+    } else {
+        prom_choice_.ok = true;
+        prom_choice_.text = "Flash PROM: " + prom_choice_.builtin_text;
+    }
     std::vector<u8> fcode;
     std::string fcode_path;
     prom_choice_.fcode_text.clear();
@@ -1434,6 +1444,22 @@ void Gui::draw_settings() {
                         edit_.cpu_mhz = m.mhz, edit_.ecache_kb = m.ecache_kb;
                 ImGui::EndCombo();
             }
+            {
+                // The flash PROM: UltraViolet's OpenBoot, or the PROM folder's image.
+                const PromChoice& pc = prom_choice(edit_);
+                label("Flash PROM");
+                ImGui::SetNextItemWidth(-1);
+                std::string items = pc.builtin_text;
+                items += '\0';
+                items += pc.folder_ok ? "From the PROM folder: " + pc.folder_text : "From the PROM folder (none there)";
+                items += '\0';
+                int f = edit_.prom == "supplied" ? 1 : 0;
+                if (ImGui::Combo("##prom", &f, items.c_str())) edit_.prom = f == 1 ? "supplied" : "builtin";
+                ImGui::SetItemTooltip("The firmware the machine starts: UltraViolet's OpenBoot (open source, built\n"
+                                      "from Sun's OpenBoot 4.23.0 release), or the newest Ultra 5/10 image in the\n"
+                                      "PROM folder (such as Sun's OpenBoot 3.31). Each keeps its settings in NVRAM\n"
+                                      "its own way: changing firmware starts them afresh.");
+            }
             label("Memory");
             ImGui::SetNextItemWidth(160 * scale_);
             const std::string ram = std::to_string(edit_.ram_mb) + " MiB";
@@ -1526,11 +1552,13 @@ void Gui::draw_settings() {
             const std::string default_folder = prom_folder(Settings{});
             path_row("PROM folder", "promdir", edit_.prom_dir, Pick::PromDir, std::nullopt, default_folder.c_str());
             {
+                // The folder's image (used when Machine > Flash PROM says so).
                 const PromChoice& pc = prom_choice(edit_);
                 ImGui::SetCursorPosX(label_w);
                 ImGui::PushTextWrapPos(0.0f);
-                if (pc.ok) ImGui::TextUnformatted(pc.text.c_str());
-                else ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s", pc.text.c_str());
+                if (pc.folder_ok) ImGui::TextUnformatted(pc.folder_text.c_str());
+                else if (edit_.prom != "supplied") ImGui::TextDisabled("%s", pc.folder_text.c_str());
+                else ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s", pc.folder_text.c_str());
                 ImGui::PopTextWrapPos();
             }
             path_row("NVRAM", "nvram", edit_.nvram, Pick::Nvram, Pick::NewNvram);

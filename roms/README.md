@@ -1,8 +1,9 @@
 # Firmware images
 
-UltraViolet runs the machine's own firmware: the OpenBoot flash PROM of an
-Ultra 5/10, and for a Creator3D, if you choose it, the card's own FCode
-PROM (UltraViolet's own FCode for the card is built in). These are Sun's
+UltraViolet can run the machine's own firmware: the OpenBoot flash PROM of
+an Ultra 5/10, and for a Creator3D the card's own FCode PROM, when you
+choose them (UltraViolet's own OpenBoot and its own FCode for the card are
+built in, and used by default). These are Sun's
 copyrighted software (now Oracle's) and are not included here. This page
 says which images UltraViolet expects, where they come from, and how to
 make them from the original Sun files with the `sunrom` tool in
