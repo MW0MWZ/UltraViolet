@@ -245,9 +245,11 @@ private:
 
     // The PROM the settings being edited would start with (or why there is
     // none), worked out again only when the folder changes.
+    // Also the Creator3D FCode image there, if any (to offer it).
     struct PromChoice {
         std::string key, text;
         bool ok = false;
+        std::string fcode_text;  // whose, and its file; empty: none
     } prom_choice_;
     const PromChoice& prom_choice(const Settings& s);
 };
@@ -263,6 +265,11 @@ const Gui::PromChoice& Gui::prom_choice(const Settings& s) {
         prom_choice_.text = "Flash PROM: " + file_name(p.path) + " (OpenBoot " + p.version + ", " + p.date + ")";
     else
         prom_choice_.text = error;
+    std::vector<u8> fcode;
+    std::string fcode_path;
+    prom_choice_.fcode_text.clear();
+    if (find_creator3d_fcode(s, fcode, fcode_path))
+        prom_choice_.fcode_text = creator3d_fcode_name(fcode) + " (" + file_name(fcode_path) + ")";
     return prom_choice_;
 }
 
@@ -1414,9 +1421,47 @@ void Gui::draw_settings() {
             int upa = edit_.upa == "creator3d" ? 1 : 0;
             if (ImGui::Combo("##upa", &upa, "Empty\0Creator3D (FFB2+, double-buffered)\0"))
                 edit_.upa = upa == 1 ? "creator3d" : "none";
-            ImGui::SetItemTooltip("The Ultra 10's UPA graphics slot. A Creator3D needs its FCode PROM image\n"
-                                  "(ffb2p.fth, read from a real card) in the PROM folder; it is then the\n"
-                                  "screen, and the on-board Rage Pro has no monitor.");
+            ImGui::SetItemTooltip("The Ultra 10's UPA graphics slot. A Creator3D is then the screen, and the\n"
+                                  "on-board Rage Pro has no monitor.");
+            if (edit_.upa == "creator3d") {
+                // Which FCode, when the PROM folder holds one of the card's.
+                const PromChoice& pc = prom_choice(edit_);
+                if (!pc.fcode_text.empty() || edit_.creator3d_fcode == "supplied") {
+                    label("FCode");
+                    ImGui::SetNextItemWidth(-1);
+                    std::string items = creator3d_fcode_name(builtin_creator3d_fcode()) + " (built in)";
+                    items += '\0';
+                    items += pc.fcode_text.empty() ? "From the PROM folder (none there)" : pc.fcode_text;
+                    items += '\0';
+                    int f = edit_.creator3d_fcode == "supplied" ? 1 : 0;
+                    if (ImGui::Combo("##fcode", &f, items.c_str())) edit_.creator3d_fcode = f == 1 ? "supplied" : "builtin";
+                    ImGui::SetItemTooltip("The Creator3D's FCode PROM: UltraViolet's own, built in, or the image in\n"
+                                          "the PROM folder (such as one read from a real card's PROM).");
+                }
+            }
+            {
+                // The screen's size, from the list of the card that is the screen.
+                const bool ffb = edit_.upa == "creator3d";
+                const std::vector<MonitorTiming>& list = ffb ? Ffb::resolutions() : Mach64::resolutions();
+                label("Resolution");
+                ImGui::SetNextItemWidth(160 * scale_);
+                auto text = [](const MonitorTiming& t) {
+                    return std::to_string(t.width) + " x " + std::to_string(t.height) + ", " + std::to_string(t.rate) + " Hz";
+                };
+                const MonitorTiming* now = find_timing(list, edit_.resolution);
+                const std::string shown = now ? text(*now) : edit_.resolution + " (not this card's: 1152 x 900)";
+                if (ImGui::BeginCombo("##resolution", shown.c_str())) {
+                    for (const MonitorTiming& t : list)
+                        if (ImGui::Selectable(text(t).c_str(), &t == now))
+                            edit_.resolution = std::to_string(t.width) + "x" + std::to_string(t.height);
+                    ImGui::EndCombo();
+                }
+                ImGui::SetItemTooltip("The screen from power-on (the %s's): OpenBoot's console and the desktop.\n"
+                                      "It goes in NVRAM's output-device (as screen:r1280x1024x60) when that names\n"
+                                      "the screen, and the monitor prefers it. A mode set in Solaris (such as\n"
+                                      "with ffbconfig or m64config) is kept over it.",
+                                      ffb ? "Creator3D" : "on-board Rage Pro");
+            }
             label("Console");
             ImGui::SetNextItemWidth(-1);
             int con = edit_.console == "ttya" ? 1 : 0;

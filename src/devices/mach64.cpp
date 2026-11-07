@@ -4,6 +4,8 @@
 
 #include <algorithm>
 
+#include "core/text.h"
+
 namespace uv {
 
 namespace {
@@ -39,6 +41,10 @@ constexpr u32 kBusApertureRegsDis = 1u << 4, kBusExtRegEn = 1u << 27, kBusReadOn
 // GP_IO: what the pins the chip does not drive read; pin 7 reads low even
 // when driven high (OpenBoot pulses it 1-0-1 and a real Ultra 10 then reads 0).
 constexpr u32 kGpIoInputs = 0x3F5C, kGpIoHeldLow = 0x0080;
+// The monitor's DDC lines on GP_IO pins 13 (SCL) and 12 (SDA), open drain:
+// a pin set as an output with a 0 pulls its line low; otherwise the line
+// is high unless the monitor pulls it.
+constexpr u32 kGpIoScl = 1u << 13, kGpIoSda = 1u << 12;
 // CLOCK_CNTL.
 constexpr u32 kPllWrEn = 1u << 9;
 // DAC_CNTL.
@@ -99,6 +105,7 @@ Mach64::Mach64(Scheduler& scheduler, double cpu_hz)
 void Mach64::reset() {
     pci::Function::reset();
     crtc_timer_.cancel();
+    monitor_.drive(true, true);
     latched_at_ = sched_.now();
     regs_ = {};
     regs_[kCrtcGenCntl] = kGenDispReqDis;  // display requests off until a mode is set
@@ -140,7 +147,10 @@ u32 Mach64::reg_read(unsigned index, unsigned lanes) {
             // the Ultra 10's board leaves them (a real Ultra 10, nothing on the
             // DDC lines, 12 and 13).
             const u32 dir = regs_[index] >> 16;
-            return (regs_[index] & 0xFFFF0000) | (((regs_[index] & dir) | (~dir & kGpIoInputs)) & ~kGpIoHeldLow);
+            u32 in = kGpIoInputs;
+            if (!monitor_.scl()) in &= ~kGpIoScl;
+            if (!monitor_.sda()) in &= ~kGpIoSda;
+            return (regs_[index] & 0xFFFF0000) | (((regs_[index] & dir) | (~dir & in)) & ~kGpIoHeldLow);
         }
         case kClockCntl: return (regs_[index] & 0xFF00FFFF) | u32{pll_[(regs_[index] >> 10) & 0x3F]} << 16;
         case kDacRegs: {
@@ -198,6 +208,13 @@ void Mach64::reg_write(unsigned index, u32 value, unsigned lanes) {
         case kDacCntl:
             regs_[index] = (merged & ~kDacReadOnly) | (old & kDacReadOnly);
             break;
+        case kGpIo: {
+            regs_[index] = merged;
+            if (debug_gp_io_.size() < 65536) appendf(debug_gp_io_, " %x", merged);
+            const u32 low = (merged >> 16) & ~merged;  // driven low
+            monitor_.drive(!(low & kGpIoScl), !(low & kGpIoSda));
+            break;
+        }
         case kConfigChipId:
         case kFifoStat:
         case kGuiStat: break;  // read-only
@@ -318,6 +335,40 @@ double Mach64::pixel_clock() const {
     const unsigned post = kPost[((pll_[0x06] >> (2 * n)) & 3) | (((pll_[0x0B] >> (4 + n)) & 1) << 2)];
     if (!fb || !ref) return 0;
     return 2.0 * kXtalHz * fb / ref / post;
+}
+
+const std::vector<MonitorTiming>& Mach64::resolutions() {
+    // The modes as the monitor takes them (VESA's, and Sun's for its own
+    // sizes; the card's FCode sets each within a fraction of its clock):
+    // pixel clock; front porch, sync and back porch.
+    static const std::vector<MonitorTiming> kList = {
+        {640, 480, 60, 25175, 16, 96, 48, 10, 2, 33, false},
+        {800, 600, 75, 49500, 16, 80, 160, 1, 3, 21, true},
+        {1024, 768, 60, 65000, 24, 136, 160, 3, 6, 29, false},
+        {1024, 800, 84, 94500, 16, 128, 152, 2, 4, 31, false},
+        {1152, 900, 66, 94500, 40, 128, 208, 2, 4, 31, false},
+        {1280, 800, 76, 101250, 20, 114, 156, 3, 7, 36, false},
+        {1280, 1024, 60, 108000, 48, 112, 248, 1, 3, 38, true},
+        {1440, 900, 76, 135000, 40, 160, 240, 2, 3, 39, false},
+        {1600, 1000, 66, 135000, 40, 136, 192, 2, 5, 32, false},
+        {1600, 1200, 60, 162000, 64, 192, 304, 1, 3, 46, true},
+    };
+    return kList;
+}
+
+void Mach64::describe(std::string& out) const {
+    appendf(out, "mach64: crtc h_total_disp %08x h_sync %08x v_total_disp %08x v_sync %08x off_pitch %08x gen_cntl %08x\n",
+            regs_[0], regs_[1], regs_[2], regs_[3], regs_[kCrtcOffPitch], regs_[kCrtcGenCntl]);
+    appendf(out, "mach64: clock_cntl %08x dac_cntl %08x gen_test_cntl %08x mem_cntl %08x config_cntl %08x bus_cntl %08x\n",
+            regs_[kClockCntl], regs_[kDacCntl], regs_[kGenTestCntl], regs_[kMemCntl], regs_[kConfigCntl], regs_[kBusCntl]);
+    out += "mach64: pll";
+    for (unsigned i = 0; i < 0x20; ++i) appendf(out, " %02x", pll_[i]);
+    appendf(out, "\nmach64: pixel clock %.3f MHz, dac mask %02x\n", pixel_clock() / 1e6, dac_mask_);
+    out += "mach64: palette";
+    for (unsigned i = 0; i < 256; ++i)
+        appendf(out, "%s%02x%02x%02x", i % 16 ? " " : "\n  ", palette_[i][0], palette_[i][1], palette_[i][2]);
+    out += "\nmach64: gp_io writes" + debug_gp_io_ + "\n";
+    if (!monitor_.trace().empty()) out += "mach64: ddc" + monitor_.trace() + "\n";
 }
 
 Mach64::Timing Mach64::timing() const {

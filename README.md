@@ -45,10 +45,16 @@ installed from their own media.
   SAB82532 serial ports, the CMD646 IDE controller with ATA disks and an
   ATAPI CD-ROM drive, the on-board Happy Meal Ethernet, the on-board ATI
   Rage Pro graphics with its drawing engine, the CS4231 audio codec, the
-  front-panel power button, and a Sun Type 5 keyboard and mouse.
-- **Creator3D:** a Creator3D (FFB2+) in the Ultra 10's UPA slot, with the
-  card's PROM image (see [roms/README.md](roms/README.md)): OpenBoot takes it
-  as its screen, with the card's own banner logo; Solaris 8 and 9 run the
+  front-panel power button, and a Sun Type 5 keyboard and mouse. The
+  screen comes up at the resolution chosen in the settings (`--resolution`:
+  640 x 480 to 1600 x 1200 on the Rage Pro), on a monitor that answers DDC
+  with its EDID.
+- **Creator3D:** a Creator3D (FFB2+) in the Ultra 10's UPA slot, with
+  UltraViolet's own free FCode for it built in
+  ([firmware/creator3d](firmware/creator3d)), or the card's PROM image if you
+  have one (see [roms/README.md](roms/README.md)), at resolutions up to
+  1920 x 1200: OpenBoot takes it as its
+  screen, with the card's own banner logo; Solaris 8 and 9 run the
   CDE desktop on it and Solaris 10 its GNOME desktop, and NetBSD, OpenBSD
   and Linux their consoles. Its 2D drawing, window lookups, overlay and
   vertical retrace interrupt are modelled; its 3D operations are not yet.
@@ -278,7 +284,7 @@ it has set the one DHCP gave it. Other names go to the host's resolver.
 ## Firmware and media
 
 UltraViolet runs the Ultra 5/10's own OpenBoot PROM, and for a Creator3D
-the card's own FCode PROM, with Solaris (or another sparc64 operating
+its own built-in FCode (or the card's, if you supply it), with Solaris (or another sparc64 operating
 system) from its media. None of these is included: [roms/README.md](roms/README.md)
 says which images it expects, where they come from, and how to make them
 from the original Sun files with the `sunrom` tool. The `roms/`, `iso/` and
@@ -292,6 +298,13 @@ UltraViolet is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
 Foundation; either version 2 of the License, or (at your option) any later
 version. See [LICENSE](LICENSE).
+
+The Creator3D FCode in `firmware/creator3d` is under the MIT licence; see
+[its LICENSE](firmware/creator3d/LICENSE).
+
+The logos, UltraViolet's (in `graphics`) and the Creator3D FCode's (in
+`firmware/creator3d`), are &copy; Andy Taylor (MW0MWZ), all rights
+reserved: neither licence covers them.
 
 Sun, Ultra, Solaris and OpenBoot are trademarks of Oracle and/or its
 affiliates. SPARC and UltraSPARC are trademarks of SPARC International, Inc.

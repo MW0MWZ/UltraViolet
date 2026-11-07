@@ -1,7 +1,8 @@
 # Firmware images
 
 UltraViolet runs the machine's own firmware: the OpenBoot flash PROM of an
-Ultra 5/10, and for a Creator3D the card's own FCode PROM. These are Sun's
+Ultra 5/10, and for a Creator3D, if you choose it, the card's own FCode
+PROM (UltraViolet's own FCode for the card is built in). These are Sun's
 copyrighted software (now Oracle's) and are not included here. This page
 says which images UltraViolet expects, where they come from, and how to
 make them from the original Sun files with the `sunrom` tool in
@@ -48,6 +49,11 @@ UltraViolet is developed against **OpenBoot 3.31** (the `-latest`
 program).
 
 ## Creator3D FCode
+
+UltraViolet has its own free FCode for the Creator3D built in
+([firmware/creator3d](../firmware/creator3d)), and uses it unless the card's
+own is chosen: with an image of the card's PROM here, Machine > Settings
+offers it (or `--creator3d-fcode supplied`).
 
 A Creator3D's FCode is on the card itself, in its PROM, and in no Sun patch
 or install media. The card's FCode draws OpenBoot's console and gives the

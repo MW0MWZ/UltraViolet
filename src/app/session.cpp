@@ -127,7 +127,8 @@ bool Session::power_on(std::string& error) {
         return false;
     }
     UV_LOG(Info, "session", "flash PROM: %s (OpenBoot %s)", prom.path.c_str(), prom.version.c_str());
-    if (!fcode_path.empty()) UV_LOG(Info, "session", "Creator3D FCode PROM: %s", fcode_path.c_str());
+    if (s.upa == "creator3d")
+        UV_LOG(Info, "session", "Creator3D FCode PROM: %s", fcode_path.empty() ? "UltraViolet's, built in" : fcode_path.c_str());
     machine_->cpu().set_block_cache(s.block_cache);
     machine_->cpu().set_jit(s.jit);
     machine_->cpu().set_idle_skip(s.idle_skip);

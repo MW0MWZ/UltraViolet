@@ -21,10 +21,12 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <string>
 #include <vector>
 
 #include "core/scheduler.h"
 #include "devices/display.h"
+#include "devices/monitor.h"
 #include "devices/pci.h"
 
 namespace uv {
@@ -71,6 +73,17 @@ public:
     // Changes with anything that may change the picture (memory, registers,
     // the palette), so a display need not be remade while it stays put.
     u64 display_version() const override { return version_; }
+
+    // The monitor on the on-board connector: its DDC lines.
+    Monitor& monitor() { return monitor_; }
+    // The resolutions a screen is given at power-on: each size the card's
+    // FCode has, at 60 Hz or the next rate up it has, with the standard
+    // timing of that mode.
+    static const std::vector<MonitorTiming>& resolutions();
+
+    // A report of the mode, clock and DAC registers, and the general-purpose
+    // pins' writes (debugging).
+    void describe(std::string& out) const;
 
 protected:
     bool bar_read(unsigned bar, u32 offset, unsigned size, u64& value) override;
@@ -184,6 +197,8 @@ private:
     std::array<std::array<u8, 3>, 256> palette_{};
     u8 dac_windex_ = 0, dac_rindex_ = 0, dac_wphase_ = 0, dac_rphase_ = 0, dac_mask_ = 0xFF;
     std::array<u8, 3> dac_latch_{};
+    std::string debug_gp_io_;  // GP_IO's values written, for describe()
+    Monitor monitor_;
 };
 
 }  // namespace uv
