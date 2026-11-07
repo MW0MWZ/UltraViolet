@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Andy Taylor
 cmake_minimum_required(VERSION 3.21)
-project(UltraViolet VERSION 1.0.1 DESCRIPTION "Sun UltraSPARC (Ultra 5/10) emulator" LANGUAGES CXX)
+project(UltraViolet VERSION 1.1.0 DESCRIPTION "Sun UltraSPARC (Ultra 5/10) emulator" LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -65,6 +65,7 @@ add_library(uv_emu STATIC
   src/devices/hme.cpp
   src/devices/ffb.cpp
   src/devices/ffb_engine.cpp
+  src/devices/monitor.cpp
   src/devices/mach64.cpp
   src/devices/mach64_engine.cpp
   src/devices/ata.cpp
@@ -111,6 +112,26 @@ add_library(uv_app STATIC
 )
 target_include_directories(uv_app PUBLIC src)
 target_link_libraries(uv_app PUBLIC uv_emu PRIVATE uv_warnings)
+# The Creator3D's open source FCode PROM image (firmware/creator3d/ffb.fc, made by
+# its build.sh from ffb.fth) as a C array: the card's FCode unless another
+# is chosen. It must be the build of the ffb.fth beside it.
+set(UV_FFB_FC ${CMAKE_CURRENT_SOURCE_DIR}/firmware/creator3d/ffb.fc)
+set(UV_FFB_FTH ${CMAKE_CURRENT_SOURCE_DIR}/firmware/creator3d/ffb.fth)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${UV_FFB_FC} ${UV_FFB_FTH})
+file(STRINGS ${UV_FFB_FTH} UV_FFB_VERSION REGEX "\" UltraViolet ffb\\.fth [0-9.]+\"")
+string(REGEX MATCH "UltraViolet ffb\\.fth [0-9.]+" UV_FFB_VERSION "${UV_FFB_VERSION}")
+file(STRINGS ${UV_FFB_FC} UV_FFB_FC_VERSION REGEX "UltraViolet ffb\\.fth [0-9.]+")
+string(REGEX MATCH "UltraViolet ffb\\.fth [0-9.]+" UV_FFB_FC_VERSION "${UV_FFB_FC_VERSION}")
+if(NOT UV_FFB_VERSION OR NOT UV_FFB_VERSION STREQUAL UV_FFB_FC_VERSION)
+  message(FATAL_ERROR "firmware/creator3d/ffb.fc (${UV_FFB_FC_VERSION}) is not the build of ffb.fth "
+                      "(${UV_FFB_VERSION}): run firmware/creator3d/build.sh")
+endif()
+file(READ ${UV_FFB_FC} UV_FFB_HEX HEX)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," UV_FFB_BYTES "${UV_FFB_HEX}")
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/generated/creator3d_fcode.h
+  "// Generated from firmware/creator3d/ffb.fc.\n#pragma once\n"
+  "constexpr unsigned char kCreator3dFcode[] = {${UV_FFB_BYTES}};\n")
+target_include_directories(uv_app PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 if(WIN32)
   target_link_libraries(uv_app PRIVATE shell32 ole32)  # the Documents folder
 endif()

@@ -128,6 +128,32 @@ TEST(ffb_rectangle_vscroll_and_font) {
     CHECK_EQ(r.rd(kFbc + 0x314), (101u << 16) | 50u);
 }
 
+// A block fill counts its width and height from the block its start is in,
+// a block being as the frame buffer's organisation (FBCFG0) sets it: 16 x 4
+// pixels in the high resolutions, 8 x 4 in the standard ones, as Xsun's
+// block fills take them.
+TEST(ffb_block_fill_counts_from_the_organisations_block) {
+    for (const bool high : {true, false}) {
+        Rig r;
+        r.fbc(0x10270, high ? 0xCA30003B : 0xC83C002B);
+        r.fbc(0x200, 0x869BAF);
+        r.fbc(0x254, 0x200875AA);
+        r.fbc(0x258, 0x00838383);
+        r.fbc(0x290, 0xFFFFFF);
+        r.fbc(0x294, 0xFF);
+        r.fbc(0x300, 0x09);                       // fast fill
+        r.fbc(0x208, 0x00336699);
+        r.fbc(0x60, 3), r.fbc(0x68, 0), r.fbc(0x6C, 0), r.fbc(0x70, 4), r.fbc(0x74, 0x40);  // the colour block
+        // 40 x 6 from (24, 10): x 8 past a 16-pixel block, 0 past an 8-pixel one.
+        r.fbc(0x60, 2), r.fbc(0x68, 10), r.fbc(0x6C, 24), r.fbc(0x70, 6 + (10 & 3));
+        r.fbc(0x64, 40 + (24 & (high ? 15 : 7)));
+        CHECK_EQ(r.pixel(24, 10), 0x00336699u);
+        CHECK_EQ(r.pixel(63, 15), 0x00336699u);
+        CHECK_EQ(r.pixel(64, 10), 0u);
+        CHECK_EQ(r.pixel(24, 16), 0u);
+    }
+}
+
 TEST(ffb_views) {
     Rig r;
     r.fbc(0x254, 0x200875AA);
@@ -257,6 +283,121 @@ TEST(ffb_picture_through_the_window_lookups) {
     const double line = 100e6 * 1528 / 94.5e6;
     r.now = static_cast<u64>(line * (937 + 10.5));
     CHECK_EQ(r.dac(0x600F), 10u);
+}
+
+TEST(ffb_high_resolutions_count_four_pixels_horizontally) {
+    // 1600 x 1200 at 75 Hz as the FCode sets it: 8/2:1 pixels, a 202.5 MHz
+    // clock (13.5 x 60 / 4), 2160 x 1250 a frame (VESA's).
+    Rig r;
+    r.dac(0x0000, 0x4000 | 4 << 7 | 60);
+    r.dac(0x1000, 3);
+    r.wr(kDac, 0x6001);
+    for (u32 v : {48u, 1248u, 2u, 1249u, 491u, 123u, 523u, 47u, 539u, 519u, 119u, 0u, 0u, 0u}) r.wr(kDac + 4, v);
+    r.dac(0x6000, 3);
+    Display::Frame frame;
+    CHECK(r.f.render(frame));
+    CHECK_EQ(frame.width, 1600u);
+    CHECK_EQ(frame.height, 1200u);
+    const double line = 100e6 * 2160 / 202.5e6;
+    r.now = static_cast<u64>(line * (1250 + 10.5));
+    CHECK_EQ(r.dac(0x600F), 10u);
+    // The same timing 4/2:1 is half as wide.
+    r.dac(0x1000, 2);
+    CHECK(r.f.render(frame));
+    CHECK_EQ(frame.width, 800u);
+}
+
+TEST(ffb_interlaced_modes_count_half_lines) {
+    // 640 x 480 NTSC as the FCode sets it: interlaced, a 12.27 MHz clock
+    // (13.5 x 80 / 11 / 8), 390 pixels a half-line, 525 half-lines a field.
+    Rig r;
+    r.dac(0x0000, 0x5DD0);
+    r.dac(0x1000, 2);
+    r.wr(kDac, 0x6001);
+    for (u32 v : {37u, 517u, 5u, 524u, 165u, 59u, 184u, 28u, 194u, 180u, 55u, 13u, 11u, 518u}) r.wr(kDac + 4, v);
+    r.dac(0x6000, 0x63);
+    Display::Frame frame;
+    CHECK(r.f.render(frame));
+    CHECK_EQ(frame.width, 640u);
+    CHECK_EQ(frame.height, 480u);
+    // Fields at NTSC's rate: the vertical count back to 0 after 525 half-lines.
+    const double half_line = 100e6 * 390 / (13.5e6 * 80 / 11 / 8);
+    r.now = static_cast<u64>(half_line * (525 + 3.5));
+    CHECK_EQ(r.dac(0x600F), 3u);
+}
+
+namespace {
+
+// The card's side of an I2C read of the monitor's EDID, through the DAC's
+// monitor port (SCL bit 0, SDA bit 1).
+struct Ddc {
+    Rig& r;
+    u32 lines = 3;
+    void set(u32 v) { lines = v, r.dac(0x8001, v); }
+    void scl(bool on) { set(on ? lines | 1 : lines & ~1u); }
+    void sda(bool on) { set(on ? lines | 2 : lines & ~2u); }
+    bool sda_in() { return r.dac(0x8002) & 2; }
+    void start() { sda(true), scl(true), sda(false), scl(false); }
+    void stop() { sda(false), scl(true), sda(true); }
+    bool out(u8 b) {
+        for (int i = 7; i >= 0; --i) sda(b >> i & 1), scl(true), scl(false);
+        sda(true), scl(true);
+        const bool ack = !sda_in();
+        scl(false);
+        return ack;
+    }
+    u8 in(bool last) {
+        u8 b = 0;
+        sda(true);
+        for (int i = 0; i < 8; ++i) {
+            scl(true);
+            b = static_cast<u8>(b << 1 | (sda_in() ? 1 : 0));
+            scl(false);
+        }
+        sda(last), scl(true), scl(false);
+        return b;
+    }
+};
+
+}  // namespace
+
+TEST(ffb_monitor_answers_ddc_with_its_edid) {
+    Rig r;
+    Ddc d{r};
+    d.start();
+    CHECK(!d.out(0xA0));  // no monitor on DDC: nothing acknowledges
+    d.stop();
+    const MonitorTiming* t = find_timing(Ffb::resolutions(), "1280x1024");
+    CHECK(t != nullptr);
+    r.f.monitor().set_edid(monitor_edid(Ffb::resolutions(), *t));
+    d.start();
+    CHECK(d.out(0xA0));
+    CHECK(d.out(0x00));
+    d.stop();
+    d.start();
+    CHECK(d.out(0xA1));
+    std::vector<u8> e;
+    for (int i = 0; i < 128; ++i) e.push_back(d.in(i == 127));
+    d.stop();
+    CHECK(e == r.f.monitor().edid());
+    u8 sum = 0;
+    for (u8 b : e) sum = static_cast<u8>(sum + b);
+    CHECK_EQ(sum, 0u);
+    CHECK_EQ(e[0], 0u);
+    CHECK_EQ(e[1], 0xFFu);
+    // The preferred timing first: 1280 x 1024 at 108 MHz; its standard
+    // timing first too (1280 / 8 - 31, 5:4, 60 Hz).
+    CHECK_EQ(e[54] | e[55] << 8, 10800u);
+    CHECK_EQ(e[56] | (e[58] >> 4) << 8, 1280u);
+    CHECK_EQ(e[38], 1280u / 8 - 31);
+    CHECK_EQ(e[39], 2u << 6 | 0);
+}
+
+TEST(ffb_monitor_sense) {
+    Rig r;
+    CHECK_EQ((r.rd(0x200010) >> 24) & 7, 7u);  // nothing sensed
+    r.f.monitor().set_sense(5);
+    CHECK_EQ((r.rd(0x200010) >> 24) & 7, 5u);
 }
 
 TEST(ffb_window_transfer_waits_for_the_vertical_blank) {

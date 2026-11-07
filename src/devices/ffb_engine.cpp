@@ -26,11 +26,13 @@ constexpr u32 kLpat = 0x30C, kEbxi = 0x54;
 constexpr unsigned kDrawDot = 0x00, kDrawLineCap = 0x02, kDrawLineOpen = 0x03, kDrawRectangle = 0x08, kDrawFastFill = 0x09,
                    kDrawBcopy = 0x0A, kDrawVscroll = 0x0B;
 // Fast fill: by holds the step (1 page fill, 2 block fill, 3 the colour
-// block set up; 4 the page's block); the block size, which the frame
-// buffer's organisation sets, for the standard resolution (as the X driver
-// takes it).
+// block set up; 4 the page's block).
 constexpr u32 kFastFillPage = 1, kFastFillBlock = 2, kFastFillColourBlock = 3;
-constexpr int kFastFillBlockW = 8, kFastFillBlockH = 4;
+// The frame buffer's organisation (FBCFG0's resolution field, which the
+// card's FCode sets for the mode), and the block a block fill counts from
+// in each, as Xsun's block fills take them: 16 x 4 in the high
+// resolutions, 8 x 2 in stereo, 8 x 4 in the standard ones.
+constexpr u32 kFbcfg0 = 0x270, kFbcfg0Res = 0x30, kResHigh = 0x30, kResStereo = 0x10;
 
 // A raster operation (the X11 functions' order: bit 3 for neither source
 // nor destination set, 2 destination only, 1 source only, 0 both).
@@ -273,7 +275,9 @@ void Ffb::fast_fill(u32 written) {
     if (step != kFastFillBlock && step != kFastFillPage) return;
     const int x = static_cast<s32>(regs_[kDx / 4]), y = static_cast<s32>(regs_[kDy / 4]);
     const int w = static_cast<s32>(regs_[written / 4]), h = static_cast<s32>(regs_[kBh / 4]);
-    const int x0 = step == kFastFillBlock ? x & ~(kFastFillBlockW - 1) : x, y0 = step == kFastFillBlock ? y & ~(kFastFillBlockH - 1) : y;
+    const u32 res = kregs_[kFbcfg0 / 4] & kFbcfg0Res;
+    const int bw = res == kResHigh ? 16 : 8, bh = res == kResStereo ? 2 : 4;
+    const int x0 = step == kFastFillBlock ? x & ~(bw - 1) : x, y0 = step == kFastFillBlock ? y & ~(bh - 1) : y;
     rectangle(x, y, x0 + w - x, y0 + h - y, fast_fill_colour_);
 }
 

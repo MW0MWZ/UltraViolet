@@ -73,7 +73,7 @@ public:
 
     // Turbo: Max timing while on, the configured timing when off. Offered
     // when the configured timing is Realtime or Cycle; kept across power
-    // cycles, not a setting.
+    // cycles, and turned on at power-on by the turbo_at_boot setting.
     bool turbo_available() const {
         return settings_.timing == Pacer::Mode::Realtime || settings_.timing == Pacer::Mode::Cycle;
     }

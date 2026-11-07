@@ -27,14 +27,24 @@ struct Settings {
     // graphics, with a Sun keyboard and mouse) or "ttya" (no keyboard: the
     // first serial port).
     std::string console = "screen";
-    std::string keyboard = "us";
-    // The Ultra 10's UPA slot: "none", or "creator3d" (a Creator3D, its
-    // FCode PROM image found in the PROM folder; the screen then is its).
-    std::string upa = "none";  // the keyboard's layout: us, uk or a number (the DIP switch value)
+    std::string keyboard = "us";  // the keyboard's layout: us, uk or a number (the DIP switch value)
+    // The Ultra 10's UPA slot: "none", or "creator3d" (a Creator3D; the
+    // screen then is its).
+    std::string upa = "none";
+    // The Creator3D's FCode: "builtin" (UltraViolet's open source one) or
+    // "supplied" (an image in the PROM folder, such as the card's own).
+    std::string creator3d_fcode = "builtin";
+    // The screen's size at power-on (the Creator3D's resolutions(), or the
+    // Rage Pro's without one).
+    std::string resolution = "1152x900";
     std::optional<std::array<u8, 6>> mac;
     std::string net = "user";  // user | tap:NAME | none
     std::vector<net::PortForward> forwards;
     Pacer::Mode timing = Pacer::Mode::Realtime;
+    // Turbo (Maximum timing, guest clocks still following the host's) from
+    // power-on, with Real time or Cycle timing; the Turbo button still
+    // turns it off and on.
+    bool turbo_at_boot = false;
     bool block_cache = true, jit = true;
     bool idle_skip = true;  // run the guest's idle loops at once (UltraSparc::set_idle_skip)
     // The IDE drives without a real drive's delays, DMA at host speed.

@@ -239,6 +239,17 @@ Ultra5_10::Ultra5_10(const Options& options)
 
     // NVRAM: the saved contents, or (none, or a blank image) a new one.
     if (opt_.nvram_path.empty() || !nvram_.load(opt_.nvram_path) || nvram_blank()) write_new_nvram();
+    if (!opt_.screen_resolution.empty()) {
+        const std::vector<MonitorTiming>& list = ffb_ ? Ffb::resolutions() : Mach64::resolutions();
+        const MonitorTiming* t = find_timing(list, opt_.screen_resolution);
+        if (!t) {
+            UV_LOG(Warn, "ultra5_10", "the %s has no %s resolution: 1152x900", ffb_ ? "Creator3D" : "Rage Pro",
+                   opt_.screen_resolution.c_str());
+            t = find_timing(list, "1152x900");
+        }
+        (ffb_ ? ffb_->monitor() : mach64_.monitor()).set_edid(monitor_edid(list, *t));
+        set_screen_mode(std::to_string(t->width) + "x" + std::to_string(t->height) + "x" + std::to_string(t->rate));
+    }
 
     bus_.set_rom_write_handler([this](u64 pa, unsigned size, u64 value) {
         if (prom_map_size_ && pa - prom_pa_ < prom_map_size_) flash_.write(pa - prom_pa_, size, value);
@@ -422,6 +433,23 @@ void Ultra5_10::write_new_nvram() {
     for (unsigned i = 0x0C; i < kNvramConfigEnd; ++i) sum ^= p[i];
     p[0] = sum;
     nvram_.write_idprom(kMachineType, mac.data(), kBoardDateBcd, serial);
+}
+
+// The screen's mode named in output-device ("screen:r1280x1024x60"), as
+// setenv writes it, when it names the screen (alone or with a mode); a
+// console put elsewhere stays there.
+void Ultra5_10::set_screen_mode(const std::string& mode) {
+    constexpr unsigned kAt = 0x63C, kRoom = 0x65F - 0x63C - 2;  // output-device's length, text and 0
+    u8* p = nvram_.data();
+    const std::string now(reinterpret_cast<const char*>(p + kAt + 1), std::min<unsigned>(p[kAt], kRoom));
+    const std::string want = "screen:r" + mode;
+    if ((now != "screen" && now.rfind("screen:r", 0) != 0) || now == want || want.size() > kRoom) return;
+    p[kAt] = static_cast<u8>(want.size());
+    std::copy(want.begin(), want.end(), p + kAt + 1);
+    p[kAt + 1 + want.size()] = 0;
+    u8 sum = 0x17;
+    for (unsigned i = 0x0C; i < kNvramConfigEnd; ++i) sum ^= p[i];
+    p[0] = sum;
 }
 
 void Ultra5_10::set_timing(Pacer::Mode mode) {
