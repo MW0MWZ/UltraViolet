@@ -41,8 +41,8 @@
 \ ========== Copyright Header End ============================================
 \ Adapted for the Ultra 5/10 (sun4u) by Andy Taylor, 2026: entered from the
 \ reset code with the MMU on and OpenBoot's memory mapped; the hypervisor's
-\ calls and scratchpad registers are left out, and the processor runs on
-\ its normal globals.
+\ calls and scratchpad registers are left out, the processor runs on its
+\ normal globals, and the reset it was started for is kept (reset-kind).
 id: @(#)boot.fth 1.1 06/02/16
 purpose:
 copyright: Copyright 2006 Sun Microsystems, Inc.  All Rights Reserved
@@ -64,6 +64,10 @@ overload: stand-init-io  ( -- )
 
 headers
 
+\ The reset this start is for, from the reset code (%i2): 0 power-on (and
+\ a soft power-on reset), 1 watchdog, 2 XIR, 3 SIR, 4 RED state.
+nuser reset-kind
+
 label prom-cold-code  ( -- )
 
    \ Turn OFF everything except for PRIV bit in %pstate
@@ -72,6 +76,7 @@ label prom-cold-code  ( -- )
    %g0  4			wrpstate
    %i0			%g1	move
    %i1			%g2	move
+   %i2			%g3	move
    %g0  0			wrtba
    \ XXX %g0  0		%r22	wrasr	\ Clear SoftInt Reg.
    %g0  7			wrcleanwin
@@ -82,6 +87,7 @@ label prom-cold-code  ( -- )
    %g0  0			wrcwp
    %g1			%i0	move
    %g2			%i1	move
+   %g3			%i2	move
    %g0  0			wrtl	\ TL = 0
 
 
@@ -107,6 +113,8 @@ label prom-cold-code  ( -- )
    %i6	%i7		%i7	add	\ Memtop
    'user# physmax	%i6	set
    %i7  up		%i6	nput	\ Set the physmax (memory HWM)
+   'user# reset-kind	%i6	set
+   %i2  up		%i6	nput
    
    \ clear post-run magic in %i5
    %g0		%i5	move

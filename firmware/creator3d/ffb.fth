@@ -310,6 +310,11 @@ here est-modes - 5 /n * / constant #est-modes
 
 \ --- The DAC: clock, timing, window lookup ------------------------------------
 
+\ The pixel format and the window mode (the user control).
+: set-window-mode  ( -- )
+   high-res? if  3 8  else  2 2c  then  1001 dac!  1000 dac!
+;
+
 \ The pixel clock is 13.5 MHz x M / D / 2^PFD. The timing generator counts
 \ lines vertically, and horizontally pixels by two (by four in the high
 \ resolutions, which take the pixels 8/2:1 rather than 4/2:1). The high
@@ -318,7 +323,7 @@ here est-modes - 5 /n * / constant #est-modes
 : set-timing  ( -- )
    0 6000 dac!                                  \ the timing generator off
    5 mode@ 0 dac!                               \ the pixel PLL
-   high-res? if  3 8  else  2 2c  then  1001 dac!  1000 dac!
+   set-window-mode
    7 mode@ 5001 dac!                            \ sync
    d# 14 0 do  8 i + mode@  6001 i + dac!  loop
    6 mode@ 6000 dac!                            \ on: video, timing, master
@@ -371,18 +376,15 @@ here est-modes - 5 /n * / constant #est-modes
 : drawop  ( rop op -- )  3 fifo-wait  ppc-plain 200 fbc!  300 fbc!  258 fbc!  ;
 : colours  ( fg bg -- )  2 fifo-wait  20c fbc!  208 fbc!  ;
 
-: init-fbc  ( -- )
-   7 fifo-wait
+\ The registers the console draws with.
+: fbc-console  ( -- )
+   6 fifo-wait
    0 204 fbc!                                   \ window ID 0
    ppc-plain 200 fbc!
-   fbc-ab-x-on 254 fbc!
    rop-new 258 fbc!
    8 300 fbc!                                   \ rectangles
    ffffffff 290 fbc!                            \ every plane
    10000 31c fbc!                               \ font rows a line apart
-   ffffff 0 colours
-   0 0 width height rectangle                   \ both buffers white, window ID 0
-   fbc-idle
    \ The view clip, compare, X and window ID plane masks and stencil as the
    \ card leaves them.
    8 fifo-wait
@@ -390,6 +392,13 @@ here est-modes - 5 /n * / constant #est-modes
    f0000000 338 fbc!  33300000 33c fbc!
    high-res? if  33300000  else  33380000  then  2cc fbc!
    high-res? 0= if  101 2d8 fbc!  then
+;
+: init-fbc  ( -- )
+   fbc-console
+   1 fifo-wait  fbc-ab-x-on 254 fbc!
+   ffffff 0 colours
+   0 0 width height rectangle                   \ both buffers white, window ID 0
+   fbc-idle
    1 fifo-wait  fbc-x-off 254 fbc!
 ;
 
@@ -436,7 +445,17 @@ here est-modes - 5 /n * / constant #est-modes
 : ffb-erase-screen  ( -- )  0 0 width height back fill-rect  fbc-idle  ;
 : ffb-invert-screen  ( -- )  0 0 width height invert-rect  fbc-idle  ;
 : ffb-blink-screen  ( -- )  ffb-invert-screen d# 20 ms ffb-invert-screen  ;
-: ffb-reset-screen  ( -- )  ;
+\ Back from a client (X leaves the window mode, the frame buffer
+\ configuration, the window lookups, the palette and the FBC its own): the
+\ console's again, and every pixel window ID 0, its colour kept (the X
+\ planes alone written).
+60007095 constant fbc-ab-x-only
+: ffb-reset-screen  ( -- )
+   set-window-mode  set-fbcfg  set-windows  set-palette  fbc-console
+   1 fifo-wait  fbc-ab-x-only 254 fbc!
+   0 0 colours  0 0 width height rectangle  fbc-idle
+   1 fifo-wait  fbc-x-off 254 fbc!
+;
 
 \ Moves a block of the text area: the FBC's vertical scroll, from (sx, sy)
 \ to (dx, dy).
@@ -560,7 +579,7 @@ my-space 1c0 - 2/ encode-int " upa-portid" property
 \ The card's identity, read from it.
 exp rl@ d# 24 rshift ff and encode-int " board_type" property
 " SUNW,501-4788" model
-" UltraViolet ffb.fth 0.4" encode-string " fcode_version" property
+" UltraViolet ffb.fth 0.5" encode-string " fcode_version" property
 dac-uctrl dac@ 8 rshift f and encode-int " ramdac_rev" property
 800 fbc@ encode-int " fbc_reg_id" property
 unmap-card

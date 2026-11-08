@@ -70,8 +70,46 @@ external
    net-off unmap-resources
 ;
 
+\ The selftest: a frame to the station's own address through the MAC's
+\ internal loopback (the output drivers off), compared when it comes
+\ back; then the transceiver, reset and answering with its ID.
+d# 64 constant /test-frame
+: test-pattern ( adr -- )
+   system-mac drop  over 6 move  system-mac drop  over 6 + 6 move	( adr )
+   /test-frame d# 12 do  i over i + c!  loop  drop
+;
+: loopback-test ( -- ok? )
+   reset-hme drop  init-mac  init-rings  start-dma
+   2 bmac-xif reg!					\ Loopback, drivers off
+   h# 201 bmac-tx-cfg reg!  1 bmac-rx-cfg reg!		\ Full duplex; own frames
+   /test-frame alloc-mem  dup test-pattern		( frame )
+   dup /test-frame transmit /test-frame = if		( frame )
+      /test-frame alloc-mem  false			( frame buf ok? )
+      get-msecs d# 200 +  begin			( frame buf ok? when )
+         2 pick /test-frame receive ?dup if		( frame buf ok? when #rcvd )
+            nip nip  /test-frame >= if		( frame buf )
+               2dup /test-frame comp 0=		( frame buf ok? )
+            else  false  then			( frame buf ok? )
+            get-msecs				( frame buf ok? when )
+         then
+         dup timed-out?  2 pick or		( frame buf ok? when done? )
+      until  drop					( frame buf ok? )
+      swap /test-frame free-mem			( frame ok? )
+   else  false  then				( frame ok? )
+   swap /test-frame free-mem			( ok? )
+   net-off
+;
+: transceiver-test ( -- ok? )
+   phy-reset dup if  drop phy-id1@ dup 0<> swap h# ffff <> and  then
+;
+
 : selftest ( -- 0 | error )
-   map-resources  net-on 0=  net-off unmap-resources
+   map-resources
+   loopback-test  ." Internal loopback test -- "
+   dup if  ." succeeded."  else  ." failed."  then  cr	( ok1? )
+   transceiver-test  ." Transceiver check  -- "
+   dup if  ." passed"  else  ." failed"  then  cr		( ok1? ok2? )
+   and 0=  net-off unmap-resources
 ;
 
 : reset ( -- )  net-off  ;

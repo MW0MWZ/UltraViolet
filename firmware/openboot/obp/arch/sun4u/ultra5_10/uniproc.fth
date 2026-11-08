@@ -21,9 +21,36 @@ h# 1fe.0000.f020 constant reset-status-pa
 : power-on-reset? ( -- flag )
    reset-status-pa bypass-asi spacex@ h# 8000.0000 and 0<>
 ;
+\ The root's reset-reason: a power-on, or one the Sabre's reset control
+\ made (SOFT_POR, bit 30: reset-all)
+: soft-power-on-reset? ( -- flag )
+   reset-status-pa bypass-asi spacex@ h# 4000.0000 and 0<>
+;
+stand-init: Reset reason
+   root-device
+      power-on-reset? if  " POR"  else
+      soft-power-on-reset? if  " S-POR"  else  " RESET"  then  then
+      encode-string " reset-reason" property
+   device-end
+;
 
-\ Pending soft interrupts cleared (the tick alarm's among them).
-: reset-interrupts ( -- )  -1 clear-softint!  ;
+\ On to the client (go): OpenBoot's own pending soft interrupt (level 14)
+\ cleared; the tick's (TICK_INT) left, for a client whose clock interrupt
+\ came while OpenBoot ran to take it (its tick compare is behind the tick
+\ by then, so the clock would not interrupt it again).
+: reset-interrupts ( -- )  h# 4000 clear-softint!  ;
+
+\ An interrupt vector: a device's interrupt a client left mapped (the
+\ keyboard's, when Solaris stops at Stop-A or halts). OpenBoot takes no
+\ device interrupts, so it goes on with interrupts off (TSTATE's PSTATE.IE
+\ cleared), and the vector stays in the processor for the client to take
+\ when it resumes.
+h# 060 begin-trap
+   %g1			rdtstate
+   %g1 h# 200	%g1	andn
+   %g1 0		wrtstate
+   retry
+h# 061 end-trap
 
 headers
 defer clear-keyboard  ' noop is clear-keyboard
@@ -38,4 +65,11 @@ defer .keyboard-type
    keyboard-input? if  ." Keyboard Present"  else  ." No Keyboard"  then
 ;
 ' (.keyboard-type) is .keyboard-type
+
+\ Each entry to OpenBoot: the keyboard's keys forgotten (see its restore).
+: (clear-keyboard) ( -- )
+   keyboard-input? 0= if  exit  then
+   " restore" stdin @ ['] $call-method catch if  3drop  then
+;
+' (clear-keyboard) is clear-keyboard
 headerless

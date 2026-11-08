@@ -688,7 +688,11 @@ void UltraSparc::take_trap(unsigned type) {
         ps |= pstate::PEF | pstate::PRIV;
         if (ps & pstate::TLE) ps |= pstate::CLE;
         if (type == tt::kInterruptVector) ps |= pstate::IG;
-        else if (type >= tt::kFastInstructionAccessMmuMiss && type <= tt::kFastDataAccessProtection + 3) ps |= pstate::MG;
+        // (The MMU globals for the fast MMU traps and the two access
+        // exceptions: UltraSPARC IIi User's Manual, 13.3.)
+        else if ((type >= tt::kFastInstructionAccessMmuMiss && type <= tt::kFastDataAccessProtection + 3) ||
+                 type == tt::kDataAccessException || type == tt::kInstructionAccessException)
+            ps |= pstate::MG;
         else ps |= pstate::AG;
     }
     pstate_ = ps;

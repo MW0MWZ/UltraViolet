@@ -96,6 +96,18 @@ source{
    : ebus-flashprom ( -- )  " ebus-flashprom" load-driver  ;
 }source
 
+depend		${BP}/dev/ebus/eeprom/depend.mk
+target		eeprom.fc	ebus-eeprom
+source{
+   : ebus-eeprom ( -- )  " ebus-eeprom" load-driver  ;
+}source
+
+depend		${BP}/dev/ebus/fdthree/depend.mk
+target		fdthree.fc	ebus-fdthree
+source{
+   : ebus-fdthree ( -- )  " ebus-fdthree" load-driver  ;
+}source
+
 # Other PCI-PCI bridges (on cards in the slots)
 depend		${BP}/dev/pci-bridge/dec21152/depend.mk
 target		dec21152.fc	class060400

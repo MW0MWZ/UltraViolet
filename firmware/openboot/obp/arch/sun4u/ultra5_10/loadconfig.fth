@@ -66,6 +66,38 @@ fload ${BP}/arch/sun4u/config/scsi-id.fth
 false	config-flag	fcode-debug?
 false	config-flag	local-mac-address?
 
+\ The rest of OpenBoot 3.x's: the level of the power-on tests, the
+\ manufacturing mode, the PCI buses' probe lists, the keyboard's click
+\ and map, the Ethernet's link test, a reset by the watchdog, the quiet
+\ power-on, and the system board's records (the values and lengths as
+\ OpenBoot 3.31 keeps them).
+resident  headers
+vocabulary diag-level-types  also diag-level-types definitions
+h# 00	byte-keyword	off
+h# 20	byte-keyword	min
+h# 40	byte-keyword	max
+previous definitions
+vocabulary mfg-mode-types  also mfg-mode-types definitions
+h# 00	byte-keyword	off
+h# 41	byte-keyword	sys-ext
+previous definitions
+headerless
+
+" max"	' diag-level-types  vocab-variable  diag-level
+" off"	' mfg-mode-types  vocab-variable  mfg-mode
+" 1,2,3,4"	d# 32	config-string	pcia-probe-list
+" 1,2,3"	d# 32	config-string	pcib-probe-list
+false		config-flag	keyboard-click?
+" "		d# 128	config-bytes	keymap
+true		config-flag	tpe-link-test?
+false		config-flag	watchdog-reboot?
+false		config-flag	silent-mode?
+nodefault-int					#power-cycles
+d# 16		nodefault-string		system-board-serial#
+d# 8		nodefault-string		system-board-date
+d# 15		nodefault-string		hardware-revision
+d# 7		nodefault-string		last-hardware-update
+
 \ Install hook for fcode-debug?
 ' fcode-debug?  to (fcode-debug?)
 

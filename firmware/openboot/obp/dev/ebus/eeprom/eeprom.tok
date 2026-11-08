@@ -1,0 +1,75 @@
+\ Copyright (C) 2026 Andy Taylor. Distributed under the same terms as the
+\ OpenBoot release it is part of (see LICENSE).
+id: @(#)eeprom.tok 1.0 26/11/07
+purpose: The M48T59's clock: eeprom@14,0
+copyright: Copyright 2026 Andy Taylor
+
+\ The time of day, from the M48T59's clock registers at 1ff8 (control,
+\ then seconds, minutes, hours, day of the week, date, month and year, in
+\ BCD; the year counted from 1968, as Solaris keeps it), through the
+\ mapping the node's "address" property gives. The real time clock's methods, and the
+\ release's watch-clock and date commands (dev/rtc/support.fth). (Its
+\ NVRAM and IDPROM are read through /packages/nvram and /packages/idprom.)
+
+Fcode-version3
+
+headerless
+
+" address" get-my-property 0= if  decode-int nip nip  else  0  then
+value tod-base
+
+h# 1ff8 constant tod-control
+h# 40 constant tod-read		\ the registers held for reading
+h# 80 constant tod-write	\ ... and for writing
+
+: tod@ ( n -- b )  tod-control + tod-base + rb@  ;
+: tod! ( b n -- )  tod-control + tod-base + rb!  ;
+
+: bcd> ( bcd -- n )  dup 4 rshift d# 10 *  swap h# f and +  ;
+: >bcd ( n -- bcd )  d# 10 /mod 4 lshift or  ;
+
+: tod-hold ( bit -- )  0 tod@  or  0 tod!  ;
+: tod-release ( -- )  0 tod@  tod-read tod-write or invert and  0 tod!  ;
+
+: tod-field ( n mask -- value )  swap tod@ and bcd>  ;
+
+: year> ( yy -- year )  d# 1968 +  ;
+
+\ The words dev/rtc/support.fth uses
+: get-seconds ( -- secs )
+   tod-read tod-hold  1 h# 7f tod-field  tod-release
+;
+: get-time ( -- hour min secs )
+   tod-read tod-hold
+   3 h# 3f tod-field  2 h# 7f tod-field  1 h# 7f tod-field
+   tod-release
+;
+: get-date ( -- month date year )
+   tod-read tod-hold
+   6 h# 1f tod-field  5 h# 3f tod-field  7 h# ff tod-field year>
+   tod-release
+;
+
+fload ${BP}/dev/rtc/support.fth
+
+external
+
+: open ( -- true )  true  ;
+: close ( -- )  ;
+
+\ The real time clock's methods
+: get-time ( -- sec min hour day month year )
+   tod-read tod-hold
+   1 h# 7f tod-field  2 h# 7f tod-field  3 h# 3f tod-field
+   5 h# 3f tod-field  6 h# 1f tod-field  7 h# ff tod-field year>
+   tod-release
+;
+: set-time ( sec min hour day month year -- )
+   tod-write tod-hold
+   d# 1968 - d# 100 mod >bcd 7 tod!  >bcd 6 tod!  >bcd 5 tod!
+   >bcd 3 tod!  >bcd 2 tod!
+   >bcd 1 tod@ h# 80 and or 1 tod!		\ (the oscillator's stop bit kept)
+   tod-release
+;
+
+end0

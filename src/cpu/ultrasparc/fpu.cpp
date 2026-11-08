@@ -299,8 +299,10 @@ void UltraSparc::fpop1(u32 insn) {
     auto unfinished_operands = [&](bool sa, bool sb, Arith op, auto fa, auto fb, const Format& f) {
         if (!sa && !sb) return false;
         if (op == Arith::Add || (sa && sb)) return true;
-        // FMUL, FDIV with one: unless the result overflows or is deep below the subnormals.
+        // FMUL, FDIV with one: unless the result overflows or is deep below the subnormals
+        // (but a divide's inexact is predicted, as for ordinary operands, with that trap on).
         if (fa == 0 || fb == 0 || std::isinf(fa) || std::isinf(fb)) return false;
+        if (op == Arith::Div && (tem & kNx)) return true;
         const int er = exact_er(fa, fb, op, f);
         return er < f.max_exp && er > f.deep;
     };
@@ -411,9 +413,10 @@ void UltraSparc::fpop1(u32 insn) {
             if (fp_finish(exc)) set_f64(rd, r);
             return;
         }
-        case 0x029: {  // FSQRTs (inexact predicted pessimistically, as a divide's)
+        case 0x029: {  // FSQRTs (inexact predicted pessimistically, as a divide's, but for a
+                       // negative operand: invalid, as Sun's POST expects of the chip)
             if (sub_operand32(f_[rs2])) return fp_unfinished();
-            if (!ns && (tem & kNx) && ordinary32(f_[rs2])) return fp_unfinished();
+            if (!ns && (tem & kNx) && ordinary32(f_[rs2]) && !(f_[rs2] >> 31)) return fp_unfinished();
             const u32 b = ns_in32(f_[rs2], ns, exc);
             u32 r;
             if (is_nan32(b)) {
@@ -432,7 +435,7 @@ void UltraSparc::fpop1(u32 insn) {
         }
         case 0x02A: {  // FSQRTd
             if (sub_operand64(freg64(rs2))) return fp_unfinished();
-            if (!ns && (tem & kNx) && ordinary64(freg64(rs2))) return fp_unfinished();
+            if (!ns && (tem & kNx) && ordinary64(freg64(rs2)) && !(freg64(rs2) >> 63)) return fp_unfinished();
             const u64 b = ns_in64(freg64(rs2), ns, exc);
             u64 r;
             if (is_nan64(b)) {
@@ -510,11 +513,13 @@ void UltraSparc::fpop1(u32 insn) {
             if (fp_finish(exc)) set_f64(rd, r);
             return;
         }
-        case 0x0C6: {  // FdTOs: unfinished for a subnormal operand, or a result in the subnormal window
+        case 0x0C6: {  // FdTOs: unfinished for a subnormal operand, or a result in the subnormal
+                       // window (or, with the underflow trap enabled, any result below the
+                       // single range, as Sun's POST expects of the chip)
             if (sub_operand64(freg64(rs2))) return fp_unfinished();
             if (!ns && ordinary64(freg64(rs2))) {
                 const int er = std::ilogb(f64(freg64(rs2))) + kSingle.bias;
-                if (er > kSingle.deep && er < 1) return fp_unfinished();
+                if (er < 1 && (er > kSingle.deep || (fsr_ >> kFsrTemShift) & kUf)) return fp_unfinished();
             }
             const u64 b = ns_in64(freg64(rs2), ns, exc);
             u32 r;

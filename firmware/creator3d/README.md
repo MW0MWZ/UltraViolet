@@ -17,7 +17,10 @@ card's own FCode leaves them),
 and gives OpenBoot its console through IEEE 1275's display interface, drawn
 with the card's own fill, scroll and font operations and with its own
 colour logo. Solaris attaches its Creator3D driver to
-it and runs its window system on it.
+it and runs its window system on it. Back in OpenBoot from a client it sets
+the console's window lookups, palette and FBC state again, and gives every
+pixel the console's window ID (its colour kept), so the console shows
+whatever state the window system left.
 
 It is written from the card's open documentation: the X.Org `sunffb`
 driver's register definitions, the NetBSD, OpenBSD and Linux drivers,

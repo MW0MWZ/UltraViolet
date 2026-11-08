@@ -98,7 +98,7 @@ instance variable kbd-alarm-running?
    set-oftused-buf-offsets
    clear-keyboard
    h# 21 to layout
-   kbd-reset? if  kbd-get-layout true  else  forced-keyboard-mode?  then
+   kbd-reset? if  kbd-get-layout kbd-set-click true  else  forced-keyboard-mode?  then
    dup 0= if  dealloc-vaddr-buffs  then
 ;
 
@@ -120,6 +120,10 @@ external
    kbd-package ?dup if  close-package  then
    dealloc-vaddr-buffs
 ;
+
+\ Back in OpenBoot from a client: the keys it took (a key's release among
+\ them, after go was typed) forgotten, so that none is held down here.
+: restore  ( -- )  clear-keys-down clear-keyboard  ;
 
 : reset  ( -- )  ;
 : selftest  ( -- error )  false  ;

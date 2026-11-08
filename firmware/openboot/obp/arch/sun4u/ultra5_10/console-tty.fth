@@ -40,7 +40,10 @@
 \ 
 \ ========== Copyright Header End ============================================
 \ Adapted for the Ultra 5/10 by Andy Taylor, 2026: the configuration
-\ variables themselves are defined with the others (loadconfig.fth).
+\ variables themselves are defined with the others (loadconfig.fth), and
+\ ttya's node does not get ignore-cd and rts-dtr-off (the serial driver
+\ gives its node port-a-ignore-cd and the like from them, as the machine's
+\ own firmware does).
 id: @(#)console-tty.fth 1.1 06/02/16
 purpose: 
 copyright: Copyright 2006 Sun Microsystems, Inc.  All Rights Reserved
@@ -51,22 +54,3 @@ copyright: Use is subject to license terms.
  
 headerless
 
-: apply-serial-props ( -- )
-   current-device >r		\ Save current device
-   " ttya" 			\ Normal serial port console
-   ?expand-alias 2dup		\ Expand into canonical form
-   ['] noalias-find-device catch \ Determine if device exists
-   0<> if 
-      2drop 2drop		\ Couldn't find ttya, ignore it.
-   else
-     find-device		\ Device exists, go there.
-     ttya-rts-dtr-off if 0 0  " rts-dtr-off" property then
-     ttya-ignore-cd   if 0 0  " ignore-cd"   property then
-     device-end
-   then
-    r> push-device
-;
-
-stand-init: Add tty flags
-   apply-serial-props
-;

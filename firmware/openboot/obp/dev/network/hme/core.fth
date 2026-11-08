@@ -155,9 +155,17 @@ h# 2000.0000 constant tx-eop
    then
 ;
 
+\ With the tpe-link-test? option false, the link is taken to be up
+\ whatever the transceiver says (for hubs without link pulses).
+: link-test? ( -- flag )
+   " /options" find-package if
+      " tpe-link-test?" rot get-package-property if  true  then
+   else  true  then
+;
+
 : net-on ( -- link-up? )
    reset-hme drop  init-mac  init-rings  start-dma
-   setup-transceiver dup if  enable-mac  then
+   setup-transceiver  link-test? 0= or  dup if  enable-mac  then
 ;
 
 \ Sending: one frame at a time, from the transmit buffer; done when the

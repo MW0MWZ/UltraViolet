@@ -3,6 +3,8 @@
 // UltraSPARC IIi memory access: address translation through the I- and
 // D-MMU, the memory ASIs (including block, partial-store and short
 // floating-point ASIs), and the internal registers reached through ASIs.
+#include <bit>
+
 #include "core/log.h"
 #include "cpu/ultrasparc/ultrasparc.h"
 
@@ -21,7 +23,7 @@ constexpr unsigned kFtPrivilege = 0x01, kFtSideEffect = 0x02, kFtAtomicUncacheab
                    kFtNfo = 0x10, kFtVaRange = 0x20;
 
 // Context types in the SFSR.
-constexpr unsigned kCtPrimary = 0, kCtSecondary = 1, kCtNucleus = 2;
+constexpr unsigned kCtPrimary = 0, kCtSecondary = 1, kCtNucleus = 2, kCtPhysical = 3;
 
 // Virtual addresses are 44 bits, sign-extended: VA[63:43] must all be equal.
 inline bool va_in_range(u64 va) {
@@ -117,7 +119,7 @@ TlbEntry* UltraSparc::tlb_lookup(MmuRegs& mmu, u64 va, unsigned context) {
     const u64 page = va >> 13;
     SoftTlbEntry& s = soft_tlb_[&mmu == &dmmu_][soft_tlb_index(page)];
     if (s.gen == tlb_gen_ && s.va_page == page && s.context == context && s.epoch == s.entry->epoch) {
-        s.entry->used = true;
+        tlb_mark_used(mmu, *s.entry);
         return s.entry;
     }
     for (TlbEntry& e : mmu.tlb) {
@@ -125,8 +127,8 @@ TlbEntry* UltraSparc::tlb_lookup(MmuRegs& mmu, u64 va, unsigned context) {
         const unsigned shift = tte::page_shift(tte::size(e.data));
         if (((e.tag ^ va) >> shift) != 0) continue;
         if (!(e.data & tte::G) && (e.tag & 0x1FFF) != context) continue;
-        e.used = true;
         s = {page, context, tlb_gen_, e.epoch, &e};
+        tlb_mark_used(mmu, e);
         return &e;
     }
     return nullptr;
@@ -170,7 +172,7 @@ void UltraSparc::data_fault(unsigned trap, u64 va, u8 a, unsigned context_type, 
         const bool overwrite = dmmu_.sfsr & 1;
         dmmu_.sfsr = (u64{a} << 16) | (u64{ft} << 7) | (side_effect ? 0x40u : 0u) | (context_type << 4) |
                      ((pstate_ & pstate::PRIV) ? 8u : 0u) | (write ? 4u : 0u) | (overwrite ? 2u : 0u) | 1u;
-        sfar_ = va;
+        sfar_ = va & ((u64{1} << 44) - 1);  // (the D-MMU's SFAR holds 44 bits)
     }
     take_trap(trap);
 }
@@ -224,6 +226,12 @@ bool UltraSparc::translate_data(u64 va, u8 a, AccessKind kind, unsigned size, Ac
     const bool armed = watch_armed();
     if (a == asi::PHYS_USE_EC || a == asi::PHYS_BYPASS_EC_E || a == asi::PHYS_USE_EC_L ||
         a == asi::PHYS_BYPASS_EC_E_L) {
+        // (An address in the VA hole traps here too, the SFSR's context type 3,
+        // as Sun's POST expects.)
+        if (!va_in_range(va) && !(pstate_ & pstate::AM)) {
+            data_fault(tt::kDataAccessException, va, a, kCtPhysical, 0, kFtVaRange, write);
+            return false;
+        }
         out.pa = va & Bus::kAddressMask;
         out.side_effect = a == asi::PHYS_BYPASS_EC_E || a == asi::PHYS_BYPASS_EC_E_L;
         out.writable = true;
@@ -231,6 +239,7 @@ bool UltraSparc::translate_data(u64 va, u8 a, AccessKind kind, unsigned size, Ac
             take_trap(tt::kPaWatchpoint);
             return false;
         }
+        if (!out.side_effect) ecache_access(out.pa, write);
         return true;
     }
     unsigned context, ct;
@@ -362,8 +371,13 @@ bool UltraSparc::phys_read(const Access& acc, unsigned size, u64& value) {
         }
     }
     if (!ok) {
-        afar_ = acc.pa;
-        afsr_ |= u64{1} << 21;  // TO: time-out
+        // The AFSR (UltraSPARC IIi User's Manual, table 16-3): TO (27), the
+        // time-out, PRIV (31) for privileged code, ME (32) when it is a
+        // second time-out not yet cleared.
+        constexpr u64 kAfsrTo = u64{1} << 27, kAfsrPriv = u64{1} << 31, kAfsrMe = u64{1} << 32;
+        if (afsr_ & kAfsrTo) afsr_ |= kAfsrMe;
+        else afar_ = acc.pa;
+        afsr_ |= kAfsrTo | ((pstate_ & pstate::PRIV) ? kAfsrPriv : 0);
         take_trap(tt::kDataAccessError);
         return false;
     }
@@ -582,21 +596,73 @@ bool UltraSparc::partial_store(u64 va, u8 a, unsigned rd, u64 mask) {
     return true;
 }
 
+// A TLB entry's data as a Data Access read gives it (UltraSPARC IIi User's
+// Manual, 15.2): the Soft and Soft2 fields read as zero; the Diag field
+// holds the Used bit (41) and the entry's size, encoded 000 8K, 001 64K,
+// 011 512K, 111 4M, as the RAM's (44:42) and the CAM's (47:45).
+u64 UltraSparc::tlb_data_read(const TlbEntry& e) {
+    static constexpr u64 kSize[4] = {0, 1, 3, 7};
+    constexpr u64 kSoftAndDiag = 0x07FFFE0000000000ull | 0x1F80;  // Soft2 58:50, Diag 49:41, Soft 12:7
+    const u64 size = kSize[tte::size(e.data)];
+    return (e.data & ~kSoftAndDiag) | size << 45 | size << 42 | (e.used ? kTteUsed : 0);
+}
+
+// The E-cache's tag for a line that an access through the physical
+// cacheable ASIs (PHYS_USE_EC) brings in or writes, as the diagnostic
+// accesses read it (UltraSPARC IIi User's Manual, A.9.3): the tag PA<29:18>
+// in 11:0, the state in 15:14 (exclusive 10, modified 11), and odd parity
+// over the state and tag<13:8> (17) and tag<7:0> (16). (Other accesses
+// leave the tags as they were.)
+void UltraSparc::ecache_access(u64 pa, bool write) {
+    if (ecache_tag_.empty() || (pa >> 40) & 1) return;  // (I/O space is not cached)
+    u64& line = ecache_tag_[(pa & (opt_.ecache_bytes - 1)) >> 6];
+    const u64 tag = (pa >> 18) & 0xFFF;
+    u64 state = (line & 0xC000) >> 14;
+    if ((line & 0x3FFF) != tag || state == 0) state = 2;  // filled: exclusive
+    if (write) state = 3;                                  // modified
+    const auto odd = [](u64 bits) { return (std::popcount(bits) & 1) ? 0u : 1u; };
+    line = tag | state << 14 | u64{odd(state << 6 | (tag >> 8))} << 17 | u64{odd(tag & 0xFF)} << 16;
+}
+
 // The L1 caches' arrays as the diagnostic ASIs index them (UltraSPARC IIi
 // User's Manual, appendix A): the 16 KiB direct-mapped D-cache's data
 // (2048 doublewords, VA<13:3>) and tags (512 lines, VA<13:5>); the 16 KiB
-// two-way I-cache's instruction pairs and predecode bits (VA<13> the way,
-// <12:3> the pair) and its tags and LRU/next fields (VA<13> the way,
-// <12:5> the line). Each keeps the bits its format defines.
+// two-way I-cache's instruction pairs (VA<13> the way, <12:3> the pair),
+// its tags (VA<13:5>), its predecode bits and its branch prediction and
+// next fields (both a 128-bit instruction quad's, VA<13:4>). Each keeps
+// the bits its format defines.
 u64& UltraSparc::diag(u8 a, u64 va) {
     unsigned index;
     switch (a) {
         case asi::DCACHE_TAG:
-        case asi::ICACHE_TAG:
-        case asi::ICACHE_NEXT_FIELD: index = static_cast<unsigned>(va >> 5) & 0x1FF; break;
-        default: index = static_cast<unsigned>(va >> 3) & 0x7FF; break;  // data, instructions, predecode
+        case asi::ICACHE_TAG: index = static_cast<unsigned>(va >> 5) & 0x1FF; break;
+        case asi::ICACHE_PRE_DECODE:
+        case asi::ICACHE_NEXT_FIELD: index = static_cast<unsigned>(va >> 4) & 0x3FF; break;
+        default: index = static_cast<unsigned>(va >> 3) & 0x7FF; break;  // data, instructions
     }
     return diag_[(u64{a} << 56) | index];
+}
+
+// The I-cache's LRU bit: one for each line (VA<12:5>), whichever way and
+// half of it the access names; written only through way 0's address.
+u64& UltraSparc::icache_lru(u64 va) {
+    return diag_[(u64{asi::ICACHE_NEXT_FIELD} << 56) | (u64{1} << 55) | ((va >> 5) & 0xFF)];
+}
+
+// A diagnostic load: the predecode fields of the instruction pair VA<3>
+// names (stored as the quad's four, 4 bits each, pair 0's in 15:8), the
+// next field with its line's LRU bit (24), or the array's entry.
+u64 UltraSparc::diag_read(u8 a, u64 va) {
+    switch (a) {
+        case asi::ICACHE_PRE_DECODE: return (diag(a, va) >> ((va & 8) ? 0 : 8)) & 0xFF;
+        case asi::ICACHE_NEXT_FIELD: return (diag(a, va) & ~kIcacheLru) | (icache_lru(va) & kIcacheLru);
+        default: return diag(a, va);
+    }
+}
+
+void UltraSparc::diag_write(u8 a, u64 va, u64 value) {
+    diag(a, va) = value & diag_mask(a) & ~(a == asi::ICACHE_NEXT_FIELD ? kIcacheLru : 0);
+    if (a == asi::ICACHE_NEXT_FIELD && !(va & 0x2000)) icache_lru(va) = value & kIcacheLru;
 }
 
 u64 UltraSparc::diag_mask(u8 a) {
@@ -634,13 +700,6 @@ void UltraSparc::tlb_data_in(MmuRegs& mmu, u64 data) {
             }
     }
     if (!slot) {
-        // Every entry used: clear the used bits, and the fast translations
-        // made from the entries (hits through those do not set the bits
-        // again; soft TLB hits do).
-        for (TlbEntry& e : mmu.tlb)
-            if (!(e.data & tte::L)) e.used = false;
-        if (&mmu == &dmmu_) flush_fast_translations(kFastData, false);
-        else flush_fast_translations(0, true);
         for (TlbEntry& e : mmu.tlb)
             if (!(e.data & tte::L)) {
                 slot = &e;
@@ -653,6 +712,26 @@ void UltraSparc::tlb_data_in(MmuRegs& mmu, u64 data) {
     slot->data = data;
     slot->used = false;
     attention_ = true;
+}
+
+// The Used bits (UltraSPARC IIi User's Manual, 15.11.2): set when an entry
+// translates; and when no entry is freely available (every entry valid,
+// and each locked or used), a "uclear" clears them all, locked entries'
+// too, in whatever cycle that comes about. (The fast translations made from
+// the entries go with it: hits through those do not set the bits again;
+// soft TLB hits do.)
+void UltraSparc::tlb_mark_used(MmuRegs& mmu, TlbEntry& e) {
+    if (e.used) return;
+    e.used = true;
+    tlb_check_uclear(mmu);
+}
+
+void UltraSparc::tlb_check_uclear(MmuRegs& mmu) {
+    for (const TlbEntry& e : mmu.tlb)
+        if (!(e.data & tte::V) || (!(e.data & tte::L) && !e.used)) return;
+    for (TlbEntry& e : mmu.tlb) e.used = false;
+    if (&mmu == &dmmu_) flush_fast_translations(kFastData, false);
+    else flush_fast_translations(0, true);
 }
 
 void UltraSparc::forget_translations(MmuRegs& mmu, TlbEntry& e) {
@@ -807,8 +886,8 @@ bool UltraSparc::internal_asi_read(u8 a, u64 va, unsigned size, u64& value) {
         case asi::DMMU_TSB_8K_PTR: value = tsb_pointer(dmmu_, false); return true;
         case asi::DMMU_TSB_64K_PTR: value = tsb_pointer(dmmu_, true); return true;
         case asi::DMMU_TSB_DIRECT_PTR: value = tsb_pointer(dmmu_, direct_64k_); return true;
-        case asi::ITLB_DATA_ACCESS: value = immu_.tlb[(va >> 3) & 63].data; return true;
-        case asi::DTLB_DATA_ACCESS: value = dmmu_.tlb[(va >> 3) & 63].data; return true;
+        case asi::ITLB_DATA_ACCESS: value = tlb_data_read(immu_.tlb[(va >> 3) & 63]); return true;
+        case asi::DTLB_DATA_ACCESS: value = tlb_data_read(dmmu_.tlb[(va >> 3) & 63]); return true;
         case asi::ITLB_TAG_READ: value = immu_.tlb[(va >> 3) & 63].tag; return true;
         case asi::DTLB_TAG_READ: value = dmmu_.tlb[(va >> 3) & 63].tag; return true;
         case asi::ECACHE_TAG_DATA: value = ecache_tag_data_; return true;
@@ -830,7 +909,7 @@ bool UltraSparc::internal_asi_read(u8 a, u64 va, unsigned size, u64& value) {
         case asi::ICACHE_INSTR:
         case asi::ICACHE_TAG:
         case asi::ICACHE_PRE_DECODE:
-        case asi::ICACHE_NEXT_FIELD: value = diag(a, va); return true;
+        case asi::ICACHE_NEXT_FIELD: value = diag_read(a, va); return true;
         default: break;
     }
     if (asi_hook && asi_hook(a, va, size, false, value)) return true;
@@ -877,7 +956,8 @@ bool UltraSparc::internal_asi_write(u8 a, u64 va, unsigned size, u64 value) {
             if (e.data & tte::V) forget_translations(m, e);  // (what was made from the entry it replaces)
             e.tag = m.tag_access;
             e.data = value;
-            e.used = false;
+            e.used = value & kTteUsed;  // (Diag<0>, writable through Data Access)
+            tlb_check_uclear(m);
             return true;
         }
         case asi::IMMU_DEMAP: tlb_demap(immu_, va); return true;
@@ -897,7 +977,7 @@ bool UltraSparc::internal_asi_write(u8 a, u64 va, unsigned size, u64 value) {
         case asi::ICACHE_INSTR:
         case asi::ICACHE_TAG:
         case asi::ICACHE_PRE_DECODE:
-        case asi::ICACHE_NEXT_FIELD: diag(a, va) = value & diag_mask(a); return true;
+        case asi::ICACHE_NEXT_FIELD: diag_write(a, va, value); return true;
         default: break;
     }
     if (asi_hook && asi_hook(a, va, size, true, value)) return true;

@@ -1,0 +1,226 @@
+\ Copyright (C) 2026 Andy Taylor. Distributed under the same terms as the
+\ OpenBoot release it is part of (see LICENSE).
+id: @(#)fdthree.tok 1.0 26/11/07
+purpose: The SuperIO's floppy disk controller (an 82077) and drive: fdthree
+copyright: Copyright 2026 Andy Taylor
+
+\ The controller runs as a PC's does (PC-AT mode). Its transfers are made
+\ here without DMA (its non-DMA mode: the data through its FIFO a byte at
+\ a time), of the 512-byte sectors of a 3.5" 1.44 MB disk (80 cylinders, 2
+\ heads, 18 sectors a track). The Ultra 5/10's drive ejects by hand. With
+\ no drive answering, the node's status is "disabled", and the selftest,
+\ open and boot say so as the machine's own firmware does.
+
+Fcode-version3
+
+headerless
+
+-1 value fdc				\ the controller's registers, while mapped
+: fdc-map ( -- )
+   fdc -1 = if  h# 3023f0 h# 14 8 " map-in" $call-parent to fdc  then
+;
+: fdc-unmap ( -- )
+   fdc -1 <> if  fdc 8 " map-out" $call-parent  -1 to fdc  then
+;
+
+: dor! ( b -- )  fdc 2+ rb!  ;
+: msr@ ( -- b )  fdc 4 + rb@  ;
+: fifo@ ( -- b )  fdc 5 + rb@  ;
+: fifo! ( b -- )  fdc 5 + rb!  ;
+: ccr! ( b -- )  fdc 7 + rb!  ;
+
+h# 80 constant rqm			\ main status: ready for a byte
+h# 20 constant ndm			\ in a non-DMA execution phase
+
+: timed-out? ( when -- flag )  get-msecs - 0<  ;
+: wait-rqm ( -- ok? )
+   get-msecs d# 1000 +  begin
+      msr@ rqm and if  drop true exit  then
+      dup timed-out?
+   until  drop false
+;
+: cmd! ( b -- )  wait-rqm drop  fifo!  ;
+
+\ A command's results: ST0 to ST2 and the sector's address, as many as it
+\ gives
+7 buffer: st
+: results ( n -- )  0 ?do  wait-rqm drop  fifo@ st i + c!  loop  ;
+: st0 ( -- b )  st c@  ;
+
+\ Reset: drive 0 selected, its motor off; the four drives' interrupts
+\ sensed; the step rate, head times and non-DMA mode; 500 kbit/s.
+0 value motor?
+: fdc-reset ( -- )
+   0 dor!  1 ms  h# 0c dor!  false to motor?  d# 10 ms
+   4 0 do  8 cmd! 2 results  loop
+   3 cmd!  h# df cmd!  3 cmd!
+   0 ccr!
+;
+: motor-on ( -- )  motor? 0= if  h# 1c dor!  d# 500 ms  true to motor?  then  ;
+: motor-off ( -- )  h# 0c dor!  false to motor?  ;
+
+\ A seek's end: once the controller and drive are no longer busy, its
+\ interrupt sensed (ST0, or 80 if there was none).
+: sense ( -- st0 )  8 cmd!  2 results  st0  ;
+: wait-seek ( -- st0 )
+   get-msecs d# 3000 +  begin
+      msr@ h# 11 and 0= if
+         sense dup h# 80 <> if  nip exit  then  drop
+      then
+      1 ms  dup timed-out?
+   until  drop h# 80
+;
+: seek-ok? ( st0 -- ok? )  h# f0 and h# 20 =  ;
+\ (Twice: a drive more than 79 steps out reaches track 0 the second time.)
+: recalibrate ( -- ok? )
+   7 cmd! 0 cmd!  wait-seek seek-ok?  dup 0= if
+      drop  7 cmd! 0 cmd!  wait-seek seek-ok?
+   then
+;
+: seek-to ( cyl head -- ok? )
+   h# f cmd!  2 lshift cmd!  dup cmd!  wait-seek seek-ok?	( cyl ok? )
+   swap st 1+ c@ = and
+;
+
+d# 512 constant /sector
+d# 18 constant #sectors
+2 constant #heads
+d# 80 constant #cylinders
+
+: chs ( block# -- sector0 head cyl )  #sectors /mod  #heads /mod  ;
+
+\ A sector's read or write command: the seek, then the command and its
+\ eight bytes (the sector's address, 512 bytes, the track's end at it).
+: sector-cmd ( block# cmd -- ok? )
+   >r chs					( sector0 head cyl )
+   2dup swap seek-to 0= if  3drop r> drop false exit  then
+   r> cmd!  over 2 lshift cmd!  cmd! cmd!	( sector0 )
+   1+ dup cmd!  2 cmd!  cmd!  h# 1b cmd!  h# ff cmd!
+   true
+;
+
+\ The execution phase: a byte each time the controller asks, while it is
+\ in the phase.
+: data-ready? ( -- flag )
+   wait-rqm  msr@ ndm and 0<>  and
+;
+: pio-read ( adr -- )
+   /sector 0 do  data-ready? 0= if  leave  then  fifo@ over i + c!  loop  drop
+;
+: pio-write ( adr -- )
+   /sector 0 do  data-ready? 0= if  leave  then  dup i + c@ fifo!  loop  drop
+;
+\ Done: a normal end, or the end of the track reached (no terminal count
+\ ends a non-DMA transfer) with no other error.
+: sector-ok? ( -- ok? )
+   st0 h# c0 and  ?dup 0= if  true exit  then
+   h# 40 =  st 1+ c@ h# 80 = and  st 2+ c@ 0= and
+;
+: read-sector ( adr block# -- ok? )
+   h# 46 sector-cmd if  pio-read 7 results sector-ok?  else  drop false  then
+;
+: write-sector ( adr block# -- ok? )
+   h# 45 sector-cmd if  pio-write 7 results sector-ok?  else  drop false  then
+;
+
+0 instance value rw-xt
+\ (Each sector tried up to three times.)
+: rw-sector ( adr block# -- ok? )
+   3 0 do  2dup rw-xt execute if  2drop true unloop exit  then  loop
+   2drop false
+;
+: r/w-blocks ( adr block# #blocks -- #done )
+   motor-on
+   dup 0 ?do					( adr block# #blocks )
+      2 pick i /sector * +  2 pick i +  rw-sector 0= if
+         drop i leave
+      then
+   loop  nip nip
+;
+
+: .recalibrate-failed ( -- )
+   ." Recalibrate failed.  The floppy drive is either missing," cr
+   ." improperly connected, or defective." cr
+;
+
+\ At the probe: no drive answering, the node disabled.
+: floppy-probe ( -- )
+   fdc-map fdc-reset  recalibrate  motor-off fdc-unmap
+   0= if  " disabled" encode-string " status" property  then
+;
+floppy-probe
+
+0 instance value label-package
+0 instance value deblocker
+0 instance value offset-low
+0 instance value offset-high
+
+: init-deblocker ( -- ok? )
+   " " " deblocker" $open-package dup to deblocker  0<>
+;
+: init-label-package ( -- ok? )
+   0 to offset-high  0 to offset-low
+   my-args " disk-label" $open-package dup to label-package  if
+      0 0 " offset" label-package $call-method  to offset-high to offset-low
+      true
+   else  false  then
+;
+
+: fdc-off ( -- )  fdc -1 <> if  motor-off fdc-unmap  then  ;
+
+external
+
+: dma-alloc ( n -- adr )  alloc-mem  ;
+: dma-free ( adr n -- )  free-mem  ;
+: block-size ( -- n )  /sector  ;
+: max-transfer ( -- n )  /sector #sectors *  ;
+: #blocks ( -- n )  #sectors #heads * #cylinders *  ;
+
+: read-blocks ( adr block# #blocks -- #read )
+   ['] read-sector to rw-xt  r/w-blocks
+;
+: write-blocks ( adr block# #blocks -- #written )
+   ['] write-sector to rw-xt  r/w-blocks
+;
+
+: close ( -- )
+   label-package ?dup if  close-package  0 to label-package  then
+   deblocker ?dup if  close-package  0 to deblocker  then
+   fdc-off
+;
+
+: open ( -- ok? )
+   fdc-map fdc-reset
+   recalibrate 0= if  .recalibrate-failed cr  fdc-off false exit  then
+   init-deblocker 0= if  close false exit  then
+   init-label-package 0= if  close false exit  then
+   true
+;
+
+: seek ( offset.low offset.high -- ok? )
+   offset-low offset-high d+  " seek" deblocker $call-method
+;
+: read ( adr len -- actual )  " read" deblocker $call-method  ;
+: write ( adr len -- actual )  " write" deblocker $call-method  ;
+: load ( adr -- size )  " load" label-package $call-method  ;
+
+: eject ( -- )  ." Press the EJECT button now" cr  ;
+
+: reset ( -- )  fdc-off  ;
+
+\ The selftest: the drive found (recalibrated), and the disk's first
+\ sector read.
+: selftest ( -- 0 | -1 )
+   ." Testing floppy disk system.  A formatted disk should be in the drive." cr
+   fdc-map fdc-reset
+   recalibrate if
+      motor-on
+      /sector alloc-mem  dup 0 read-sector  swap /sector free-mem
+      if  0  else  ." Read failed.  The disk is unformatted or defective." cr -1  then
+   else
+      .recalibrate-failed -1
+   then
+   fdc-off
+;
+
+end0

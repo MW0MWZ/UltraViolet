@@ -220,6 +220,7 @@ public:
     // current context: no traps, no TLB state changes.
     bool debug_translate(u64 va, bool data, u64& pa) const;
     const MmuRegs& dmmu() const { return dmmu_; }
+    u64 sfar() const { return sfar_; }
 
     // Interrupt vector delivery (from the PCI bus module): sets the receive
     // busy bit and the three data words, if the receive register is free.
@@ -672,9 +673,9 @@ private:
             case asi::SL: return priv ? 3 : 4;
             case asi::AIUS:
             case asi::AIUSL: return priv ? 4 : -1;
-            case asi::PHYS_USE_EC:
+            // (The cacheable physical ASIs' accesses go the slow way: they
+            // keep the E-cache tags, ecache_access.)
             case asi::PHYS_BYPASS_EC_E:
-            case asi::PHYS_USE_EC_L:
             case asi::PHYS_BYPASS_EC_E_L: return priv ? 5 : -1;
             case asi::NQUAD_LDD:
             case asi::NQUAD_LDD_L: return priv ? 2 : -1;  // (the quad loads, as N)
@@ -797,6 +798,15 @@ private:
     bool direct_64k_ = false;  // the last fast_data_access_protection was on a 64 KiB page
     std::unordered_map<u64, u64> diag_;  // L1 cache tag/data arrays seen through the diagnostic ASIs, by ASI and address
     u64& diag(u8 asi, u64 va);
+    u64& icache_lru(u64 va);
+    void ecache_access(u64 pa, bool write);
+    static u64 tlb_data_read(const TlbEntry& e);
+    void tlb_mark_used(MmuRegs& mmu, TlbEntry& e);
+    void tlb_check_uclear(MmuRegs& mmu);
+    static constexpr u64 kTteUsed = u64{1} << 41;
+    u64 diag_read(u8 asi, u64 va);
+    void diag_write(u8 asi, u64 va, u64 value);
+    static constexpr u64 kIcacheLru = u64{1} << 24;
     static u64 diag_mask(u8 asi);
     // UPA_CONFIG: only ELIM (35:33, the E-cache size limit) is implemented.
     static constexpr u64 kUpaConfigElim = 7ull << 33;

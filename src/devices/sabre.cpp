@@ -16,7 +16,8 @@ namespace {
 constexpr u32 kUpaPortId = 0x0000;
 constexpr u32 kUeAfsr = 0x0030, kUeceAfar = 0x0038, kCeAfsr = 0x0040, kUeceAfarAlias = 0x0048;
 constexpr u32 kIommuCtl = 0x0200, kIommuTsb = 0x0208, kIommuFlush = 0x0210;
-constexpr u32 kPciImap = 0x0C00, kObioImap = 0x1000, kPciIclr = 0x1400, kObioIclr = 0x1800;
+constexpr u32 kPciImap = 0x0C00, kObioImap = 0x1000, kPciIclr = 0x1400, kObioIclr = 0x1800, kIntStateDiag = 0xA800;
+constexpr u32 kIommuVaDiag = 0xA400, kIommuTagCompare = 0xA408, kIommuTagDiag = 0xA580, kIommuDataDiag = 0xA600;
 constexpr u32 kWriteSync = 0x1C20;
 // Reserved in the IIi manual (where the Psycho has its interrupt retry timer
 // and timer/counters): a real Ultra 10 reads 0x7C0 at each, and takes writes
@@ -113,8 +114,9 @@ private:
 class Sabre::HostFunction final : public pci::Function {
 public:
     HostFunction() : pci::Function(0x108E, 0xA000, 0x00, 0x060000) {
-        set_cfg16(pci::kCommand, pci::kCmdMemory | pci::kCmdMaster);
-        set_cfg16(pci::kStatus, 0x0280);  // fast back-to-back, medium DEVSEL
+        set_cfg16(pci::kCommand, pci::kCmdMemory | pci::kCmdMaster);  // (hardwired on)
+        set_wmask(pci::kCommand, 2, 0x0140);                           // SERR_EN and PER only
+        set_cfg16(pci::kStatus, 0x02A0);  // medium DEVSEL, fast back-to-back, 66 MHz capable
         set_wmask(0x40, 2, 0xFFFF);       // bus number and subordinate bus number
         save_reset_state();
     }
@@ -224,6 +226,15 @@ void Sabre::dispatch_pulse(unsigned which) {
     }
 }
 
+// Whether IOMMU TLB entry n's tag (as its diagnostic access holds it)
+// matches a VA<31:13> (VA<31:16> for a 64K entry).
+bool Sabre::iommu_tag_matches(unsigned n, u64 vpn) const {
+    const auto t = regs_.find(kIommuTagDiag + 8 * n);
+    const u64 tag = t == regs_.end() ? 0 : t->second;
+    const u64 mask = (tag & (1u << 19)) ? 0x7FFF8 : 0x7FFFF;
+    return ((tag ^ vpn) & mask) == 0;
+}
+
 u64 Sabre::reg(u32 o) const {
     switch (o) {
         case kUpaPortId: return kUpaPortIdValue;
@@ -249,6 +260,30 @@ u64 Sabre::reg(u32 o) const {
     if (o >= kObioImap && o < kObioImap + 0x100) return obio_imap_[((o - kObioImap) >> 3) & 31];
     if (o == kGfxImapAlias) return obio_imap_[(kGfxImap - kObioImap) >> 3];
     if (o == kUpaImapAlias) return obio_imap_[(kUpaImap - kObioImap) >> 3];
+    // The IOMMU's tag comparator (IIi manual 19.3.2.6-7): bit n set when
+    // tag n (A580 + 8n) matches the virtual address diagnostic register's
+    // VA<31:13> (VA<31:16> for a 64K entry).
+    if (o == kIommuVaDiag) {
+        const auto it = regs_.find(o);
+        return it == regs_.end() ? 0 : it->second & 0xFFFFE000ull;
+    }
+    if (o == kIommuTagCompare) {
+        const auto va = regs_.find(kIommuVaDiag);
+        const u64 vpn = va == regs_.end() ? 0 : (va->second >> 13) & 0x7FFFF;
+        u64 hits = 0;
+        for (unsigned i = 0; i < 16; ++i)
+            if (iommu_tag_matches(i, vpn)) hits |= u64{1} << i;
+        return hits;
+    }
+    // The interrupt state diagnostic registers: each level interrupt's state
+    // machine, two bits an INO (IIi manual 19.3.3.4): PCI's 00-1F at A800,
+    // the others' 20-3F at A808.
+    if (o == kIntStateDiag || o == kIntStateDiag + 8) {
+        const unsigned first = o == kIntStateDiag ? 0 : 0x20;
+        u64 v = 0;
+        for (unsigned i = 0; i < 0x20; ++i) v |= u64{state_[first + i] & 3u} << (2 * i);
+        return v;
+    }
     if (o >= kPciIclr && o < kPciIclr + 0x100) return state_[((o - kPciIclr) >> 3) & 0x1F];
     if (o >= kObioIclr && o < kObioIclr + 0x100) return state_[0x20 + (((o - kObioIclr) >> 3) & 0x1F)];
     if (o == kReservedAt1A00 || (o >= kReservedTimers && o < kReservedTimers + 0x20)) return kReservedValue;
@@ -274,11 +309,23 @@ bool Sabre::regs_write(u64 offset, unsigned size, u64 value) {
     }
     switch (o) {
         case kUpaPortId: return true;
-        case kIommuCtl: iommu_ctl_ = v & 0x07F70007ull; return true;
+        // (ERR and ERRSTS, 26:24, cleared by writing 1; the rest as written)
+        case kIommuCtl: iommu_ctl_ = (iommu_ctl_ & ~v & 0x07000000ull) | (v & 0x00FF0007ull); return true;
         case kIommuTsb: iommu_tsb_ = v & 0x1FFFFFFE000ull; return true;
-        case kIommuFlush: return true;  // translations are not cached
+        // (DMA translations are not cached here; what the diagnostic accesses
+        // see of the IOMMU's TLB is: a flush invalidates each entry whose tag
+        // matches the address, IIi manual 19.3.2.3.)
+        case kIommuFlush:
+            for (unsigned i = 0; i < 16; ++i)
+                if (iommu_tag_matches(i, (v >> 13) & 0x7FFFF)) {
+                    const auto d = regs_.find(kIommuDataDiag + 8 * i);
+                    if (d != regs_.end()) d->second &= ~(u64{1} << 30);  // V
+                }
+            return true;
         case kPciCtl:
-            pci_ctl_ = (v & ~(1ull << 34)) | (pci_ctl_ & (1ull << 34) & ~v);  // SERR is W1C
+            // (the fields table 19-2 gives: MRLM_EN 36, ARB_PARK, priorities 21:16,
+            // ERRINT_EN 8, RETRY_WAIT_EN 7, ARB_EN 3:0; SERR, 34, W1C; the rest 0)
+            pci_ctl_ = (v & ((1ull << 36) | 0x3F0000u | 0x18Fu)) | (pci_ctl_ & (1ull << 34) & ~v);
             update_error_interrupts();
             return true;
         case kPciAfsr:

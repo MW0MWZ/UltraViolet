@@ -116,3 +116,15 @@ stand-init: Attach the NVRAM and IDPROM
    install-nvram
    ['] init-idprom catch drop
 ;
+
+\ Each power-on counted, as OpenBoot 3.x counts them.
+stand-init: Count the power cycles
+   power-on-reset?  if  #power-cycles 1+ to #power-cycles  then
+;
+
+\ After a watchdog reset or a RED state exception OpenBoot boots only
+\ with watchdog-reboot? true; otherwise it stops at the ok prompt.
+: error-reset? ( -- flag )  reset-kind @  dup 1 =  swap 4 =  or  ;
+chain: don't-boot? ( flag -- flag' )
+   error-reset? watchdog-reboot? 0= and or
+;

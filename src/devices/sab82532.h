@@ -74,7 +74,13 @@ private:
     // An interrupt status register's readable bits: all of them with IPC:VIS
     // set, else only the unmasked ones.
     u8 visible(u8 status, u8 mask) const;
-    u8 ipc_ = 0, iva_ = 0, pvr_ = 0, pim_ = 0xFF, pcr_ = 0, pis_ = 0;
+    u8 ipc_ = 0, iva_ = 0, pvr_ = 0, pim_ = 0xFF, pcr_ = 0xFF, pis_ = 0;
+    // The levels the board gives the universal port's pins when they are
+    // inputs: high (the modem lines' RS-232 receivers idle high, the
+    // signals active low; pin 1 high as Sun's POST checks), but for pin 6,
+    // which tells OpenBoot the DIMMs' speed: low for 50 ns (high reads as
+    // 60 ns, as OpenBoot 3.31 shows in its banner).
+    static constexpr u8 kPortInputs = 0xBF;
 };
 
 }  // namespace uv
