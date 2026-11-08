@@ -702,6 +702,71 @@ TEST(sabre_reserved_registers_read_as_a_real_ultra_10_does) {
     }
 }
 
+// The IOMMU control register: ERR and ERRSTS (26:24) cleared by writing 1,
+// never set by a write; the lock, TSB size and enables as written; the
+// reserved bits 0 (IIi manual, table 19-20).
+TEST(sabre_iommu_control_error_bits_clear_on_one) {
+    Ultra5_10 m(small_options());
+    auto& b = m.bus();
+    u64 v = 0;
+    CHECK(b.write(Sabre::kRegsBase + 0x200, u64{0xFFFFFFFFFFFFFFFFull}));
+    CHECK(b.read(Sabre::kRegsBase + 0x200, v));
+    CHECK_EQ(v, 0x00FF0007u);
+    CHECK(b.write(Sabre::kRegsBase + 0x200, u64{0}));
+    CHECK(b.read(Sabre::kRegsBase + 0x200, v));
+    CHECK_EQ(v, 0u);
+}
+
+// A clear register sets its interrupt's state; the state diagnostic
+// registers show each, two bits an INO (PCI's at A800, OBIO's at A808).
+TEST(sabre_interrupt_state_diagnostic_registers_show_the_states) {
+    Ultra5_10 m(small_options());
+    auto& b = m.bus();
+    u64 v = 0;
+    CHECK(b.write(Sabre::kRegsBase + 0x1400 + (1 << 3), u64{1}));   // INO 01: received
+    CHECK(b.write(Sabre::kRegsBase + 0x1800 + (2 << 3), u64{3}));   // INO 22: pending
+    CHECK(b.read(Sabre::kRegsBase + 0xA800, v));
+    CHECK_EQ(v, 0x4u);
+    CHECK(b.read(Sabre::kRegsBase + 0xA808, v));
+    CHECK_EQ(v, 0x30u);
+}
+
+// The IOMMU TLB as its diagnostic accesses show it: the tag comparator
+// marks the entries whose tag matches the VA diagnostic register (a 64K
+// entry ignoring VA<15:13>), and a flush clears the matching entries' V.
+TEST(sabre_iommu_tlb_compare_and_flush) {
+    Ultra5_10 m(small_options());
+    auto& b = m.bus();
+    const u64 r = Sabre::kRegsBase;
+    u64 v = 0;
+    CHECK(b.write(r + 0xA580, u64{0x12345}));               // entry 0: 8K, VPN 12345
+    CHECK(b.write(r + 0xA588, u64{(1u << 19) | 0x12340}));  // entry 1: 64K
+    CHECK(b.write(r + 0xA600, u64{0x50000000}));            // valid, used... entry 0
+    CHECK(b.write(r + 0xA608, u64{0x50000000}));
+    CHECK(b.write(r + 0xA400, u64{0x12345} << 13));
+    CHECK(b.read(r + 0xA408, v));
+    CHECK_EQ(v, 0x3u);
+    CHECK(b.write(r + 0xA400, u64{0x12346} << 13));
+    CHECK(b.read(r + 0xA408, v));
+    CHECK_EQ(v, 0x2u);
+    CHECK(b.write(r + 0x210, u64{0x12345} << 13));
+    CHECK(b.read(r + 0xA600, v));
+    CHECK_EQ(v, 0x10000000u);
+    CHECK(b.read(r + 0xA608, v));
+    CHECK_EQ(v, 0x10000000u);
+}
+
+// The PCI control/status register keeps only its fields (IIi manual,
+// table 19-2): all ones written read as the writable bits.
+TEST(sabre_pci_control_register_keeps_its_fields) {
+    Ultra5_10 m(small_options());
+    auto& b = m.bus();
+    u64 v = 0;
+    CHECK(b.write(Sabre::kRegsBase + 0x2000, u64{0xFFFFFFFBFFFFFFFFull}));  // (SERR, W1C, left alone)
+    CHECK(b.read(Sabre::kRegsBase + 0x2000, v));
+    CHECK_EQ(v, 0x10003F018Full);
+}
+
 // The memory controller's registers: their power-on values (IIi manual),
 // FFB_Config's fixed Oneread, 0xF008 as a real Ultra 10 reads it, the writable
 // bits; a SOFT_POR (OpenBoot's reset-all) leaves Mem_Control0/1 alone and
@@ -988,6 +1053,25 @@ TEST(ns16550_receive_interrupt_follows_the_fifo_trigger_and_timeout) {
     feed("12345678");  // the trigger level: at once
     CHECK(irq);
     CHECK_EQ(rd(2) & 0x0F, 0x04u);
+}
+
+TEST(sab82532_port_pins_read_their_levels_and_keep_only_outputs) {
+    // After reset every pin is an input (PCR FF), read at the board's
+    // level (high but for pin 6, the DIMM speed: 50 ns); a write reaches
+    // only the pins made outputs.
+    Scheduler s;
+    SerialLine a, b;
+    Sab82532 se(s, a, b, Sab82532::kClockHz / 16.0);
+    u64 v = 0;
+    se.read(0x3E, 1, v);
+    CHECK_EQ(v, 0xFFu);  // PCR
+    se.write(0x3C, 1, 0x00);
+    se.read(0x3C, 1, v);
+    CHECK_EQ(v, 0xBFu);  // PVR: inputs, the write ignored
+    se.write(0x3E, 1, 0xFC);  // P0 and P1 outputs
+    se.write(0x3C, 1, 0x01);
+    se.read(0x3C, 1, v);
+    CHECK_EQ(v, 0xBDu);  // P0 high and P1 low as written; the inputs as the board has them
 }
 
 TEST(sab82532_transmit_fifo_fills_in_order_at_any_address) {

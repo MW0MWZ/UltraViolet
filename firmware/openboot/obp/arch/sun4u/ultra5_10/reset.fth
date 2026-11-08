@@ -22,7 +22,8 @@ copyright: Copyright 2026 Andy Taylor
 \   5. Locked TLB entries: 0 to 0 (this code), monvirtbase to membase (4 MiB,
 \      the image), RAMbase to membase + 2 MiB - 64 KiB (64 KiB); the MMUs
 \      and caches on; the image entered at its power-on entry (ROMbase +
-\      30) with %i0 = membase, %i1 = 8 MiB.
+\      30) with %i0 = membase, %i1 = 8 MiB, %i2 = the reset (0 power-on,
+\      1 watchdog, 2 XIR, 3 SIR, 4 RED state; kept in %y until then).
 \ The other resets (watchdog, XIR, SIR, RED) say which they were and start
 \ again as from power-on.
 
@@ -229,9 +230,10 @@ label continue-low
    %o0  %g0  %g0  h# 45		stxa
    #Sync			membar
 
-   \ Into the image: %i0 = membase, %i1 = its size.
+   \ Into the image: %i0 = membase, %i1 = its size, %i2 = the reset.
    %l0			%i0	move
    8meg			%i1	set
+   %i2				rdy
    ROMbase		%o0	set
    %o0 h# 30		%g0	jmpl
    nop
@@ -326,11 +328,11 @@ end-code
 \ Where the reset vectors branch to.
 label reset-entries
 h# 20 .align
-0 L:  power-on-reset always brif annul nop
-1 L:  init-reset-pci call nop  init-reset-ttya call nop  print" "r"nWatchdog Reset"r"n"  other-reset always brif annul nop
-2 L:  init-reset-pci call nop  init-reset-ttya call nop  print" "r"nExternally Initiated Reset"r"n"  other-reset always brif annul nop
-3 L:  init-reset-pci call nop  init-reset-ttya call nop  print" "r"nSoftware Initiated Reset"r"n"  other-reset always brif annul nop
-4 L:  init-reset-pci call nop  init-reset-ttya call nop  print" "r"nRED State Exception"r"n"  other-reset always brif annul nop
+0 L:  %g0 0 wry  power-on-reset always brif annul nop
+1 L:  %g0 1 wry  init-reset-pci call nop  init-reset-ttya call nop  print" "r"nWatchdog Reset"r"n"  other-reset always brif annul nop
+2 L:  %g0 2 wry  init-reset-pci call nop  init-reset-ttya call nop  print" "r"nExternally Initiated Reset"r"n"  other-reset always brif annul nop
+3 L:  %g0 3 wry  init-reset-pci call nop  init-reset-ttya call nop  print" "r"nSoftware Initiated Reset"r"n"  other-reset always brif annul nop
+4 L:  %g0 4 wry  init-reset-pci call nop  init-reset-ttya call nop  print" "r"nRED State Exception"r"n"  other-reset always brif annul nop
 end-code
 
 end-obj

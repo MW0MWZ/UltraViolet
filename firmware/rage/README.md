@@ -15,7 +15,9 @@ shows, brings the chip up from cold (its bus interface, memory controller,
 DAC and clock synthesiser, and its memory sized), reads the monitor's
 EDID, sets the chip up in any of its video modes, and gives OpenBoot its
 console through IEEE 1275's display interface in the 8-bit frame buffer,
-with its own colour logo.
+with its own colour logo. Back in OpenBoot from a client (Solaris halted,
+or stopped from its window system) it sets the console's mode, palette and
+DAC again, so the console shows whatever state the window system left.
 
 It is written from the chip's open documentation: the register
 definitions of X.Org's mach64 driver and Linux's `atyfb`, and the chip as

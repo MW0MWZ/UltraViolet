@@ -110,6 +110,7 @@ copyright: Copyright 2026 Andy Taylor
       " address" property
       1 interrupts-property
       " manual" boolean-property
+      " ebus-fdthree" builtin-driver
    finish-device
 ;
 
@@ -121,6 +122,7 @@ copyright: Copyright 2026 Andy Taylor
       " mk48t59" model
       0 0 encode-bytes  0 h# 2000 reg+  " reg" property
       0 0 encode-bytes  0 h# 2000 va+  " address" property
+      " ebus-eeprom" builtin-driver
    finish-device
 ;
 

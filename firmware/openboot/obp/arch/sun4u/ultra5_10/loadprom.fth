@@ -165,12 +165,13 @@ fload ${BP}/arch/sun4u/ultra5_10/probeall.fth
 fload ${BP}/dev/scsi/probescsi.fth      \ probe-scsi
 fload ${BP}/pkg/inet/watchnet.fth	\ watch-net
 fload ${BP}/dev/ide/probe.fth		\ probe-ide
+fload ${BP}/arch/sun4u/ultra5_10/diag.fth	\ .speed, probe-pci, ...
 
 fload builtin.fth
 
+fload ${BP}/arch/sun4u/ultra5_10/post.fth	\ system-tests, show-post-results
+
 true value system-test-ok?
-alias post-ok? true
-alias system-tests noop
 
 fload ${BP}/arch/sun4u/startup.fth \ S misc. startup stuff
 

@@ -135,6 +135,40 @@ TEST(fpu_square_roots_of_negatives_are_invalid_and_of_minus_zero_are_minus_zero)
     CHECK_EQ(r.cpu.freg32(3), fs(42.0f));
 }
 
+TEST(fpu_square_root_and_fdtos_trap_as_suns_post_expects) {
+    // With every trap enabled: the square root of a positive number is
+    // unfinished (inexact predicted), of a negative one invalid; FdTOs of
+    // the smallest normal double (far below the single range) unfinished.
+    constexpr u64 kTemAll = u64{0x1F} << 23;
+    Rig r;
+    r.cpu.set_fsr(kTemAll);
+    r.cpu.set_freg32(0, 0x40000001);
+    r.exec({FPOP1(22, 0, 0, 0x029)}, 1);
+    CHECK_EQ(r.cpu.trap_type(1), tt::kFpExceptionOther);
+    CHECK_EQ(ftt(r.cpu), 2u);
+    Rig n;
+    n.cpu.set_fsr(kTemAll);
+    n.cpu.set_freg32(20, 0xC0000001);
+    n.exec({FPOP1(28, 0, 20, 0x029)}, 1);
+    CHECK_EQ(n.cpu.trap_type(1), tt::kFpExceptionIeee754);
+    CHECK_EQ(n.cpu.fsr() & 0x1F, 0x10u);
+    Rig d;
+    d.cpu.set_fsr(kTemAll);
+    d.cpu.set_freg64(dreg(8), 0x0010000000000001ull);
+    d.exec({FPOP1(24, 0, dreg(8), 0x0C6)}, 1);
+    CHECK_EQ(d.cpu.trap_type(1), tt::kFpExceptionOther);
+    CHECK_EQ(ftt(d.cpu), 2u);
+    // FDIVs by a subnormal, the quotient overflowing: inexact predicted, so
+    // unfinished.
+    Rig v;
+    v.cpu.set_fsr(kTemAll);
+    v.cpu.set_freg32(0, 0x40000001);
+    v.cpu.set_freg32(8, 0x00100000);
+    v.exec({FPOP1(24, 0, 8, 0x04D)}, 1);
+    CHECK_EQ(v.cpu.trap_type(1), tt::kFpExceptionOther);
+    CHECK_EQ(ftt(v.cpu), 2u);
+}
+
 TEST(fpu_enabled_exception_traps_without_writing_the_result) {
     Rig r;
     r.cpu.set_fsr(kTemDz);

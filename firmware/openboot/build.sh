@@ -7,8 +7,11 @@
 # here from their sources for SPARC Linux and run under QEMU's user-mode
 # emulation, in the Docker image host/Dockerfile describes:
 #
-#   ./build.sh            build in Docker (the image is made if need be)
-#   ./build.sh STAGE...   only those stages (tools, kernel, ...)
+#   ./build.sh            the tool chain (tools, kernel), in Docker (the
+#                         image is made if need be)
+#   ./build.sh STAGE...   those stages: tools, kernel, or a system (as
+#                         systems/NAME.mk describes it); all: every one
+#   ./build.sh systems    the systems there are
 #
 # Everything built goes in build/.
 set -e
@@ -152,28 +155,38 @@ tokenize() {
         -s "aout-header? off silent on" -s "tokenize $1 $2" < /dev/null
 }
 
-# A check of the whole tool chain: the release's own platform, the Sun Fire
-# T2000 (Ontario), made into a PROM image with all its drop-ins.
-t2000() {
-    NAME=t2000 RELEASE=$BP/arch/sun4v/ontario/release FLAGS="-D SUN4V -D Ontario"
-    LOADFILE=$BP/arch/sun4v/niagara/loadprom.fth RESET=$BP/arch/sun4v/niagara/reset.fth
+# A system: its OpenBoot built as systems/NAME.mk describes it (the
+# platform's release folder, flags, load and reset files), then padded to
+# its flash PROM's size and installed if it says so.
+system() {
+    desc=$ROOT/systems/$1.mk
+    val() { sed -n "s/^$1[ \t]*=[ \t]*//p" "$desc" | sed 's/[ \t]*$//'; }
+    NAME=$(val NAME) FLAGS=$(val FLAGS)
+    RELEASE=$BP/$(val RELEASE) LOADFILE=$BP/$(val LOADFILE) RESET=$BP/$(val RESET)
     image; reset; prom
-}
-
-# The Ultra 5 and 10.
-ultra5_10() {
-    NAME=ultra5_10 RELEASE=$BP/arch/sun4u/ultra5_10/release FLAGS="-D SUN4U -D Ultra5_10"
-    LOADFILE=$BP/arch/sun4u/ultra5_10/loadprom.fth RESET=$BP/arch/sun4u/ultra5_10/reset.fth
-    image; reset; prom
-    # The flash PROM's whole 1 MiB, the rest erased (ff).
     cd "$OUT/$NAME"
-    size=$(wc -c < openboot.bin)
-    { cat openboot.bin; head -c $((1048576 - size)) /dev/zero | tr '\000' '\377'; } > ultra5_10.bin
-    say "$NAME: $OUT/$NAME/ultra5_10.bin"
-    # The image UltraViolet builds in (the PROM's contents before the erased rest)
-    cp openboot.bin "$ROOT/ultra5_10.prom"
-    say "$NAME: $ROOT/ultra5_10.prom"
+    flash=$(val FLASH)
+    if [ -n "$flash" ]; then
+        size=$(wc -c < openboot.bin)
+        { cat openboot.bin; head -c $((flash - size)) /dev/zero | tr '\000' '\377'; } > "$NAME.bin"
+        say "$NAME: $OUT/$NAME/$NAME.bin"
+    fi
+    install=$(val INSTALL)
+    if [ -n "$install" ]; then
+        cp openboot.bin "$ROOT/$install"
+        say "$NAME: $ROOT/$install"
+    fi
 }
 
+# The systems there are descriptions of
+systems() {
+    for d in "$ROOT"/systems/*.mk; do basename "$d" .mk; done
+}
+
+# A stage is a step (tools, kernel, systems) or a system's name; "all" is
+# the tool chain and every system.
 stages=${*:-tools kernel}
-for s in $stages; do $s; done
+[ "$stages" = all ] && stages="tools kernel $(systems)"
+for s in $stages; do
+    if [ -f "$ROOT/systems/$s.mk" ]; then system "$s"; else $s; fi
+done

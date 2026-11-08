@@ -70,6 +70,7 @@ public:
     std::function<void(u64)> on_mem_control0;
 
     u64 reg(u32 offset) const;
+    bool iommu_tag_matches(unsigned n, u64 vpn) const;
 
 private:
     class Window;

@@ -288,8 +288,8 @@ Sab82532::Sab82532(Scheduler& scheduler, SerialLine& a, SerialLine& b, double cp
 
 void Sab82532::reset() {
     for (auto& c : ch_) c->reset();
-    ipc_ = iva_ = pvr_ = pcr_ = pis_ = 0;
-    pim_ = 0xFF;
+    ipc_ = iva_ = pvr_ = pis_ = 0;
+    pim_ = pcr_ = 0xFF;  // all pins inputs
     update_irq();
 }
 
@@ -338,7 +338,8 @@ bool Sab82532::read(u64 offset, unsigned, u64& value) {
             return true;
         }
         case kIpc: value = ipc_; return true;
-        case kPvr: value = pvr_; return true;
+        // The pins' levels: an output's as written, an input's as driven.
+        case kPvr: value = (pvr_ & ~pcr_) | (kPortInputs & pcr_); return true;
         case kPis: {
             const u8 v = visible(pis_, pim_);
             pis_ &= static_cast<u8>(~v);
@@ -362,7 +363,7 @@ bool Sab82532::write(u64 offset, unsigned, u64 value) {
     switch (reg) {
         case kIva: iva_ = v; return true;
         case kIpc: ipc_ = v; return true;
-        case kPvr: pvr_ = v; return true;
+        case kPvr: pvr_ = static_cast<u8>((pvr_ & pcr_) | (v & ~pcr_)); return true;  // (inputs' bits ignored)
         case kPim: pim_ = v; return true;
         case kPcr: pcr_ = v; return true;
         default: c.write(reg, v); return true;

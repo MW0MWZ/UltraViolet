@@ -243,6 +243,95 @@ TEST(cpu_little_endian_asi_and_atomics) {
     CHECK_EQ(r.cpu.reg(o2), 0xFFu);
 }
 
+TEST(cpu_icache_predecode_and_next_fields_keep_their_formats) {
+    Rig r;
+    // The next fields: two a line (VA<4>), each its own; one LRU bit a
+    // line (24), shared by both ways and halves, written through way 0.
+    r.cpu.set_reg(g1, 0x20);    // line 1, half 0, way 0
+    r.cpu.set_reg(g2, 0x30);    // line 1, half 1, way 0
+    r.cpu.set_reg(g3, 0x2030);  // line 1, half 1, way 1
+    r.cpu.set_reg(g4, 0x1000100);  // LRU, a branch prediction bit
+    r.cpu.set_reg(g5, 0x10ABC00);  // (any way 0 store writes the LRU bit)
+    r.exec({STXA(g4, g1, g0, asi::ICACHE_NEXT_FIELD), STXA(g5, g2, g0, asi::ICACHE_NEXT_FIELD),
+            LDXA(o0, g1, g0, asi::ICACHE_NEXT_FIELD), LDXA(o1, g2, g0, asi::ICACHE_NEXT_FIELD)});
+    CHECK_EQ(r.cpu.reg(o0), 0x1000100u);
+    CHECK_EQ(r.cpu.reg(o1), 0x10ABC00u);
+    r.exec({STXA(g0, g3, g0, asi::ICACHE_NEXT_FIELD), LDXA(o2, g3, g0, asi::ICACHE_NEXT_FIELD),
+            LDXA(o3, g1, g0, asi::ICACHE_NEXT_FIELD)});
+    CHECK_EQ(r.cpu.reg(o2), 0x1000000u);  // (way 1's write leaves the LRU bit)
+    CHECK_EQ(r.cpu.reg(o3), 0x1000100u);
+    // The predecode fields: a store sets a quad's four (VA<4>, VA<3>
+    // ignored), a load reads the two of the pair VA<3> names.
+    r.cpu.set_reg(g1, 0x48);  // quad 4 (pair 1 named; ignored by the store)
+    r.cpu.set_reg(g2, 0x40);
+    r.cpu.set_reg(g4, 0x1234);
+    r.exec({STXA(g4, g1, g0, asi::ICACHE_PRE_DECODE), LDXA(o0, g2, g0, asi::ICACHE_PRE_DECODE),
+            LDXA(o1, g1, g0, asi::ICACHE_PRE_DECODE)});
+    CHECK_EQ(r.cpu.reg(o0), 0x12u);
+    CHECK_EQ(r.cpu.reg(o1), 0x34u);
+}
+
+TEST(cpu_ecache_tags_follow_physical_cacheable_accesses) {
+    // A store through PHYS_USE_EC leaves its line (PA<20:6> in the 2 MB
+    // E-cache) modified, with its tag (PA<29:18>) and odd parity; a load
+    // brings a line in exclusive.
+    Rig r;
+    r.cpu.set_reg(g1, 0x40000);                    // tag 1, line 1000
+    r.cpu.set_reg(g2, u64{2} << 39 | 0x40000);     // E-cache tag access, line 1000
+    r.exec({STXA(g1, g1, g0, asi::PHYS_USE_EC), LDXA(g0, g2, g0, asi::ECACHE_R),
+            LDXA(o0, g0, g0, asi::ECACHE_TAG_DATA)});
+    CHECK_EQ(r.cpu.reg(o0), 0x2C001u);  // parity 10, modified, tag 1
+    r.cpu.set_reg(g3, 0x80040);                    // tag 2, line 2001
+    r.cpu.set_reg(g2, u64{2} << 39 | 0x80040);
+    r.exec({LDXA(g4, g3, g0, asi::PHYS_USE_EC), LDXA(g0, g2, g0, asi::ECACHE_R),
+            LDXA(o1, g0, g0, asi::ECACHE_TAG_DATA)});
+    CHECK_EQ(r.cpu.reg(o1), 0x8002u);   // parity 00, exclusive, tag 2
+}
+
+TEST(cpu_tlb_data_access_reads_diag_size_bits_and_no_soft_fields) {
+    // Written with Soft, Soft2 and Used set: read with the soft fields 0,
+    // Used kept, and the size (512K: 011) in both of Diag's size fields.
+    Rig r;
+    r.cpu.set_reg(g1, 0x30);
+    r.cpu.set_reg(g2, 0x40000000);  // tag access
+    r.cpu.set_reg(g3, 0xC0040200'00400F80ull | u64{1} << 41);  // V, 512K, Soft2 1, PA 400000, Soft 3f
+    r.cpu.set_reg(g4, 62 << 3);
+    r.exec({STXA(g2, g1, g0, asi::DMMU), STXA(g3, g4, g0, asi::DTLB_DATA_ACCESS),
+            LDXA(o0, g4, g0, asi::DTLB_DATA_ACCESS)});
+    CHECK_EQ(r.cpu.reg(o0), 0xC0006E00'00400000ull);
+}
+
+TEST(cpu_physical_asi_address_in_the_va_hole_traps) {
+    Rig r;
+    r.cpu.set_reg(g1, 0xFFFFF70000000000ull);
+    r.exec({LDXA(g2, g1, g0, asi::PHYS_BYPASS_EC_E)}, 1);
+    CHECK_EQ(r.cpu.trap_type(1), tt::kDataAccessException);
+    CHECK_EQ((r.cpu.dmmu().sfsr >> 4) & 3, 3u);  // context type: physical
+    CHECK_EQ(r.cpu.sfar(), 0x70000000000ull);    // (44 bits)
+    CHECK(r.cpu.pstate_reg() & pstate::MG);      // the MMU globals
+    CHECK(!(r.cpu.pstate_reg() & pstate::AG));
+}
+
+TEST(cpu_load_from_nothing_times_out_in_the_afsr) {
+    // A privileged load from an address nothing answers: data_access_error,
+    // AFSR TO and PRIV, the AFAR the address; a second sets ME.
+    Rig r;
+    r.cpu.set_reg(g1, 0x1F000000000ull);
+    r.exec({LDXA(g2, g1, g0, asi::PHYS_BYPASS_EC_E)}, 1);
+    CHECK_EQ(r.cpu.trap_type(1), tt::kDataAccessError);
+    Rig q;
+    q.cpu.set_reg(g1, 0x1F000000000ull);
+    for (int i = 0; i < 2; ++i) {
+        q.exec({LDXA(g2, g1, g0, asi::PHYS_BYPASS_EC_E)}, 1);
+        CHECK_EQ(q.cpu.trap_type(1), tt::kDataAccessError);
+        q.cpu.set_tl(0);
+        q.cpu.set_pstate(pstate::PRIV | pstate::PEF);  // (the normal globals again)
+    }
+    q.exec({LDXA(o0, g0, g0, asi::AFSR), LDXA(o1, g0, g0, asi::AFAR)});
+    CHECK_EQ(q.cpu.reg(o0), 0x188000000ull);  // ME, PRIV, TO
+    CHECK_EQ(q.cpu.reg(o1), 0x1F000000000ull);
+}
+
 TEST(cpu_restricted_asi_needs_privilege) {
     Rig r;
     r.cpu.set_pstate(pstate::PEF);
@@ -297,12 +386,20 @@ TEST(cpu_dmmu_demap_drops_translations_already_used) {
     CHECK_EQ(r.cpu.trap_type(1), tt::kFastDataAccessMmuMiss);
 }
 
+// A locked translation (in entries 1-63, so that replacement takes entry 0)
+void dmmu_map_locked(Rig& r, u64 va, u64 pa) {
+    r.cpu.set_reg(g1, va);
+    r.cpu.set_reg(g2, tte::V | tte::CP | tte::P | tte::W | tte::L | pa);
+    r.cpu.set_reg(g3, 0x30);
+    r.exec({STXA(g1, g3, g0, asi::DMMU), STXA(g2, g0, g0, asi::DTLB_DATA_IN)});
+}
+
 TEST(cpu_dtlb_entry_replaced_stops_translating_even_after_use) {
-    // Page A fills entry 0; 63 more fill the rest; all are used; the next
-    // insert replaces entry 0 (no unused ones left), so A must then miss.
+    // Page A fills entry 0; 63 locked pages the rest; all are used; the next
+    // insert replaces entry 0 (the only one not locked), so A must then miss.
     Rig r;
     dmmu_map(r, 0x40000000, 0x4000);
-    for (u64 k = 1; k < 64; ++k) dmmu_map(r, 0x50000000 + 0x2000 * k, 0x6000);
+    for (u64 k = 1; k < 64; ++k) dmmu_map_locked(r, 0x50000000 + 0x2000 * k, 0x6000);
     dmmu_on(r);
     r.cpu.set_reg(g5, 0x40000000);
     r.exec({LDX(g6, g5, 0)});
@@ -364,6 +461,29 @@ TEST(cpu_dtlb_contexts_switched_back_and_forth_keep_their_own_translations) {
     CHECK_EQ(r.cpu.reg(g1), 0u);
     CHECK_EQ(r.cpu.reg(g6), 200u * 0x55);
     CHECK_EQ(r.cpu.reg(g7), 200u * 0x66);
+}
+
+TEST(cpu_dtlb_uclear_clears_every_used_bit_when_no_entry_is_free) {
+    // Entries 0-62 locked; 63 unlocked, its page read: with every entry
+    // then locked or used, the uclear clears all the Used bits (63's too).
+    // With entry 62 left invalid, 63's Used bit stays set.
+    for (const bool all : {true, false}) {
+        Rig r;
+        r.cpu.set_reg(g3, 0x30);
+        for (unsigned i = 0; i < 64; ++i) {
+            if (!all && i == 62) continue;
+            const u64 va = 0x40000000 + u64{i} * 0x2000;
+            r.cpu.set_reg(g1, va);
+            r.cpu.set_reg(g2, tte::V | tte::CP | tte::P | tte::W | (i < 63 ? tte::L : 0) | 0x4000);
+            r.cpu.set_reg(g4, u64{i} << 3);
+            r.exec({STXA(g1, g3, g0, asi::DMMU), STXA(g2, g4, g0, asi::DTLB_DATA_ACCESS)});
+        }
+        dmmu_on(r);
+        r.cpu.set_reg(g5, 0x40000000 + 63 * 0x2000);
+        r.cpu.set_reg(g4, 63 << 3);
+        r.exec({LDX(g6, g5, 0), LDXA(o0, g4, g0, asi::DTLB_DATA_ACCESS)});
+        CHECK_EQ((r.cpu.reg(o0) >> 41) & 1, all ? 0u : 1u);
+    }
 }
 
 TEST(cpu_dtlb_entry_written_by_data_access_replaces_the_one_there) {
@@ -443,7 +563,7 @@ TEST(cpu_dtlb_entry_replaced_stops_translating_in_translated_code) {
     // entry has been replaced: it must miss.
     Rig r;
     dmmu_map(r, 0x40000000, 0x4000);
-    for (u64 k = 1; k < 64; ++k) dmmu_map(r, 0x50000000 + 0x2000 * k, 0x6000);
+    for (u64 k = 1; k < 64; ++k) dmmu_map_locked(r, 0x50000000 + 0x2000 * k, 0x6000);
     dmmu_on(r);
     for (u64 k = 1; k < 64; ++k) {
         r.cpu.set_reg(g5, 0x50000000 + 0x2000 * k);

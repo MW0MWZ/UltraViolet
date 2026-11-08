@@ -34,24 +34,37 @@ FCode for the Creator3D and Rage Pro built in.
   Rage Pro's and Creator3D's screens (with UltraViolet's open source FCode).
   The console runs on the keyboard and screen or on ttya; the NVRAM holds
   the configuration variables; OpenBoot boots from CD-ROM and from the
-  network (DHCP, TFTP). The installation DVDs of Solaris 8 and Solaris 10
-  boot to their installers. To do: the diagnostics, and installing and
-  running Solaris 8, 9 and 10 in UltraViolet.
+  network (DHCP, TFTP). The installation media of Solaris 8, 9 and 10
+  boot to their installers, and installed systems of each boot from disk.
+  The selftests and diagnostic commands are there, and a power-on
+  selftest (POST) at a power-on with `diag-switch?` true.
 
 ## Building
 
 With Docker:
 
 ```sh
-./build.sh
+./build.sh                 # the tool chain: the host tools and the kernel
+./build.sh ultra5_10       # a system's PROM image (after the tool chain)
+./build.sh all             # the tool chain and every system
+./build.sh systems         # the systems there are
 ```
 
-makes the build image (from [host/Dockerfile](host/Dockerfile): Debian's
-cross compiler for 64-bit SPARC Linux, with its 32-bit libraries, and QEMU)
-and builds in `build/`: the host tools and the kernel by default;
-`./build.sh tools kernel ultra5_10` also the Ultra 5/10's flash PROM image
-(`build/ultra5_10/ultra5_10.bin`), and `t2000` the T2000's PROM image
-(`build/t2000/openboot.bin`).
+(or `make`, `make ultra5_10`, `make toolchain`). The build image comes
+from [host/Dockerfile](host/Dockerfile) (Debian's cross compiler for 64-bit
+SPARC Linux, with its 32-bit libraries, and QEMU), and everything built goes
+in `build/`.
+
+Each system is described by a file in [systems](systems), in make's
+`NAME = value` form: its platform's folder of release files (with the
+drop-ins it lists in `dropins.src`), its compile flags, its load file and
+reset code, the size of its flash PROM (the image padded with erased bytes
+to it) and the file the image is installed as. `ultra5_10` makes
+`build/ultra5_10/ultra5_10.bin`, the 1 MiB flash PROM, and installs
+`ultra5_10.prom`, which UltraViolet builds in; `t2000`, the release's own
+platform (the Sun Fire T2000), checks the tool chain. Another machine is a
+platform folder under `obp/arch` and a file in `systems`.
+
 The release's makefiles are for Solaris's make; `build.sh` does what they
 do, a stage at a time, and `host/reset.ld` lays out the reset code as the
 release's linker map (`obp/arch/sun4u/openboot.map`) does.
@@ -73,8 +86,8 @@ It is here as released, but for:
 - the prebuilt Solaris programs and libraries that came with it (`bin`,
   `lib`, `tools`, `obp/os/unix`), left out: the build makes them from their
   sources;
-- UltraViolet's additions: this README, [LICENSE](LICENSE), [build.sh](build.sh)
-  and [host](host).
+- UltraViolet's additions: this README, [LICENSE](LICENSE), [build.sh](build.sh),
+  [Makefile](Makefile), [systems](systems) and [host](host).
 
 The Ultra 5 and 10's own code is new: the platform in
 `obp/arch/sun4u/ultra5_10` (reset code, console, memory, NVRAM and IDPROM,
@@ -90,8 +103,26 @@ I/II/IIi's TLB and translation entries in `obp/cpu/sparc/ultra` (`map.fth`,
 | `obp/dev/ebus/se` | the SAB82532: ttya and ttyb |
 | `obp/dev/ebus/su` | the SuperIO's UARTs, and the Sun Type 5 keyboard |
 | `obp/dev/ebus/flashprom` | the flash PROM's drop-ins, read as a device |
+| `obp/dev/ebus/eeprom` | the M48T59's clock (`watch-clock`, `date`) |
+| `obp/dev/ebus/fdthree` | the floppy disk controller and drive |
 | `obp/dev/network/hme` | the RIO's Ethernet (Happy Meal) |
 | `obp/dev/m64` | the Rage Pro: UltraViolet's FCode (`firmware/rage`) as a drop-in |
+
+OpenBoot 3.x's configuration variables for the machine
+(`loadconfig.fth`), its diagnostic commands the release has no form of
+(`diag.fth`: `.speed`, `probe-pci`, `probe-pci-slot`, `eject-floppy`), and
+a power-on selftest (`post.fth`: OpenBoot 3.31's tests at the level
+`diag-level` gives: the NVRAM; the D-TLB's tags and entries; the E-cache's
+data and tags; the processor's instructions, tick, soft traps and
+interrupts; the MMUs' registers; the D- and I-caches' arrays; the FPU, its
+registers, operations and trap; the UPA data bus; memory, through the
+E-cache and around it, with block loads and stores; the PCI bus module's
+PIO address decoding and byte enables, interrupt maps and states, IOMMU registers and TLB, and PCI registers; the
+MMUs' misses, byte order and ASIs; the traps for errors, misaligned
+accesses and protection; the RIO's configuration; a PCI master abort; with
+`show-post-results`) are part of the platform;
+the selftests (`test`, `test-all`) of the Rage Pro, the Ethernet and the
+floppy drive are in their drivers.
 
 They are built on the release's PCI, serial, keyboard and network code
 (`obp/dev/pci`, `obp/dev/serial`, `obp/dev/usb-devices/kbd`,
@@ -124,6 +155,9 @@ The release's own files are unchanged, but for:
   every 10 microseconds for the first millisecond before polling every
   millisecond, so that a drive's brief busy time between the blocks of a
   transfer doesn't cost a millisecond a block.
+- `obp/fm/kernel/fileio.fth`: an error at the end of a string being
+  evaluated shows the string ("Evaluating: boot"); the line was looked for
+  from one past its end, and shown empty.
 
 ## Credits
 

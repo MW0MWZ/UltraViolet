@@ -88,7 +88,7 @@ chain: init  ( -- )
    source-id  0<>  if
       source-id  -1 =  if
          \ Record the approx error position not the whole buffer!!
-         true source >r >in @		( flag adr offset )
+         true source >r >in @ r@ 1- min 0 max	( flag adr offset )
          begin				( flag adr offset )
             rot				( adr offset more? )
             over and while		( adr offset )

@@ -20,6 +20,8 @@ hex
 h# 01 constant kbd-reset
 h# 02 constant kbd-bell-on
 h# 03 constant kbd-bell-off
+h# 0a constant kbd-click-on
+h# 0b constant kbd-click-off
 h# 0f constant kbd-layout
 h# ff constant kbd-reset-response
 h# fe constant kbd-layout-response
@@ -98,11 +100,23 @@ h# 80 instance buffer: keys-down
    until  drop false
 ;
 
+\ The reset's response within a second: bytes before it passed over (a
+\ key's release sent after the reset began, as when reset-all is typed:
+\ the keyboard is not reset with the machine).
+: kbd-reset-response? ( -- found? )
+   get-msecs d# 1000 +  begin				( until )
+      d# 10 kbd-wait if
+         kbd-reset-response = if  drop true exit  then
+      then
+      dup get-msecs - 0<
+   until  drop false
+;
+
 \ Reset: the self-test's response, then the keys down (or idle)
 : kbd-reset? ( -- present? )
+   begin  d# 20 kbd-wait  while  drop  repeat		\ what was waiting
    kbd-reset kbd-out
-   d# 1000 kbd-wait 0= if  false exit  then		( byte )
-   kbd-reset-response <> if  false exit  then
+   kbd-reset-response? 0= if  false exit  then
    d# 20 kbd-wait if  drop  then			\ the type (4)
    clear-keys-down
    begin  d# 20 kbd-wait  while			( byte )
@@ -116,6 +130,15 @@ h# 80 instance buffer: keys-down
    d# 100 kbd-wait if
       kbd-layout-response = if  d# 20 kbd-wait if  to layout  then  then
    then
+;
+
+\ The keys' click, on as the keyboard-click? option says (reset turns it
+\ off)
+: kbd-set-click ( -- )
+   " /options" find-package if
+      " keyboard-click?" rot get-package-property if  false  then
+   else  false  then
+   if  kbd-click-on  else  kbd-click-off  then  kbd-out
 ;
 
 \ A byte from the keyboard: a key down or up, or all up

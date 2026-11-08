@@ -295,8 +295,9 @@ UltraViolet runs OpenBoot, with Solaris (or another sparc64 operating
 system) from its media. Its own OpenBoot is included and built in by
 default: open source, built from Sun's OpenBoot 4.23.0 release for the
 Ultra 5 and 10 ([firmware/openboot](firmware/openboot)). It is still being
-completed (the Solaris 8 and 10 installation DVDs boot with it; its
-diagnostics are to come); the Ultra 5/10's own Sun
+completed (Solaris 8, 9 and 10 boot with it, from their installation
+media and from disk; it has OpenBoot 3.x's selftests and diagnostic
+commands, but no power-on selftest yet); the Ultra 5/10's own Sun
 OpenBoot (3.31) is chosen under Settings (Flash PROM) or with `--prom
 supplied`. Sun's images and the operating systems are not included:
 [roms/README.md](roms/README.md) says which images UltraViolet expects,

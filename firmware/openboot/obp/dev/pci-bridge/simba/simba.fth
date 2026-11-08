@@ -27,7 +27,7 @@ make-compatible-property
 
 " SUNW,simba" model
 " 0" encode-string " no-probe-list" property
-d# 33333333 encode-int " clock-frequency" property
+d# 33000000 encode-int " clock-frequency" property
 7 encode-int " scsi-initiator-id" property
 
 \ Function 1 is bus A (the Ultra 5/10's own devices), function 0 bus B.
@@ -129,13 +129,14 @@ h# e8 constant pio-afsr
    " bus-range"  property
 ;
 
-\ Bus A's devices are on the board; bus B's are the slots (four on an
-\ Ultra 10, devices 1 to 4).
+\ Bus A's devices are on the board (no slots); bus B's are the slots
+\ (four on an Ultra 10, devices 1 to 4), named as the machine's own
+\ firmware names them.
 : slot-names ( -- )
-   bus-a?  if  exit  then
+   bus-a?  if  0 encode-int " slot-names" property  exit  then
    h# 1e encode-int
-   " pci slot 1" encode-string encode+  " pci slot 2" encode-string encode+
-   " pci slot 3" encode-string encode+  " pci slot 4" encode-string encode+
+   " pcia slot 1" encode-string encode+  " pcia slot 2" encode-string encode+
+   " pcia slot 3" encode-string encode+  " pcia slot 4" encode-string encode+
    " slot-names" property
 ;
 

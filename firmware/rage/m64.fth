@@ -504,6 +504,21 @@ my-address my-space encode-phys  0 encode-int encode+  0 encode-int encode+
 
 \ --- Install and remove ---------------------------------------------------------
 
+\ Back from a client (X leaves the chip in its own mode, depth, palette
+\ and pixel mask): the console's mode set again if the CRTC is not in it,
+\ the DAC 8 bits a colour, the palette, the display on.
+: mode-kept?  ( -- flag )
+   crtc-h-total-disp reg@ 6 mode@ =
+   crtc-v-total-disp reg@ 8 mode@ =  and
+   crtc-off-pitch reg@  width 8 / d# 22 lshift =  and
+   crtc-gen-cntl reg@ 700 and 200 =  and
+;
+: m64-reset-screen  ( -- )
+   mode-kept? 0= if  set-mode  then
+   dac-cntl reg@ 100 or dac-cntl reg!
+   set-palette  display-on
+;
+
 \ The frame buffer, kept mapped from the first open as the node's
 \ "address".
 : m64-install  ( -- )
@@ -516,10 +531,60 @@ my-address my-space encode-phys  0 encode-int encode+  0 encode-int encode+
    default-font set-font
    width height  width char-width /  height char-height /  fb8-install
    ['] m64-draw-logo to draw-logo
+   ['] m64-reset-screen to reset-screen
 ;
 
 : m64-remove  ( -- )  ;
-: m64-selftest  ( -- 0 )  0  ;
+\ --- The selftest -----------------------------------------------------------------
+
+\ The registers (the two scratch registers), the RAMDAC (every palette
+\ entry, written and read back) and the frame buffer (every word of the
+\ memory, put back as it was), each passed or failed. Unless the chip is
+\ the console's output, it says first that its display is not installed.
+80 constant scratch-reg0
+84 constant scratch-reg1
+: console?  ( -- flag )
+   " /chosen" find-package if
+      " stdout" rot get-package-property 0= if
+         decode-int nip nip  ?dup if  ihandle>phandle my-self ihandle>phandle =  exit  then
+      then
+   then  false
+;
+: .result  ( ok? -- ok? )  dup if  ."  passed Ok"  else  ."  failed"  then  cr  ;
+: reg-ok?  ( pattern reg -- ok? )  2dup reg!  reg@ =  ;
+: reg-test  ( -- ok? )
+   scratch-reg0 reg@  scratch-reg1 reg@  true		( s0 s1 ok? )
+   55555555 scratch-reg0 reg-ok? and  2aaaaaaa scratch-reg0 reg-ok? and
+   2aaaaaaa scratch-reg1 reg-ok? and  55555555 scratch-reg1 reg-ok? and
+   0 scratch-reg0 reg-ok? and  0 scratch-reg1 reg-ok? and
+   >r  scratch-reg1 reg!  scratch-reg0 reg!  r>
+;
+: dac-pattern  ( index phase -- b )  over 3 * + 2a xor  swap 2/ xor  3f and  ;
+: dac-test  ( -- ok? )
+   0 dac-regs regb!
+   100 0 do  3 0 do  j i dac-pattern dac-regs 1+ regb!  loop  loop
+   0 dac-regs 3 + regb!  true
+   100 0 do  3 0 do  dac-regs 1+ regb@  j i dac-pattern =  and  loop  loop
+   set-palette
+;
+: fb-test  ( -- ok? )
+   true  vram-mib 100000 * regs-offset min  0 do	( ok? )
+      aperture i + dup rl@  swap			( ok? old adr )
+      i over rl!  dup rl@ i =			( ok? old adr ok1? )
+      i invert 7fffffff and  2 pick rl!		( ok? old adr ok1? )
+      over rl@  i invert 7fffffff and =  and	( ok? old adr ok2? )
+      >r rl!  r> and				( ok? )
+   4 +loop
+;
+: m64-selftest  ( -- 0 | 1 )
+   aperture -1 = dup >r  if  map-chip  then
+   console? 0= if  cr ." Display not installed" cr cr  then
+   ." Test hardware registers - "  reg-test .result
+   ." Test RamDAC - "  dac-test .result  and
+   ." Test Frame buffer - "  fb-test .result  and
+   r> if  unmap-chip  then
+   0= 1 and
+;
 
 ' m64-install is-install
 ' m64-remove is-remove

@@ -41,3 +41,7 @@ root-device
    ;
 device-end \ root device
 
+\ /openprom: the machine's own firmware has decode-complete there.
+" /openprom" find-device
+   0 0 " decode-complete" property
+device-end
