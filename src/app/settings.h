@@ -50,6 +50,10 @@ struct Settings {
     // turns it off and on.
     bool turbo_at_boot = false;
     bool block_cache = true, jit = true;
+    // A developer's check of the JIT: each translated block run, then run
+    // again by the interpreter from the same state, and the processor
+    // stopped with the differences if they disagree (slow).
+    bool jit_check = false;
     bool idle_skip = true;  // run the guest's idle loops at once (UltraSparc::set_idle_skip)
     // The IDE drives without a real drive's delays, DMA at host speed.
     bool fast_disk = true;

@@ -42,8 +42,8 @@
 \ Adapted for the Ultra 5/10 by Andy Taylor, 2026: the configuration
 \ variables themselves are defined with the others (loadconfig.fth), and
 \ ttya's node does not get ignore-cd and rts-dtr-off (the serial driver
-\ gives its node port-a-ignore-cd and the like from them, as the machine's
-\ own firmware does).
+\ gives its node port-a-ignore-cd and the like from them, as on an Ultra
+\ 10).
 id: @(#)console-tty.fth 1.1 06/02/16
 purpose: 
 copyright: Copyright 2006 Sun Microsystems, Inc.  All Rights Reserved

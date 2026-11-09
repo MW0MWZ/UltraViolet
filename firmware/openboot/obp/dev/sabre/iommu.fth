@@ -13,11 +13,11 @@ copyright: Copyright 2026 Andy Taylor
 h# 12 h# 8000.0000 lxjoin constant tte-valid	\ Valid, cacheable, writable
 h# ffff.e000 h# 1ff lxjoin constant tte-pa-mask
 
-\ The TSB is physically contiguous (1 MB), mapped a 64 KB piece at a time
+\ The TSB is physically contiguous, mapped up to 64 KB at a time
 \ (OpenBoot's virtual range is short of large pieces as it starts). The
 \ pieces' addresses are kept as 64-bit words (FCode's cells are 32 bits:
 \ @ would sign-extend them).
-h# 1.0000 constant /tsb-piece
+/tsb h# 1.0000 min constant /tsb-piece
 /tsb /tsb-piece / constant #tsb-pieces
 #tsb-pieces 8 * alloc-mem constant tsb-pieces
 0 value tsb-pa
@@ -42,7 +42,7 @@ h# 1.0000 constant /tsb-piece
       0 i 8 * iommu-data-diag + sabre-x!
    loop
    0 iommu-control sabre-x!
-   /tsb pagesize phys-claim to tsb-pa
+   /tsb dup phys-claim to tsb-pa
    #tsb-pieces 0 do
       tsb-pa i /tsb-piece * +  /tsb-piece (map-in)	( va )
       dup /tsb-piece erase
@@ -55,7 +55,7 @@ h# 1.0000 constant /tsb-piece
 init-iommu
 
 variable dma-list	dma-list off
-virtual-dma-base virtual-dma-size dma-list free-memrange
+virtual-dma-base /dvma-used dma-list free-memrange
 
 : map-dvma-page ( pa dvma -- )
    swap tte-pa-mask and tte-valid or  over >tsb-entry x!	( dvma )

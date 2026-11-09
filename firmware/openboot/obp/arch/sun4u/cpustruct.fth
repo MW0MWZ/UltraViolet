@@ -43,7 +43,7 @@
 \ structure's physical address, which sun4v keeps in a scratchpad
 \ register, is patched into the trap code that needs it (cpu-struct-pa);
 \ the hypervisor's mondo queue and TSB set-up are left out; a processor
-\ node's number is its UPA port ID.
+\ node's number is its UPA port ID; the structures are allocated.
 id: @(#)cpustruct.fth 1.1 06/02/22 
 purpose: 
 copyright: Copyright 2006 Sun Microsystems, Inc.  All Rights Reserved
@@ -346,8 +346,13 @@ code switch-to-private-stacks
    then
 c;
 
+\ The structures in memory OpenBoot allocates (physically contiguous: the
+\ trap code reaches them by physical address), not at a fixed address in
+\ the monitor's range: OpenBoot's dictionary grows there.
 stand-init: allocate cpu structs
-   h# f008.0000 dup to mp-cpu-state
+   pagesize  max-#cpus /cpu-struct *  0  allocate-aligned	( va )
+   dup 0= abort" No memory for the cpu structs"
+   dup to mp-cpu-state
    >physical drop set-cpu-struct-pa
    ['] cpu-rp0  to  rp0
    ['] cpu-sp0  to  sp0

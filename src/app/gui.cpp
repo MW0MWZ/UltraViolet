@@ -1726,6 +1726,13 @@ void Gui::draw_settings() {
                                   "the host's, so it keeps real time; the Turbo button turns it off");
             ImGui::Spacing();
             ImGui::Checkbox("JIT (translate guest code to host code)", &edit_.jit);
+            ImGui::BeginDisabled(!edit_.jit);
+            ImGui::Indent();
+            ImGui::Checkbox("Check the JIT (for developers)", &edit_.jit_check);
+            ImGui::SetItemTooltip("Runs each translated block, then runs it again in the interpreter from the same\n"
+                                  "state, and stops the processor with the differences if they disagree. Slow");
+            ImGui::Unindent();
+            ImGui::EndDisabled();
             ImGui::Checkbox("Block cache (decode guest code once)", &edit_.block_cache);
             ImGui::Checkbox("Idle skipping", &edit_.idle_skip);
             ImGui::SetItemTooltip("While the guest waits in its idle loop, guest time moves on to the next event\n"

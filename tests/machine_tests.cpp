@@ -1540,7 +1540,9 @@ TEST(ultra5_10_new_nvram_is_a_sane_starting_point) {
         CHECK(std::all_of(p + 0x6A3, p + 0x6A7, [](u8 b) { return b == 0xAA; }));  // ttya-mode's slot after it
         CHECK(std::all_of(p + 0x834, p + 0x840, [](u8 b) { return b == 0x55; }));
         CHECK(std::all_of(p + 0x8C0, p + 0x900, [](u8 b) { return b == 0xFF; }));
-        CHECK(std::all_of(p + 0x1E80, p + 0x1EC0, [](u8 b) { return b == 0xAA; }));
+        // Above the configuration area to the IDPROM: zeros, as a real Ultra 10
+        // that has never run the power-on selftest reads.
+        CHECK(std::all_of(p + 0x1CD8, p + 0x1FD8, [](u8 b) { return b == 0; }));
         const u8* id = p + 0x1FD8;
         CHECK_EQ(id[0], 0x01u);
         CHECK_EQ(id[1], 0x80u);

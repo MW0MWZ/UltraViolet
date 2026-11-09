@@ -373,7 +373,6 @@ here est-modes - 5 /n * / constant #est-modes
 : rectangle  ( x y w h -- )
    4 fifo-wait  >r >r  60 fbc!  64 fbc!  r> r>  70 fbc!  74 fbc!   \ (y, x, h, w: w starts it)
 ;
-: drawop  ( rop op -- )  3 fifo-wait  ppc-plain 200 fbc!  300 fbc!  258 fbc!  ;
 : colours  ( fg bg -- )  2 fifo-wait  20c fbc!  208 fbc!  ;
 
 \ The registers the console draws with.
@@ -393,6 +392,15 @@ here est-modes - 5 /n * / constant #est-modes
    high-res? if  33300000  else  33380000  then  2cc fbc!
    high-res? 0= if  101 2d8 fbc!  then
 ;
+\ Before each of the console's drawings: its registers, and buffer A
+\ written, whatever a client left (a kernel message while the window system
+\ runs is drawn over its screen, as on the card's own FCode; X leaves the
+\ FBC writing buffer B, its window's).
+: console-state  ( -- )  fbc-console  1 fifo-wait  fbc-x-off 254 fbc!  ;
+: drawop  ( rop op -- )
+   console-state  3 fifo-wait  ppc-plain 200 fbc!  300 fbc!  258 fbc!
+;
+
 : init-fbc  ( -- )
    fbc-console
    1 fifo-wait  fbc-ab-x-on 254 fbc!
@@ -428,6 +436,7 @@ here est-modes - 5 /n * / constant #est-modes
 ;
 : ffb-draw-character  ( char -- )
    >font
+   console-state
    text-colours colours
    4 fifo-wait
    ppc-plain 200 fbc!  rop-new 258 fbc!
@@ -579,7 +588,7 @@ my-space 1c0 - 2/ encode-int " upa-portid" property
 \ The card's identity, read from it.
 exp rl@ d# 24 rshift ff and encode-int " board_type" property
 " SUNW,501-4788" model
-" UltraViolet ffb.fth 0.5" encode-string " fcode_version" property
+" UltraViolet ffb.fth 0.6" encode-string " fcode_version" property
 dac-uctrl dac@ 8 rshift f and encode-int " ramdac_rev" property
 800 fbc@ encode-int " fbc_reg_id" property
 unmap-card

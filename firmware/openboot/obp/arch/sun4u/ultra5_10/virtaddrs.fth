@@ -39,9 +39,12 @@
 \ any nuclear facility. 
 \ 
 \ ========== Copyright Header End ============================================
-\ Adapted for the Ultra 5/10 (sun4u) by Andy Taylor, 2026: the same layout,
-\ which is also sun4u OpenBoot's (the monitor at f000.0000, as Solaris
-\ expects it).
+\ Adapted for the Ultra 5/10 (sun4u) by Andy Taylor, 2026: the monitor at
+\ f000.0000, as Solaris expects it, and OpenBoot in the top 1 MiB of memory
+\ as an Ultra 10 has it: its image in the top 512 KiB, mapped at f000.0000
+\ (ROMbase, the dictionary's origin) by one locked 512 KiB entry, its RAM
+\ in the 64 KiB below, the page tables' root in the page below that, and
+\ the rest of the 1 MiB the memory it takes from as it starts.
 id: @(#)virtaddrs.fth 1.1 06/02/16
 purpose: 
 copyright: Copyright 2006 Sun Microsystems, Inc.  All Rights Reserved
@@ -58,7 +61,10 @@ headerless
 h#  fff.0000       constant monvirtsize  \ Size of monitor's virtual memory
 h# F000.0000       constant monvirtbase  \ Base of monitor's virtual memory
 
-monvirtbase 2meg + constant ROMbase
+h#   10.0000       constant /obp-memory	\ OpenBoot's memory, at the top
+h#    8.0000       constant /obp-image	\ its image, at the top of that
+
+monvirtbase        constant ROMbase
 ROMbase ROMsize +  constant ROMtop
 
 \ Heap size includes the temporary RS/DS stacks used before we can alloc
@@ -89,7 +95,12 @@ ROMbase  constant trap-table	\ trap vectors
 RAMbase HEAPsize + constant prom-main-task
 
 : RAM-dictionary-base  ( -- adr )  ROM-dictionary-size origin+  ;
-: initial-limit  ( -- adr )  4meg origin+  ;
+: initial-limit  ( -- adr )  /obp-image origin+  ;
+\ Past that, the dictionary grows a page at a time, as an Ultra 10's does.
+h# 2000 constant /dictionary-growth
+\ The retained page (arch/sun4u/retained.fth) just below OpenBoot's 1 MiB,
+\ where an Ultra 10 keeps it.
+h# 10.0000 constant retained-min-align
 
 \t32 8meg constant /dictionary-max
 \t16 h#  1.0000 tshift << constant /dictionary-max

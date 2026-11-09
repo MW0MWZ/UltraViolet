@@ -3,7 +3,8 @@
 Sun Microsystems' OpenBoot, the IEEE 1275 Open Firmware of Sun's SPARC
 machines, from the source Sun released in 2006, being brought to the Sun
 Ultra 5 and Ultra 10 as open source system firmware: a replacement for
-their OpenBoot 3.x flash PROM, for UltraViolet and for the real machines.
+the firmware in their flash PROM, for UltraViolet and for the real
+machines.
 
 The release is OpenBoot 4.23.0, written for Sun's sun4v machines (the
 UltraSPARC T1 systems), and the version here keeps its number. It holds the
@@ -28,16 +29,31 @@ FCode for the Creator3D and Rage Pro built in.
   PROM image that starts the machine from reset (the processor, the memory
   controller and the memory's size, the PCI bus numbers; OpenBoot unpacked
   into the top of memory and the MMU turned on) and runs OpenBoot to its
-  `ok` prompt, with the device tree as the machine's own firmware builds
-  it: the processor (its clock measured), the PCI bus module and its IOMMU,
+  `ok` prompt, with the device tree as an Ultra 10 has it: the processor (its clock measured), the PCI bus module and its IOMMU,
   the APB's two buses, the EBus and all its devices, IDE, Ethernet, and the
   Rage Pro's and Creator3D's screens (with UltraViolet's open source FCode).
   The console runs on the keyboard and screen or on ttya; the NVRAM holds
-  the configuration variables; OpenBoot boots from CD-ROM and from the
+  the configuration variables an Ultra 10 has, in its layout (see
+  below); OpenBoot boots from CD-ROM and from the
   network (DHCP, TFTP). The installation media of Solaris 8, 9 and 10
   boot to their installers, and installed systems of each boot from disk.
   The selftests and diagnostic commands are there, and a power-on
-  selftest (POST) at a power-on with `diag-switch?` true.
+  selftest (POST) at a power-on with `diag-switch?` true. The POST is a
+  program of its own in the flash PROM's second half ([post](post), C and
+  assembler), as an Ultra 10 has it: the reset code runs it before
+  OpenBoot, it probes the memory itself (from the PROM, as it sets the
+  memory controller's column mode), copies itself into memory, reports on
+  ttya and returns its result, and a software power-on reset follows;
+  OpenBoot then has the result (`show-post-results`, "Power On Self Test
+  Failed.  Cause: ...", and no booting by itself after a failure).
+  In diagnostic mode it reports as an Ultra 10 does: from the reset code
+  ("Hardware Power ON", "Probing keyboard", "Clearing E$ Tags",
+  "Probing Memory", "MMUs ON" and the rest), and before probing (the reset
+  control, the processor module, the memory's DIMM pairs) and while
+  probing ("Probing UPA Slot at 1e,0 ", "Probing /pci@1f,0/pci@1,1 at
+  Device 1  " and the name of each node made); the RIO's EBus is named by
+  its IDs during the PCI probe and becomes `ebus`, with its devices, after
+  it, as on an Ultra 10.
 
 ## Building
 
@@ -59,8 +75,11 @@ Each system is described by a file in [systems](systems), in make's
 `NAME = value` form: its platform's folder of release files (with the
 drop-ins it lists in `dropins.src`), its compile flags, its load file and
 reset code, the size of its flash PROM (the image padded with erased bytes
-to it) and the file the image is installed as. `ultra5_10` makes
-`build/ultra5_10/ultra5_10.bin`, the 1 MiB flash PROM, and installs
+to it) and the file the image is installed as; and, if it has one, its POST
+program's folder (`POST`), its place in the flash PROM (`POST_AT`) and
+whether the image installed has it (`POST_ON`; the image with it is
+`build/NAME/NAME-post.bin`). `ultra5_10` makes
+`build/ultra5_10/ultra5_10.bin`, the 1 MiB flash PROM, and installs it as
 `ultra5_10.prom`, which UltraViolet builds in; `t2000`, the release's own
 platform (the Sun Fire T2000), checks the tool chain. Another machine is a
 platform folder under `obp/arch` and a file in `systems`.
@@ -108,20 +127,20 @@ I/II/IIi's TLB and translation entries in `obp/cpu/sparc/ultra` (`map.fth`,
 | `obp/dev/network/hme` | the RIO's Ethernet (Happy Meal) |
 | `obp/dev/m64` | the Rage Pro: UltraViolet's FCode (`firmware/rage`) as a drop-in |
 
-OpenBoot 3.x's configuration variables for the machine
-(`loadconfig.fth`), its diagnostic commands the release has no form of
-(`diag.fth`: `.speed`, `probe-pci`, `probe-pci-slot`, `eject-floppy`), and
-a power-on selftest (`post.fth`: OpenBoot 3.31's tests at the level
-`diag-level` gives: the NVRAM; the D-TLB's tags and entries; the E-cache's
+The machine's configuration variables (`loadconfig.fth`) and its
+diagnostic commands the release has no form of (`diag.fth`: `.speed`,
+`probe-pci`, `probe-pci-slot`, `eject-floppy`) are part of the platform;
+the power-on selftest ([post](post)) runs an Ultra 10's groups and tests,
+in its order and words, at the level `diag-level` gives: the NVRAM; the D-TLB's tags and entries; the E-cache's
 data and tags; the processor's instructions, tick, soft traps and
 interrupts; the MMUs' registers; the D- and I-caches' arrays; the FPU, its
 registers, operations and trap; the UPA data bus; memory, through the
 E-cache and around it, with block loads and stores; the PCI bus module's
 PIO address decoding and byte enables, interrupt maps and states, IOMMU registers and TLB, and PCI registers; the
-MMUs' misses, byte order and ASIs; the traps for errors, misaligned
-accesses and protection; the RIO's configuration; a PCI master abort; with
-`show-post-results`) are part of the platform;
-the selftests (`test`, `test-all`) of the Rage Pro, the Ethernet and the
+MMUs' misses, byte order and ASIs; the traps for errors (a PCI master
+abort among them), misaligned accesses and protection (`post.fth` takes
+its result); the RIO EBus's DMA test is not there yet. The
+selftests (`test`, `test-all`) of the Rage Pro, the Ethernet and the
 floppy drive are in their drivers.
 
 They are built on the release's PCI, serial, keyboard and network code
@@ -144,10 +163,93 @@ other files, with Sun's notices kept and a note of what changed:
 | `obp/arch/sun4u/ultra5_10/cleanup.fth` | `obp/arch/sun4v/niagara/cleanup.fth` (unchanged) |
 | `obp/arch/sun4u/ultra5_10/console-tty.fth` | `obp/arch/sun4v/console-tty.fth` |
 | `obp/dev/ebus/su/io.fth` | `obp/dev/serial/su16550/io.fth` (the UARTs' clock) |
+| `obp/arch/sun4u/ultra5_10/ui-cvars-u10.fth` | `obp/pkg/confvar/interfaces/ui-cvars.fth` (printenv's columns and defaults as an Ultra 10's) |
+| `obp/arch/sun4u/ultra5_10/nvramrc-u10.fth` | `obp/pkg/confvar/interfaces/nvramrc.fth` (nvramrc's size and nvrecover as an Ultra 10's) |
 
 `build.sh` builds the drop-ins a platform's `dropins.src` lists with GNU
 make (`host/dropins.mk`), and runs in Docker with the whole `firmware`
 folder (for the Rage Pro's FCode).
+
+### The NVRAM
+
+The configuration variables are an Ultra 10's, no more (the release's
+others are left out: `verbosity`, `error-reset-recovery`,
+`auto-boot-on-error?`, `network-boot-arguments`), and each is kept where an
+Ultra 10 keeps it in the M48T59, in its encoding, with its lengths and
+defaults (`fixed-u10.fth`, `loadconfig.fth`), with its checksum (byte 0:
+0x17 XOR bytes 0x00C-0x1CD7). So a machine's settings are read as they
+are. Past that area, an Ultra 10's power-on selftest keeps its scratch test
+and working data (0x1CD8-0x1E0F), and ours tests the NVRAM at the same
+place (0x1D00-0x1D3F); the release's hashed store (for nothing an Ultra 10
+keeps) and its keys follow (0x1E10-0x1FD7), where an Ultra 10 never writes
+(zeros on one that has never run its power-on selftest). `printenv` lays
+its table out as an Ultra 10 does.
+
+The Ultra 10's quirks are followed, as there is no telling whether anything
+relies on them:
+
+- A string is cut to its field (the field's size less 2) and its length
+  kept in a byte: `boot-device` and `diag-device` hold 256, so a value of
+  256 bytes or more is stored empty. A length past its field reads as
+  empty.
+- `security-mode` and `system-board-date`'s length are the same byte
+  (0x050): setting either changes the other; `security-mode` shows `none`
+  for any byte but 1 (command) and 2 (full).
+- `security-password` is kept as it is typed, its length and up to 8
+  characters.
+- `nvramrc` is at the top of the area (its text ending at 0x1CD5, up to
+  5282 bytes), its length at 0x2BC and again at 0x1CD6: `set-defaults`
+  zeroes the first only, and `nvrecover` puts the text it left in the
+  editor (stored by `nvstore`).
+- `mfg-mode`, `diag-switch?`, `diag-level` and `#power-cycles` are outside
+  the checksum.
+- At a bad checksum (or an all-zero area), "Setting NVRAM parameters to
+  default values.": the defaults, `oem-banner` and `oem-logo` emptied, and
+  `diag-switch?` true (which `set-defaults` alone does not do).
+
+### The memory
+
+The memory is found and sized as an Ultra 10 does it, in two steps.
+The reset code (`reset.fth`), with the memory controller in 10-bit column
+mode, looks for each DIMM of the two pairs (0, at 0, and 2, at 256 MiB),
+sizes it, and with 11-bit columns tests a marker 16 KiB up (column bit 10)
+to tell DIMMs with 11-bit column DRAMs from those with 10-bit (Sun's 16 MB
+DIMM). It turns 11-bit mode on if the 11-bit DIMMs give at least the memory
+10-bit columns would give all of them, and puts OpenBoot at the top of the
+highest-addressed pair side the mode uses. OpenBoot's `probe-memory`
+(`memprobe.fth`) then sizes each pair again, both sides, for the memory
+node's `reg` (pair 0, then pair 2). In 11-bit mode a pair of 10-bit DIMMs
+is left unused ("Unused 10 bit Column DIMMS - See User's Manual!" in
+diagnostic mode); an unused or empty pair is switched off in Mem_Control0.
+The Ultra 10's quirks are followed:
+
+- the reset code looks for the second DIMM's second side at +512 MiB +
+  0x10 (the first DIMM's place); `probe-memory` at +512 MiB + 8;
+- a DIMM's second side is taken to be the size of its first;
+- in 11-bit mode on an UltraSPARC-IIi of version 12.10, an unused pair is
+  not switched off;
+- the memory controller's timing (Mem_Control1) at reset is 0626.128a on a
+  processor of mask version below 8.0, else 0c4a.ab14.
+
+Once the memory is known, OpenBoot tunes the memory controller as an Ultra
+10 does: ECC on (off while `probe-memory` probes), the refresh interval
+from the measured clock and the pairs in use (clock in Hz / 2048000 /
+pairs, the IIi manual's formula), and Mem_Control1's timings from a table
+by the clock in MHz, for 50 ns DRAMs, or 60 ns ones when both pairs are in
+use; the banner then names the speed ("256 MB (50 ns) memory installed").
+The free memory's check bits are then set ("Initializing ... megs of
+memory at addr ..." in diagnostic mode, "Initializing Memory" otherwise).
+
+OpenBoot lives in the top 1 MiB of that pair side, as on an Ultra 10: its
+image in the top 512 KiB (mapped at f000.0000 by one locked 512 KiB TLB
+entry), its first 64 KiB of RAM below that, and the memory it takes as it
+runs (its heap, page tables, processor structures, the dictionary's
+growth a page at a time, the IOMMU's table) from the rest of the 1 MiB;
+the retained page (`arch/sun4u/retained.fth`) is the page just below.
+The rest is free for the client (`/memory`'s `available`), the 1 MiB's
+unused part with it. The IOMMU's table is the Ultra 10's 16 KiB, for the
+16 MB of DVMA from c000.0000 OpenBoot uses (the IOMMU is told 128K entries;
+the client sets up its own).
 
 The release's own files are unchanged, but for:
 
@@ -155,6 +257,14 @@ The release's own files are unchanged, but for:
   every 10 microseconds for the first millisecond before polling every
   millisecond, so that a drive's brief busy time between the blocks of a
   transfer doesn't cost a millisecond a block.
+- `obp/fm/lib/suspend.fth`: the pager's prompt is an Ultra 10's, "More
+  [<space>,<cr>,q,n,p,c] ?" (the release's begins with a space).
+- `obp/dev/pci/device-props.fth`: on the Ultra 5/10 a PCI device's cache
+  line size and latency timer are set but not made properties, as on an
+  Ultra 10 (its device tree has none).
+- `obp/os/bootprom/initdict.fth` and `obp/arch/sun4u/retained.fth`: a
+  system may set the dictionary's growth step and the retained page's
+  alignment (the Ultra 5/10's: a page, and 1 MiB).
 - `obp/fm/kernel/fileio.fth`: an error at the end of a string being
   evaluated shows the string ("Evaluating: boot"); the line was looked for
   from one past its end, and shown empty.

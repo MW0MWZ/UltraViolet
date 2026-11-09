@@ -7,7 +7,7 @@ copyright: Copyright 2026 Andy Taylor
 \ OpenBoot's console before the device tree is built (ukey, ukey? and
 \ uemit, as arch/sun4v/hyperconsole.fth gives them through the hypervisor):
 \ the RIO EBus's SAB82532 (ESCC2), its channel A, polled, at 9600 baud, 8
-\ data bits, no parity, 1 stop bit, set up as the machine's own OpenBoot
+\ data bits, no parity, 1 stop bit, set up as an Ultra 10
 \ sets it up.
 
 headerless
@@ -55,5 +55,5 @@ h# 41 constant cmdr-reset	\ reset the receiver and transmitter
 headers
 alias ukey  uart-key
 alias ukey? uart-key?
-alias uemit uart-emit
+defer uemit  ' uart-emit is uemit	\ (and kept for the console: msgemit.fth)
 headerless

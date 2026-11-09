@@ -4,7 +4,7 @@ id: @(#)diag.fth 1.0 26/11/07
 purpose: The Ultra 5/10's diagnostic commands
 copyright: Copyright 2026 Andy Taylor
 
-\ OpenBoot 3.x's commands for the Ultra 5/10 that the release has no form
+\ The Ultra 5/10's own commands that the release has no form
 \ of: .speed, eject-floppy, probe-pci and probe-pci-slot (watch-clock and
 \ date are the clock's, in its driver; show-post-results is the POST's).
 

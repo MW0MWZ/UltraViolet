@@ -101,9 +101,6 @@ bool Session::power_on(std::string& error) {
     Ultra5_10::Options o = s.options();
     if (!select_flash(s, prom, o.prom, error)) return false;
     apply_log_level(s.log);
-    // OpenBoot 3.x's NVRAM layout (which the machine's screen setting writes);
-    // UltraViolet's OpenBoot keeps its own.
-    o.nvram_obp3 = !prom.version.empty() && prom.version[0] == '3';
     std::string fcode_path;
     if (s.upa == "creator3d" && !select_creator3d_fcode(s, o.creator3d_fcode, fcode_path, error)) return false;
     if (s.net == "user") {
@@ -134,6 +131,7 @@ bool Session::power_on(std::string& error) {
         UV_LOG(Info, "session", "Creator3D FCode PROM: %s", fcode_path.empty() ? "UltraViolet's, built in" : fcode_path.c_str());
     machine_->cpu().set_block_cache(s.block_cache);
     machine_->cpu().set_jit(s.jit);
+    machine_->cpu().set_jit_check(s.jit && s.jit_check);
     machine_->cpu().set_idle_skip(s.idle_skip);
     slice_ = static_cast<u64>(s.cpu_mhz * 1000);
     disc_ = s.cdroms.empty() ? -1 : 0;

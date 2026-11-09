@@ -149,6 +149,22 @@ prom() {
     say "$NAME: $OUT/$NAME/openboot.bin"
 }
 
+# The POST: its C and assembler sources in DIR, built freestanding for the
+# UltraSPARC IIi (32-bit addresses, run from memory with the MMU off) and
+# linked as DIR/post.ld lays it out, into post.bin.
+post_program() {
+    say "$NAME: POST"
+    for f in "$1"/*.S "$1"/*.c; do
+        sparc64-linux-gnu-gcc -m32 -mcpu=ultrasparc -O2 -ffreestanding -fno-pic -fno-builtin \
+            -fno-asynchronous-unwind-tables -fno-stack-protector -Wall -I"$1" \
+            -DPOST_DATE="\"$(date -u '+%Y/%m/%d %H:%M')\"" \
+            -c "$f" -o "post-$(basename "$f").o"
+    done
+    sparc64-linux-gnu-ld -m elf32_sparc --no-warn-execstack --no-warn-rwx-segments -T "$1/post.ld" \
+        post-*.o "$(sparc64-linux-gnu-gcc -m32 -print-libgcc-file-name)" -o post.elf
+    sparc64-linux-gnu-objcopy -O binary post.elf post.bin
+}
+
 # A tokenized FCode program: tokenize SOURCE.tok OUTPUT.fc
 tokenize() {
     $FORTH32 -d "$BP/pkg/tokenizr/sparc/tokenize.dic" -D tokenizer? $FLAGS \
@@ -157,7 +173,8 @@ tokenize() {
 
 # A system: its OpenBoot built as systems/NAME.mk describes it (the
 # platform's release folder, flags, load and reset files), then padded to
-# its flash PROM's size and installed if it says so.
+# its flash PROM's size with erased (ff) bytes, and that whole flash image
+# installed if it says so.
 system() {
     desc=$ROOT/systems/$1.mk
     val() { sed -n "s/^$1[ \t]*=[ \t]*//p" "$desc" | sed 's/[ \t]*$//'; }
@@ -166,14 +183,31 @@ system() {
     image; reset; prom
     cd "$OUT/$NAME"
     flash=$(val FLASH)
+    image=openboot.bin
     if [ -n "$flash" ]; then
         size=$(wc -c < openboot.bin)
+        [ "$size" -le "$flash" ] || { echo "$NAME: image ($size bytes) larger than its flash PROM ($flash)" >&2; exit 1; }
         { cat openboot.bin; head -c $((flash - size)) /dev/zero | tr '\000' '\377'; } > "$NAME.bin"
+        image=$NAME.bin
         say "$NAME: $OUT/$NAME/$NAME.bin"
+    fi
+    # The power-on selftest, a program of its own (POST: its source folder
+    # under the root), placed in the flash PROM at POST_AT. The flash image
+    # with it is $NAME-post.bin; it is the one installed when POST_ON is yes.
+    post=$(val POST) post_at=$(val POST_AT)
+    if [ -n "$post" ]; then
+        post_program "$ROOT/$post"
+        size=$(wc -c < openboot.bin) psize=$(wc -c < post.bin)
+        [ "$size" -le "$post_at" ] || { echo "$NAME: image ($size bytes) past the POST's place ($post_at)" >&2; exit 1; }
+        [ $((post_at + psize)) -le "$flash" ] || { echo "$NAME: POST ($psize bytes) past the flash PROM's end" >&2; exit 1; }
+        { cat openboot.bin; head -c $((post_at - size)) /dev/zero | tr '\000' '\377'
+          cat post.bin; head -c $((flash - post_at - psize)) /dev/zero | tr '\000' '\377'; } > "$NAME-post.bin"
+        say "$NAME: $OUT/$NAME/$NAME-post.bin"
+        [ "$(val POST_ON)" = yes ] && image=$NAME-post.bin
     fi
     install=$(val INSTALL)
     if [ -n "$install" ]; then
-        cp openboot.bin "$ROOT/$install"
+        cp "$image" "$ROOT/$install"
         say "$NAME: $ROOT/$install"
     fi
 }

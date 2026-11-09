@@ -45,6 +45,7 @@ fload ${BP}/os/bootprom/availmem.fth
 fload ${BP}/arch/sun4u/ultra5_10/ramforth.fth	\ S Ramforth
 fload ${BP}/os/bootprom/allocmor.fth
 fload ${BP}/os/bootprom/msgbuf.fth
+fload ${BP}/arch/sun4u/ultra5_10/msgemit.fth	\ ttya's early text kept
 
 fload ${BP}/arch/sun4s/reentry-table.fth
 fload ${BP}/arch/sun4u/cpustruct.fth		\ S Allocate cpu structs
@@ -101,6 +102,7 @@ stand-init: Loading Builtin Devices
 ;
 
 fload ${BP}/arch/sun4u/ultra5_10/loadconfig.fth
+fload ${BP}/arch/sun4u/ultra5_10/diagmsg.fth	\ the probing messages
 fload ${BP}/arch/sun/idprom.fth			\ IDPROM layout
 fload ${BP}/arch/sun4u/ultra5_10/nvram.fth	\ NVRAM and IDPROM packages
 fload ${BP}/arch/sun4u/ultra5_10/devalias.fth	\ Device aliases
@@ -108,14 +110,15 @@ fload ${BP}/arch/sun4u/ultra5_10/cpu.fth	\ The processor's node
 
 ' diag-switch? is diagnostic-mode?
 
-stand-init: Track firmware verbosity
-   " verbosity" ['] options search-wordlist if
-      get to fw-verbosity
-   then
+\ The firmware's messages at the release's "min" verbosity, always: an Ultra 10
+\ has no verbosity variable.
+stand-init: Firmware verbosity
+   VRBS-MIN to fw-verbosity
 ;
 
 fload ${BP}/arch/sun4u/ultra5_10/memprobe.fth	\ S memory sizer
 fload ${BP}/os/bootprom/scrubmem.fth
+fload ${BP}/arch/sun4u/ultra5_10/memscrub.fth	\ its display, as an Ultra 10's
 
 fload ${BP}/arch/sun/keystore.fth		\ Security keystore
 
@@ -174,8 +177,9 @@ fload ${BP}/arch/sun4u/ultra5_10/post.fth	\ system-tests, show-post-results
 true value system-test-ok?
 
 fload ${BP}/arch/sun4u/startup.fth \ S misc. startup stuff
+' .post-failure is pre-boot-hook		\ (post.fth): a failed POST's cause
+' (.memory-speed) is .memory-speed	\ (memprobe.fth): the DRAMs' speed
 
-fload ${BP}/arch/sun4v/auto-boot-on-error.fth
 
 headers
 fload ${BP}/arch/sun4u/ultra5_10/console-tty.fth

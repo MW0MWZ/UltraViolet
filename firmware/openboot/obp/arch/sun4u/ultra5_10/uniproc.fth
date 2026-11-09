@@ -16,22 +16,33 @@ headerless
 : xcall-resume-cpu ( cpu# -- failed? )  drop true  ;
 : xcall-get-pc ( cpu# -- pc failed? )  drop 0 true  ;
 
-\ The Sabre's reset control: POR (bit 31) set by a power-on reset.
+\ The Sabre's reset control: POR (bit 31) set by a power-on reset, SOFT_POR
+\ (bit 30) by reset-all. Read once, at its first use, and kept: the start
+\ clears the register (below), and the reason is asked for after that
+\ (#power-cycles, POST, retained memory).
 h# 1fe.0000.f020 constant reset-status-pa
-: power-on-reset? ( -- flag )
-   reset-status-pa bypass-asi spacex@ h# 8000.0000 and 0<>
+-1 value reset-status
+: reset-status@ ( -- n )
+   reset-status -1 =  if
+      reset-status-pa bypass-asi spacex@ to reset-status
+   then  reset-status
 ;
+: power-on-reset? ( -- flag )  reset-status@ h# 8000.0000 and 0<>  ;
 \ The root's reset-reason: a power-on, or one the Sabre's reset control
-\ made (SOFT_POR, bit 30: reset-all)
-: soft-power-on-reset? ( -- flag )
-   reset-status-pa bypass-asi spacex@ h# 4000.0000 and 0<>
-;
+\ made (SOFT_POR: reset-all)
+: soft-power-on-reset? ( -- flag )  reset-status@ h# 4000.0000 and 0<>  ;
 stand-init: Reset reason
    root-device
       power-on-reset? if  " POR"  else
       soft-power-on-reset? if  " S-POR"  else  " RESET"  then  then
       encode-string " reset-reason" property
    device-end
+   \ The reset control's bits cleared, as an Ultra 10 does at each start:
+   \ the value read written back (POR, B_POR and B_XIR clear when written
+   \ with 1), then 0 (SOFT_POR and SOFT_XIR hold what is written). A
+   \ SOFT_POR left set would make the next reset-all's write of it no reset.
+   reset-status@ reset-status-pa bypass-asi spacex!
+   0 reset-status-pa bypass-asi spacex!
 ;
 
 \ On to the client (go): OpenBoot's own pending soft interrupt (level 14)
@@ -66,8 +77,22 @@ defer .keyboard-type
 ;
 ' (.keyboard-type) is .keyboard-type
 
-\ Each entry to OpenBoot: the keyboard's keys forgotten (see its restore).
+\ The console's output a display.
+: display-output? ( -- flag )
+   stdout @ ?dup 0= if  false exit  then  ihandle>phandle	( phandle )
+   " device_type" rot get-package-property if  false exit  then	( adr len )
+   decode-string 2swap 2drop  " display" $=
+;
+
+\ Each entry to OpenBoot: the keyboard's keys forgotten (see its restore),
+\ and the display's console state put back (its restore, the terminal
+\ emulator's reset-screen: a client such as X leaves the card its own).
+\ (enter-forth's ?reset-video asks the display for a reset-screen method,
+\ which the terminal emulator gives it as restore.)
 : (clear-keyboard) ( -- )
+   display-output? if
+      " restore" stdout @ ['] $call-method catch if  3drop  then
+   then
    keyboard-input? 0= if  exit  then
    " restore" stdin @ ['] $call-method catch if  3drop  then
 ;

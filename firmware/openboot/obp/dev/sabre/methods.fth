@@ -53,6 +53,37 @@ h#   00.0000 constant bus-b-io		h#   c0.0000 constant /bus-b-io
 
 : sabre-prober ( probe$ -- )  2drop probe-apb  ;
 
+\ The release's prober, but with an Ultra 10's messages in diagnostic
+\ mode (the release's own 4.x ones kept quiet): for each device on the bus
+\ (a Simba's: it is the prober-xt the bridges below use, and runs as them),
+\ "Probing <bus> at Device <n>  ", the names of the nodes made for it as
+\ they are set, or "Nothing there" (OpenBoot's diagmsg.fth, by the root's
+\ methods). An Ultra 10 says nothing for the Sabre's own bus, the two Simbas.
+: root-method ( method$ -- xt true | false )
+   " /" find-package  if  find-method  else  2drop false  then
+;
+: quietly ( ?? xt -- ?? )
+   " probe-quietly" root-method  if  execute  else  execute  then
+;
+: pci-prober31 ( probe-list$adr,len -- )
+   pci-depth 9 > if
+      ." Maximum PCI probe depth " pci-depth . ." exceeded;"
+      ." No further PCI bridge devices can be probed" cr
+      2drop exit
+   then
+   pci-depth dup >r 1+ to pci-depth		( $adr,len ) ( r: old-depth )
+   begin  dup  while				( $adr,len )
+      ascii , left-parse-string			( rem$ dev#$ )
+      " "  2swap				( rem$ arg$ dev#$ )
+      2dup my-self ihandle>phandle		( rem$ arg$ dev#$ dev#$ phandle )
+      " probe-line-open" root-method  if  execute  else  3drop  then
+      ['] pci-probe-self quietly		( rem$ )
+      " probe-line-close" root-method  if  execute  then
+   repeat					( null$ )
+   2drop
+   r> to pci-depth
+;
+
 external
 
 : decode-unit ( adr len -- phys.lo phys.mid phys.hi )
@@ -70,8 +101,8 @@ external
 ;
 
 : assign-int-line ( int phys.hi -- false )		2drop false  ;
-: prober ( adr len -- )					sabre-prober  ;
-: prober-xt ( -- adr )					['] pci-prober  ;
+: prober ( adr len -- )					['] sabre-prober quietly  ;
+: prober-xt ( -- adr )					['] pci-prober31  ;
 
 variable my-memlist  my-memlist off
 variable my-io-list  my-io-list off

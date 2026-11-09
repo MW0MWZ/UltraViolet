@@ -116,10 +116,9 @@ bool read_prom(const PromImage& p, std::vector<u8>& data, std::string& error) {
 }
 
 std::vector<u8> builtin_prom() {
-    // The image as built, then the rest of the flash erased (0xFF).
-    std::vector<u8> d(std::begin(kOpenbootProm), std::end(kOpenbootProm));
-    d.resize(kFlashSize, 0xFF);
-    return d;
+    // The whole flash PROM as built (the erased rest already 0xFF).
+    static_assert(sizeof kOpenbootProm == kFlashSize, "the built-in OpenBoot must be the whole flash PROM");
+    return std::vector<u8>(std::begin(kOpenbootProm), std::end(kOpenbootProm));
 }
 
 PromImage builtin_prom_image() {
