@@ -60,9 +60,13 @@ h# 80.0000.0000 constant ec-data
    ver@ d# 24 rshift h# ff and " mask#" integer-property
 ;
 
-stand-init: Making cpu node
+: make-cpu-node ( -- )
    0 0 " 0,0" " /" begin-package
       make-cpu-props
    end-package
+;
+\ (Quietly: an Ultra 10 says nothing of it in diagnostic mode.)
+stand-init: Making cpu node
+   ['] make-cpu-node quietly
 ;
 headers

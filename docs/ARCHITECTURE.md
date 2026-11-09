@@ -131,7 +131,9 @@ and the native macOS menu bar, in `src/app/`.
    window cached in host registers, inline memory access through the soft
    TLB, and delay slots and annulled branches handled in the generated code.
    Each JIT feature is checked against the interpreter instruction by
-   instruction.
+   instruction. The same check can be run on any guest: `--jit-check` (or
+   Settings > Performance > Check the JIT) runs every translated block
+   again in the interpreter and stops the processor with the differences.
 
 ## Timing
 

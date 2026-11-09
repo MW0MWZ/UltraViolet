@@ -20,7 +20,10 @@ colour logo. Solaris attaches its Creator3D driver to
 it and runs its window system on it. Back in OpenBoot from a client it sets
 the console's window lookups, palette and FBC state again, and gives every
 pixel the console's window ID (its colour kept), so the console shows
-whatever state the window system left.
+whatever state the window system left. Each of its drawings sets the FBC's
+console state first, so that what a client prints through it while the
+window system runs (Solaris's "syncing file systems" at a halt) is drawn
+over the window system's screen, as with the card's own FCode.
 
 It is written from the card's open documentation: the X.Org `sunffb`
 driver's register definitions, the NetBSD, OpenBSD and Linux drivers,

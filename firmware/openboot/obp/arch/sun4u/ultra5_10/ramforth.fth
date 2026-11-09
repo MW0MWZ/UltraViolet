@@ -5,9 +5,10 @@ purpose: OpenBoot's memory, and leaving the reset code's TLB entries
 copyright: Copyright 2026 Andy Taylor
 
 \ What arch/sun4v/ramforth.fth does for sun4v, on the Ultra 5/10: the reset
-\ code has copied OpenBoot into the 8 MiB block at the top of memory and
-\ mapped it with locked TLB entries (the image at monvirtbase, its RAM at
-\ RAMbase, and itself at 0). Here OpenBoot's page tables take over those
+\ code has put OpenBoot in the 1 MiB at the top of memory (mem-base on, as
+\ an Ultra 10 has it) and mapped it with locked TLB entries (the image, in
+\ the top 512 KiB, at monvirtbase; its RAM, the 64 KiB below, at RAMbase;
+\ and itself at 0). Here OpenBoot's page tables take over those
 \ mappings, and the reset code's entries are taken out, so that the MMU
 \ miss handlers map the rest from then on.
 
@@ -16,13 +17,11 @@ false value forth-in-ram?
 : (romforth) ( -- )  ; immediate
 
 : mem-base ( -- pa.lo pa.hi )
-   hi-memory-base @  pageshift lshift ( base+ )
-   8meg round-down  obmem             ( pa.lo pa.hi )
+   hi-memory-base @  pageshift lshift ( base )
+   /obp-memory round-down  obmem      ( pa.lo pa.hi )
 ;
-: RAMphys ( -- pa.lo pa.hi )
-   mem-base >r  2meg + h# 1.0000 - r>
-;
-: ROMphys ( -- pa.lo pa.hi )  mem-base  ;
+: ROMphys ( -- pa.lo pa.hi )  mem-base >r  /obp-image + r>  ;
+: RAMphys ( -- pa.lo pa.hi )  ROMphys >r  RAMsize-start - r>  ;
 
 headerless
 \ A locked entry for a virtual address taken out of a TLB: each entry whose
@@ -42,7 +41,7 @@ headerless
 ;
 
 \ The reset code's own entry (0, in both TLBs) and its entry for RAMbase
-\ are taken out; OpenBoot's 4 MiB at monvirtbase stays locked in both, as
+\ are taken out; the image's 512 KiB at monvirtbase stays locked in both, as
 \ sun4u needs it to (the trap table and the MMU miss handlers are there,
 \ and run when nothing else is mapped).
 : flush-temporary-mappings ( -- )
@@ -55,9 +54,9 @@ headers
    true to forth-in-ram?
    \ The page tables' root, at the top of OpenBoot's RAM.
    RAMphys drop pagesize - setup-root-vpt
-   \ Their entries for RAMbase, RAMsize and the image (4 MiB).
+   \ Their entries for RAMbase, RAMsize and the image (512 KiB).
    RAMphys RAMbase RAMsize-start map-pages
-   mem-base monvirtbase 4meg map-pages
+   ROMphys monvirtbase /obp-image map-pages
    enable-map-flushing
    flush-temporary-mappings
 ;

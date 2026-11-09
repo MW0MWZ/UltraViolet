@@ -39,9 +39,24 @@ root-device
       1 lshift h# 1c0 or  over d# 32 rshift or		( offset pa.hi )
       swap h# ffff.ffff and swap			( pa.lo pa.hi )
    ;
+
+   \ The probing lines in diagnostic mode (diagmsg.fth), for the
+   \ PCI bus module's prober (FCode: it finds these as the root's methods).
+   \ A line for a device on a bus, closed with its names or "Nothing there";
+   \ and a probe made with the release's own (4.x) messages off.
+   : probe-line-open ( dev$ bus-phandle -- )
+      diag-probe?  if
+         ??cr ." Probing "  phandle>devname type  ."  at Device "  type 2 spaces
+         open-probe-line
+      else
+         3drop
+      then
+   ;
+   : probe-line-close ( -- )  diag-probe?  if  close-probe-line  then  ;
+   : probe-quietly ( ?? xt -- ?? )  quietly  ;
 device-end \ root device
 
-\ /openprom: the machine's own firmware has decode-complete there.
+\ /openprom: an Ultra 10 has decode-complete there.
 " /openprom" find-device
    0 0 " decode-complete" property
 device-end

@@ -71,11 +71,6 @@ public:
         double cpu_hz = 440e6;
         u32 ecache_bytes = 2u << 20;
         std::vector<u8> prom;    // the flash image (1 MiB: OpenBoot, then POST)
-        // The NVRAM is OpenBoot 3.x's layout: a new one gets its defaults,
-        // and the screen's mode goes into its output-device. (Other
-        // firmware, such as UltraViolet's OpenBoot 4.23, keeps its own
-        // layout: a new NVRAM is left to it, with the IDPROM.)
-        bool nvram_obp3 = true;
         std::string nvram_path;  // NVRAM contents, loaded at start and saved on stop
         // The Ethernet address a new NVRAM gets (none: a random Sun address,
         // 08:00:20:xx:xx:xx, the host ID's serial the same last three bytes).

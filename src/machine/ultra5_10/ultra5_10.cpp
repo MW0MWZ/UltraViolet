@@ -248,7 +248,7 @@ Ultra5_10::Ultra5_10(const Options& options)
             t = find_timing(list, "1152x900");
         }
         (ffb_ ? ffb_->monitor() : mach64_.monitor()).set_edid(monitor_edid(list, *t));
-        if (opt_.nvram_obp3) set_screen_mode(std::to_string(t->width) + "x" + std::to_string(t->height) + "x" + std::to_string(t->rate));
+        set_screen_mode(std::to_string(t->width) + "x" + std::to_string(t->height) + "x" + std::to_string(t->rate));
     }
 
     bus_.set_rom_write_handler([this](u64 pa, unsigned size, u64 value) {
@@ -311,8 +311,10 @@ bool Ultra5_10::nvram_blank() const {
 }
 
 // A new NVRAM, as a machine that has been set up before: the pattern a
-// real Ultra 10's part holds wherever OpenBoot has not written (a real Ultra 10:
-// 0x55, 0x00, 0xAA and 0xFF, 64 bytes each, over and over), OpenBoot
+// real Ultra 10's part holds wherever OpenBoot has not written in its
+// configuration area (a real Ultra 10: 0x55, 0x00, 0xAA and 0xFF, 64 bytes
+// each, over and over), and zeros above it to the IDPROM (0x1CD8-0x1FD7, as
+// a real Ultra 10 that has never run the power-on selftest reads), OpenBoot
 // 3.31's configuration defaults as it writes them over it, then the boot
 // from the disk alone (not the network after it: a machine with nothing to
 // boot stops at ok), the diagnostics at their least and the diagnostic
@@ -323,8 +325,9 @@ bool Ultra5_10::nvram_blank() const {
 // XOR every byte from 0x0C to 0x1CD7), byte 1 diag-switch? (0 or 0xFF),
 // byte 2 diag-level (0x20 min, 0x40 max, 0x80 menus), bytes 8-0x0B the
 // power-cycle count (#power-cycles, 32 bits); strings as a length, the text and a 0; flags 0 or
-// 0xFF. Above 0x1CD8, outside the checksum, are its own records, which
-// it writes as it boots.
+// 0xFF. Above 0x1CD8, outside the checksum, the power-on selftest keeps its
+// scratch test and working data (0x1CD8-0x1E0F, at a power-on in diagnostic
+// mode); the rest OpenBoot 3.31 never writes.
 // DRAM geometry: 16 bytes per column, the bank's columns as its DRAMs have
 // them, the rest of its address in the rows.
 void Ultra5_10::map_memory(bool col11) {
@@ -372,7 +375,7 @@ bool Ultra5_10::MismatchedBank::write(u64 offset, unsigned n, u64 value) {
 void Ultra5_10::write_new_nvram() {
     u8* p = nvram_.data();
     static constexpr u8 kFill[4] = {0x55, 0x00, 0xAA, 0xFF};
-    for (unsigned i = 0; i < kNvramIdprom; ++i) p[i] = kFill[(i >> 6) & 3];
+    for (unsigned i = 0; i < kNvramIdprom; ++i) p[i] = i < kNvramConfigEnd ? kFill[(i >> 6) & 3] : u8{0};
     // OpenBoot 3.31's defaults, as it writes them (found by letting it set
     // them over the pattern): runs of zeros, then the values.
     static const struct {

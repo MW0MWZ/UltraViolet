@@ -9,7 +9,10 @@ copyright: Copyright 2026 Andy Taylor
 \ and BAR1 (offset 14: the other devices, 8 MB at F100.0000). A child's
 \ address is the window's BAR offset and the offset in it ("14,400000").
 
-" ebus" name
+\ Named, while the PCI bus is probed, as an Ultra 10's probe names it then
+\ (by its IDs: no driver for it yet); "ebus", and its devices,
+\ once the PCI probe is over (probe-ebus, ebus.tok), as an Ultra 10.
+" pci108e,1000" name
 my-space constant ebus-space			\ Our PCI function
 2 " #address-cells" integer-property
 1 " #size-cells" integer-property
@@ -90,7 +93,7 @@ headerless
 \ The SuperIO (a PC87332, at 30.0000 in the second window): its
 \ configuration registers, through an index and a data port (15c, 15d)
 \ where a register takes the second of two writes to the data port
-\ (PC87332 datasheet, 2.2). It is set up as the Ultra 5/10's own firmware
+\ (PC87332 datasheet, 2.2). It is set up as an Ultra 10
 \ sets it up: the parallel port, both UARTs and the floppy controller on
 \ (FER), at the PC's usual addresses (FAR), the rest at their defaults.
 h# 30.015c constant superio-index

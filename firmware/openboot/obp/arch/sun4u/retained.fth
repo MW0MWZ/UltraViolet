@@ -39,6 +39,8 @@
 \ any nuclear facility. 
 \ 
 \ ========== Copyright Header End ============================================
+\ Adapted by Andy Taylor, 2026: a system may set retained-min-align (the
+\ Ultra 5/10 keeps the page just below OpenBoot's 1 MiB).
 id: @(#)retained.fth 1.20 06/02/16
 purpose: 
 copyright: Copyright 2006 Sun Microsystems, Inc.  All Rights Reserved
@@ -64,7 +66,9 @@ defer retained-phys-hook ( pa.lo pa.hi size -- pa.lo' pa.hi' size' )
 ' noop is retained-phys-hook
 
 pagesize constant /retained
+[ifnexist] retained-min-align
 16meg constant retained-min-align
+[then]
 
 : retained-phys ( -- pa.lo pa.hi size )
    hi-memory-base @

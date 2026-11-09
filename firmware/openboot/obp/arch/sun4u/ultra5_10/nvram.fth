@@ -10,9 +10,14 @@ copyright: Copyright 2026 Andy Taylor
 \ (pkg/confvar) and the IDPROM code (arch/sun/idprom.fth) read them through
 \ packages of device types "nvram" and "idprom", as sun4v's (dev/sun4v-
 \ devices/legion-nvram) give them; these are here, in /packages, to be
-\ there before the device tree is probed. The NVRAM's partitions are
-\ sun4v's: the fixed variables (40 bytes), the others (16c0), the keys
-\ (100).
+\ there before the device tree is probed. The partitions: the fixed
+\ variables, the whole of an Ultra 10's configuration area (0-1cd7,
+\ fixed-u10.fth); past it, after what an Ultra 10's power-on selftest keeps there
+\ (its scratch test and working data, 1cd8-1e0f, at a power-on in
+\ diagnostic mode; zeros on a machine that has never run it), the
+\ release's hashed store (c8, for nothing of the Ultra 10's) and the keys (100),
+\ in what an Ultra 10 never writes. Each byte written to 00c-1cd7 keeps its
+\ checksum (byte 0: 17 XOR those bytes).
 
 headerless
 h# 1ff.f100.0000 constant nvram-pa
@@ -20,9 +25,16 @@ h# 1ff.f100.0000 constant nvram-pa
 : nvram-c@ ( offset -- b )  nvram-pa + bypass-asi spacec@  ;
 : nvram-c! ( b offset -- )  nvram-pa + bypass-asi spacec!  ;
 
-h#    0 constant nvfixed-base	h#   40 constant /nvfixed-region
-h#   40 constant nvhash-base	h# 16c0 constant /nvhash-region
-h# 1700 constant keystore-base	h#  100 constant /keystore-region
+\ A byte stored, the checksum (byte 0) kept for it.
+: u10-c! ( b offset -- )
+   dup h# c h# 1cd8 within  if			( b offset )
+      2dup nvram-c@ xor  0 nvram-c@ xor  0 nvram-c!	( b offset )
+   then  nvram-c!
+;
+
+h#    0 constant nvfixed-base	h# 1cd8 constant /nvfixed-region
+h# 1e10 constant nvhash-base	h#   c8 constant /nvhash-region
+h# 1ed8 constant keystore-base	h#  100 constant /keystore-region
 h#    0 constant nvraw-base	h# 1fd8 constant /nvraw-region
 h# 1fd8 constant idprom-base	h#   20 constant /idprom-region
 
@@ -72,7 +84,7 @@ new-device
    ;
 
    : write ( adr len -- len' )
-      clip-range  tuck 0 ?do  dup i + c@ i pos nvram-c!  loop  drop
+      clip-range  tuck 0 ?do  dup i + c@ i pos u10-c!  loop  drop
       dup bump-pos
    ;
 
@@ -113,14 +125,11 @@ device-end
 stand-init: Attach the NVRAM and IDPROM
    " /packages/nvram" find-package if  to nvram-package  then
    " /packages/idprom" find-package if  to idprom-phandle  then
-   install-nvram
+   install-nvram-u10
    ['] init-idprom catch drop
 ;
 
-\ Each power-on counted, as OpenBoot 3.x counts them.
-stand-init: Count the power cycles
-   power-on-reset?  if  #power-cycles 1+ to #power-cycles  then
-;
+\ (#power-cycles is counted by the reset code, at a hardware power-on.)
 
 \ After a watchdog reset or a RED state exception OpenBoot boots only
 \ with watchdog-reboot? true; otherwise it stops at the ok prompt.

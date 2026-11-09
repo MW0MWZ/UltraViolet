@@ -60,16 +60,19 @@ h# 0100.0000 constant io-size
 0 1 lxjoin constant mem-size
 
 \ DVMA: the 512 MB the target address space register enables, translated by
-\ the IOMMU through a TSB of 128K entries (as for a 1 GB space, so that the
-\ index of C000.0000 is 0) of 8 KB pages.
+\ the IOMMU with 8 KB pages through a TSB whose size field says 128K entries
+\ (as for a 1 GB space, so that the index of C000.0000 is 0). As an Ultra 10
+\ does, only the TSB's first 16 KB is allocated, for the 16 MB from
+\ C000.0000 that OpenBoot's own DMA uses; the client sets up its own.
 \ (FCode's numbers are 32 bits, sign-extended: wider or unsigned ones are
 \ put together with lxjoin.)
 h# ffff.ffff 0 lxjoin constant low32
 h# c000.0000 0 lxjoin constant virtual-dma-base
 h# 2000.0000 constant virtual-dma-size
 7 constant tsb-size
-h# 400 tsb-size << constant #tsb-entries
+h# 800 constant #tsb-entries
 #tsb-entries 8 * constant /tsb
+#tsb-entries pagesize * constant /dvma-used
 
 : (map-in) ( pa len -- va )  >r xlsplit r> " map-in" $call-parent  ;
 : (map-out) ( va len -- )  " map-out" $call-parent  ;

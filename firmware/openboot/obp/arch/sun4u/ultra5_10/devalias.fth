@@ -4,7 +4,7 @@ id: @(#)devalias.fth 1.0 26/11/07
 purpose: The Ultra 5/10's device aliases
 copyright: Copyright 2026 Andy Taylor
 
-\ The aliases the Ultra 5/10's own OpenBoot has (as arch/sun4v/devalias.fth
+\ The aliases an Ultra 5/10 has (as arch/sun4v/devalias.fth
 \ makes sun4v's from the machine description). "screen" is the Creator3D
 \ if there is one, else the Rage Pro: it is set once the devices are
 \ probed (probeall.fth).

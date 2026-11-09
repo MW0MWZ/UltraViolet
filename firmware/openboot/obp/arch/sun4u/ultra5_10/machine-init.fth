@@ -29,7 +29,7 @@ headerless
 \ The processor's clock, as measured at start-up (below); the UPA's,
 \ a quarter of it on the SME1430 (333 MHz and up) and a third on the
 \ SME1040 (UltraSPARC-IIi manual 1.3.4 and its addendum); and the
-\ machine's names, the ones OpenBoot 3.x gives the Ultra 5/10.
+\ machine's names, the ones an Ultra 5/10 has.
 d# 440.000.000 value cpu-clock-frequency
 
 \ The clock: TICK counted against the APB's tick register, which counts

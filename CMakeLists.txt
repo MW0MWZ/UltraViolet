@@ -96,6 +96,11 @@ if(UV_WITH_SLIRP)
     if(WIN32)
       target_link_libraries(uv_emu PUBLIC ws2_32)  # the network thread's own sockets
     endif()
+    # Before 4.9.1, libslirp on macOS could take the guest's name server
+    # from the bytes of an IPv6 server listed after the host's IPv4 one.
+    if(APPLE AND SLIRP_VERSION VERSION_LESS 4.9.1)
+      message(WARNING "libslirp ${SLIRP_VERSION}: use 4.9.1 or later on macOS (DNS forwarding)")
+    endif()
   else()
     message(WARNING "libslirp not found: building without user-mode networking")
   endif()
@@ -132,12 +137,17 @@ file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/generated/creator3d_fcode.h
   "// Generated from firmware/creator3d/ffb.fc.\n#pragma once\n"
   "constexpr unsigned char kCreator3dFcode[] = {${UV_FFB_BYTES}};\n")
 # UltraViolet's OpenBoot (firmware/openboot/ultra5_10.prom, made by its
-# build.sh: the flash PROM's contents before the erased rest) as a C array:
-# the flash PROM unless another is chosen. It must be a build of the release
-# beside it (obp/firmware.rel).
+# build.sh: the whole 1 MiB flash PROM, the erased rest as ff bytes) as a C
+# array: the flash PROM unless another is chosen. It must be a build of the
+# release beside it (obp/firmware.rel), and exactly the flash PROM's size.
 set(UV_OBP_PROM ${CMAKE_CURRENT_SOURCE_DIR}/firmware/openboot/ultra5_10.prom)
 set(UV_OBP_REL ${CMAKE_CURRENT_SOURCE_DIR}/firmware/openboot/obp/firmware.rel)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${UV_OBP_PROM} ${UV_OBP_REL})
+file(SIZE ${UV_OBP_PROM} UV_OBP_SIZE)
+if(NOT UV_OBP_SIZE EQUAL 1048576)
+  message(FATAL_ERROR "firmware/openboot/ultra5_10.prom is ${UV_OBP_SIZE} bytes, not the 1 MiB flash PROM: "
+                      "run firmware/openboot/build.sh tools kernel ultra5_10")
+endif()
 file(STRINGS ${UV_OBP_REL} UV_OBP_RELEASE LIMIT_COUNT 1)
 file(STRINGS ${UV_OBP_PROM} UV_OBP_ID REGEX "@\\(#\\)OBP [0-9.]+ [0-9/]+" LIMIT_COUNT 1)
 string(REGEX MATCH "OBP ([0-9.]+) ([0-9/]+)" UV_OBP_ID "${UV_OBP_ID}")

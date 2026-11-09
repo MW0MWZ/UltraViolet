@@ -9,7 +9,7 @@ copyright: Copyright 2026 Andy Taylor
 \ a time), of the 512-byte sectors of a 3.5" 1.44 MB disk (80 cylinders, 2
 \ heads, 18 sectors a track). The Ultra 5/10's drive ejects by hand. With
 \ no drive answering, the node's status is "disabled", and the selftest,
-\ open and boot say so as the machine's own firmware does.
+\ open and boot say so as an Ultra 10 does.
 
 Fcode-version3
 

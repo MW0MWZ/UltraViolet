@@ -39,6 +39,9 @@
 \ any nuclear facility. 
 \ 
 \ ========== Copyright Header End ============================================
+\ Adapted by Andy Taylor, 2026: a system may set /dictionary-growth (the
+\ Ultra 5/10 grows its dictionary a page at a time), and each step of the
+\ growth is claimed on its own.
 id: @(#)initdict.fth 2.18 03/12/08 13:22:40
 purpose: 
 copyright: Copyright 1990-2003 Sun Microsystems, Inc.  All Rights Reserved
@@ -52,7 +55,9 @@ headerless
 \ Called when ALLOT can't satisfy the request.  Allocates some more
 \ physical memory for the dictionary, maps it in, and updates limit
 \ to include the new memory.
+[ifnexist] /dictionary-growth
 h# 1.0000 constant /dictionary-growth	\ 64K chosen to reduce map calls
+[then]
 
 \ Return a "success" indication if called when the dictionary already
 \ satisfies the request.
@@ -60,10 +65,10 @@ h# 1.0000 constant /dictionary-growth	\ 64K chosen to reduce map calls
 \  Implementation factor.
 \  Restriction:  both parameters must be  mmu-aligned
 : extend-dict-phys ( old-top-adr size' -- )
-   dup /dictionary-growth		( old-top size' size' alignment )
-   mem-claim				( old-top size' p.lo p.hi )
-   2swap				( p.lo p.hi old-top=start-addr size' )
-   mem-mode mmu-map
+   bounds  ?do					(  )
+      /dictionary-growth dup mem-claim		( p.lo p.hi )
+      i /dictionary-growth mem-mode mmu-map	(  )
+   /dictionary-growth +loop
 ;
 
 : extend-dictionary  ( size -- size )

@@ -13,6 +13,12 @@ fload ${BP}/dev/utilities/get-option.fth
 fload ${BP}/dev/ebus/rio/ebus.fth
 fload ${BP}/dev/ebus/rio/children.fth
 
-make-children
+\ After the PCI probe (OpenBoot's probe-all, with this node selected): the
+\ node's name, and its devices.
+external
+: probe-ebus ( -- )
+   " ebus" name  make-children
+;
+headerless
 
 end0

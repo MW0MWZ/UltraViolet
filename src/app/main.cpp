@@ -113,6 +113,8 @@ void usage() {
                "                   ahead), max (realtime without a speed limit) or free (one\n"
                "                   cycle an instruction, no waiting)\n"
                "  --no-jit         run decoded blocks without translating them to host code\n"
+               "  --jit-check      (for developers) run each translated block again in the\n"
+               "                   interpreter and stop with the differences if they disagree\n"
                "  --no-block-cache interpret every instruction individually (for comparison)\n"
                "  --no-idle-skip   run the guest's idle loops instruction by instruction\n"
                "                   (default: at once, to the next event, the host asleep)\n"
@@ -344,7 +346,7 @@ int main(int argc, char** argv) {
             const char* flag;
             const char* key;
             const char* value;
-        } kSwitches[] = {{"--no-jit", "jit", "0"}, {"--no-block-cache", "block_cache", "0"},
+        } kSwitches[] = {{"--no-jit", "jit", "0"}, {"--jit-check", "jit_check", "1"}, {"--no-block-cache", "block_cache", "0"},
                          {"--no-idle-skip", "idle_skip", "0"}, {"--no-fast-disk", "fast_disk", "0"},
                          {"--flash-write-enable", "flash_write_enable", "1"}};
         std::string key, value, error;

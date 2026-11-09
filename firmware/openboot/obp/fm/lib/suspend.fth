@@ -23,7 +23,7 @@ headerless
 ' (reset-page)  is reset-page
 : suspend  ( -- flag )
    #line off
-   ??cr dark  ."  More [<space>,<cr>,q,n,p,c] ? "  light
+   ??cr dark  ." More [<space>,<cr>,q,n,p,c] ? "  light
    key  #out @  (cr  spaces  (cr  #out off
    dup  ascii q  =   if  drop true  exit  then
    dup  ascii n  =   if  drop true  exit  then

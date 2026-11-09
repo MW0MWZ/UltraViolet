@@ -4,6 +4,10 @@ copyright: Copyright 1994 FirmWorks  All Rights Reserved
 copyright: Copyright 2005 Sun Microsystems, Inc. All Rights Reserved
 copyright: Use is subject to license terms.
 
+\ Adapted by Andy Taylor, 2026: on the Ultra 5/10 (Ultra5_10) the cache line
+\ size and latency timer are set but not given as properties, as an Ultra 10's
+\ own OpenBoot leaves them.
+
 \ All the code in this file executes as a child of a PCI device
 \ and so my-space is valid and config-X $call-parent (parent-X)
 \ accesses must be used.
@@ -76,8 +80,15 @@ copyright: Use is subject to license terms.
    \ If variations on either value are needed, they can be changed via nvramrc
    \ script, and the Solaris PCI nexi will respect the changed properties.
 
+[ifdef] Ultra5_10
+   \ The Ultra 5/10's own OpenBoot sets no such properties (a real one's
+   \ device tree has none): the registers only.
+   h# 10 h# 0c parent-b!
+   h# 40 h# 0d parent-b!
+[else]
    h# 10 h# 0c tuck parent-b! " cache-line-size" int8-property
    h# 40 h# 0d tuck parent-b! " latency-timer"   int8-property
+[then]
 
    6 parent-w@					( int )
    dup 9 rshift 3 and      " devsel-speed"       integer-property

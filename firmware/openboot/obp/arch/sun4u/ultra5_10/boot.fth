@@ -42,7 +42,10 @@
 \ Adapted for the Ultra 5/10 (sun4u) by Andy Taylor, 2026: entered from the
 \ reset code with the MMU on and OpenBoot's memory mapped; the hypervisor's
 \ calls and scratchpad registers are left out, the processor runs on its
-\ normal globals, and the reset it was started for is kept (reset-kind).
+\ normal globals, and the reset it was started for is kept (reset-kind), with
+\ the POST's result (post-ret0-2, post-retv); no XON (control Q) sent as the
+\ console starts, as an Ultra 10 sends none, and "ttya initialized" in
+\ diagnostic mode.
 id: @(#)boot.fth 1.1 06/02/16
 purpose:
 copyright: Copyright 2006 Sun Microsystems, Inc.  All Rights Reserved
@@ -57,8 +60,9 @@ overload: stand-init-io  ( -- )
    \ fpu-enable
    stand-init-io
    install-uart-io
-   diag-cr  " console initialized" diag-type  diag-cr
-   control Q emit
+   \ In diagnostic mode (diag-switch?, NVRAM byte 1, read directly: the
+   \ NVRAM package is not up yet), as an Ultra 10 says it.
+   h# 1ff.f100.0001 bypass-asi spacec@  if  cr ." ttya initialized" cr  then
    ['] noop         ['] bye    (is
 ;
 
@@ -67,6 +71,13 @@ headers
 \ The reset this start is for, from the reset code (%i2): 0 power-on (and
 \ a soft power-on reset), 1 watchdog, 2 XIR, 3 SIR, 4 RED state.
 nuser reset-kind
+\ The POST's result, from the reset code: its status (%i3), the address of
+\ its message in the PROM (%i4), the board descriptor (%l0), and whether
+\ it ran (%i5: "post-run").
+nuser post-ret0
+nuser post-ret1
+nuser post-ret2
+nuser post-retv
 
 label prom-cold-code  ( -- )
 
@@ -77,6 +88,10 @@ label prom-cold-code  ( -- )
    %i0			%g1	move
    %i1			%g2	move
    %i2			%g3	move
+   %i3			%g4	move
+   %i4			%g5	move
+   %i5			%g6	move
+   %l0			%g7	move
    %g0  0			wrtba
    \ XXX %g0  0		%r22	wrasr	\ Clear SoftInt Reg.
    %g0  7			wrcleanwin
@@ -88,6 +103,10 @@ label prom-cold-code  ( -- )
    %g1			%i0	move
    %g2			%i1	move
    %g3			%i2	move
+   %g4			%i3	move
+   %g5			%i4	move
+   %g6			%i5	move
+   %g7			%l0	move
    %g0  0			wrtl	\ TL = 0
 
 
@@ -97,11 +116,12 @@ label prom-cold-code  ( -- )
    \ Set %tba register
    base			%g0	wrtba
 
-   \ Base and size of at least one chunk of memory
-   4meg			%o0	set
+   \ The memory OpenBoot takes from as it starts: its 1 MiB (%i0, %i1)
+   \ but for the image, its RAM and the page tables' root (see ramforth).
+   /obp-image RAMsize-start + pagesize +	%o0	set
    %i1  %o0		%i7	sub	\ Size of unused memory
-   %i0  %o0		%i6	add	\ Base of unused memory
-   
+   %i0			%i6	move	\ Base of unused memory
+
    \ Set up register
    prom-main-task	up	set
 
@@ -110,11 +130,19 @@ label prom-cold-code  ( -- )
    init-forth-environment	call
    %g0  1		%o2	sub	\ Use standard layout
 
-   %i6	%i7		%i7	add	\ Memtop
+   %i0  %i1		%i7	add	\ Memtop
    'user# physmax	%i6	set
    %i7  up		%i6	nput	\ Set the physmax (memory HWM)
    'user# reset-kind	%i6	set
    %i2  up		%i6	nput
+   'user# post-ret0	%i6	set
+   %i3  up		%i6	nput
+   'user# post-ret1	%i6	set
+   %i4  up		%i6	nput
+   'user# post-ret2	%i6	set
+   %l0  up		%i6	nput
+   'user# post-retv	%i6	set
+   %i5  up		%i6	nput
    
    \ clear post-run magic in %i5
    %g0		%i5	move
