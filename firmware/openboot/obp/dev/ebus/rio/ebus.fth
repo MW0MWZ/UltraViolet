@@ -22,8 +22,9 @@ my-space constant ebus-space			\ Our PCI function
 \ Our registers: configuration space and the two windows (fixed: the
 \ flash PROM is where the processor starts)
 : bar-reg ( xdr,len bar size -- xdr',len' )
-   >r  h# 8200.0000 my-space or over or en+ 0 en+  my-cfg-l@ h# f invert and en+
-   0 en+ r> en+
+   >r >r						( xdr,len ) ( r: size bar )
+   h# 8200.0000 my-space or r@ or en+  0 en+		( xdr,len )
+   r> my-cfg-l@ h# f invert and en+  0 en+  r> en+	( xdr,len' )
 ;
 my-space encode-int 0 en+ 0 en+ 0 en+ 0 en+
    h# 10 h# 100.0000 bar-reg

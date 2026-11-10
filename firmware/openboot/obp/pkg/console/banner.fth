@@ -44,6 +44,10 @@ purpose: Displays banner describing system configuration
 copyright: Copyright 1990-2004 Sun Microsystems, Inc.  All Rights Reserved
 copyright: Use is subject to license terms.
 
+\ Adapted by Andy Taylor, 2026: on the Ultra 5/10 (Ultra5_10) the banner has
+\ no copyright line, no blank line before it and no sub-release line, as an
+\ Ultra 10's own OpenBoot's.
+
 headerless
 
 d# 128 constant max-logo-width
@@ -98,7 +102,9 @@ true value auto-banner?
 : suppress-banner  ( -- )  false to auto-banner?  ;
 
 : banner  ( -- )
+[ifndef] Ultra5_10
    cr
+[then]
  
    auto-banner?  if  " banner-" do-drop-in  then
 
@@ -111,10 +117,14 @@ true value auto-banner?
       cr ?spaces oem-banner type  cr cr
    else
       ?spaces  cpu-model type      ." , "  .keyboard-type                   cr
+[ifndef] Ultra5_10
       ?spaces .copyrights
+[then]
       ?spaces  .rom                ." , "  .memory         ." , "  .serial  cr
 [ifndef] RELEASE
+[ifndef] Ultra5_10
       ?spaces  sub-release ". cr
+[then]
 [then]
       ?spaces  .ether              ." , "  .hostid         ." ."            cr
    then
