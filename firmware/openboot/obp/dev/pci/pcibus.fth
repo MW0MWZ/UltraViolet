@@ -44,6 +44,9 @@ purpose:
 copyright: Copyright 2006 Sun Microsystems, Inc.  All Rights Reserved
 copyright: Use is subject to license terms.
 
+\ Adapted by Andy Taylor, 2026: on the Ultra 5/10 (Ultra5_10) a bridge gets
+\ no "available" property, as an Ultra 10's own OpenBoot leaves them.
+
 hex
 
 h# 40 buffer: function-reg-string
@@ -396,7 +399,10 @@ headerless
    \ then free the nodes.
    get-pointers >r >r >r 			( )
    r@ pci-alloc-lists 2@ set-pointers		( )
+[ifndef] Ultra5_10
+   \ (An Ultra 10's own OpenBoot gives its bridges no "available".)
    make-available-property			( )
+[then]
    pci-alloc-lists 2@ debug-keep-mem-lists? if	( mem io )
       \ Some useful bridge debug properties.
       " io-list" integer-property		( mem )

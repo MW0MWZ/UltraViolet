@@ -101,15 +101,15 @@ copyright: Copyright 2026 Andy Taylor
 : make-fdthree ( -- )
    " 14,3023f0" child
       " fdthree" name
-      " block" device-type
       0 0 encode-bytes
          h# 3023f0 8 reg+  h# 706000 h# 10 reg+  h# 720000 4 reg+
       " reg" property
+      1 interrupts-property
+      " block" device-type
       0 0 encode-bytes
          h# 3023f0 8 va+  h# 706000 h# 10 va+  h# 720000 4 va+
       " address" property
-      1 interrupts-property
-      " manual" boolean-property
+      \ (unit and manual, or status, from the driver's probe)
       " ebus-fdthree" builtin-driver
    finish-device
 ;

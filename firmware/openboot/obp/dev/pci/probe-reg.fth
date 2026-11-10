@@ -44,6 +44,13 @@ purpose: PCI/UPA bus mapping
 copyright: Copyright 2006 Sun Microsystems, Inc. All Rights Reserved
 copyright: Use is subject to license terms.
 
+\ Adapted by Andy Taylor, 2026: on the Ultra 5/10 (Ultra5_10) a device's
+\ BARs are given temporary addresses while it is probed, each device's from
+\ its bus's base up (not from the bus's free list), and released without
+\ touching the list, as an Ultra 10's own OpenBoot probes; its final
+\ addresses come from its "reg" once probed (make-device.fth). allocate-low
+\ claims lowest-first from a list.
+
 headerless
 
 h# 0000.1fff invert constant pci-pagemask
@@ -166,6 +173,44 @@ alloc-bar-struct to bar-struct-addr
 \ chances of someone accidently refering to the either uninitialised
 \ defer or the more likely incorrectly initialised defer.
 \
+[ifdef] Ultra5_10
+\ The bus being probed: its base addresses (set as each bus's devices are
+\ probed) and each device's next temporary address in it.
+0 value bus-mem-base	0 value bus-io-base
+0 value p1-mem		0 value p1-io
+: bump-mem ( size -- pa )  p1-mem over round-up  tuck +  to p1-mem  ;
+: bump-io  ( size -- pa )  p1-io  over round-up  tuck +  to p1-io   ;
+
+\ The final addresses, as the bus's devices are placed: each above the last
+\ (an Ultra 10's own OpenBoot never goes back into a gap below).
+0 value p2-mem		0 value p2-io
+
+\ Lowest-first allocation from a list, at or above al-floor: the first
+\ piece of it with room at an address of the alignment, taken out of the
+\ list.
+0 value al-align	0 value al-size		0 value al-list		0 value al-adr
+0 value al-floor
+: carve ( node -- )
+   >r r@ node-range over +			( adr end ) ( r: node )
+   r@ al-list remove-selected-node drop  r> free-node
+   swap al-adr over -				( end adr head )
+   ?dup if  al-list free-memrange  else  drop  then	( end )
+   al-adr al-size + tuck -			( tail tail-size )
+   ?dup if  al-list free-memrange  else  drop  then	( )
+;
+: allocate-low ( align size list -- pa false | true )
+   to al-list  to al-size  to al-align
+   al-list @  begin  dup  while			( node )
+      dup >mem.adr @ al-floor max  al-align round-up to al-adr
+      al-adr al-size +  over node-end  u<=  if	( node )
+         carve  al-adr false exit
+      then
+      >next-node @
+   repeat					( 0 )
+   drop true
+;
+[then]
+
 defer $call-who
 : (assign-bar-resources) ( phys.hi acf -- )
    to $call-who					( phys.hi )
@@ -175,19 +220,31 @@ defer $call-who
    r@ >bar.phys.hi @				( size phys.hi )
    cfg>ss# h# 3 and case			( -- )
       0 of 3drop true endof			( true )
+[ifdef] Ultra5_10
+      1 of bump-io false 			( pa,0 )
+[else]
       1 of dup pci-io-list allocate-memrange 	( pa,0 | true )
+[then]
            dup 0= if			 	( pa,0 | true )
               over r@ >bar.phys.hi @		( pa,0 pa phys.hi )
               $config-l! $call-who		( pa,0 )
            then					( pa,0 | true )
         endof					( pa,0 | true )
+[ifdef] Ultra5_10
+      2 of bump-mem false			( pa,0 )
+[else]
       2 of dup pci-memlist allocate-memrange	( pa,0 | true )
+[then]
            dup 0= if				( pa,0 | true )
               over r@ >bar.phys.hi @		( pa,0 pa phys.hi )
               $config-l! $call-who		( pa,0 )
            then					( pa,0 | true )
         endof					( pa,0 | true )
+[ifdef] Ultra5_10
+      3 of bump-mem false			( pa,0 )
+[else]
       3 of dup pci-memlist allocate-memrange	( pa,0 | true )
+[then]
            dup 0= if				( pa,0 | true )
               r@ >bar.phys.hi @	>r		( pa 0 )
               over r@ $config-l! $call-who	( pa,0 )
@@ -232,9 +289,13 @@ defer $call-who
    0 rot !					( phys.hi pa )
    r> >bar.size @				( phys.hi pa len )
    debug-probe-bar? if  over .x dup .x cr  then
+[ifdef] Ultra5_10
+   rot 3drop					( -- )
+[else]
    rot cfg>ss# 3 and 1 >			( pa len mem? )
    if  pci-memlist  else  pci-io-list  then	( pa len list )
    free-memrange				( -- )
+[then]
 ;
 
 : read-bar-resources ( offset -- incr implemented )

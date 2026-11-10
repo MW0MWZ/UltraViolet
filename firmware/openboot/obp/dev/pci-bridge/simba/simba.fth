@@ -96,11 +96,19 @@ h# e8 constant pio-afsr
 
 : init-subordinate-bus# ( -- )  h# ff h# 1a my-b!  ;
 
-\ With the space kept, only the subordinate bus number is brought down to
-\ the highest below.
+\ As an Ultra 10's own OpenBoot leaves them: bus A keeps all its space, and
+\ its subordinate bus number is brought down to the highest below; bus B
+\ hands its unused space back to the Sabre (whose "available" it is), and
+\ its subordinate bus number is left as set before the probe (ff).
+0 value sub-bus#
 : retain-pci-resource ( -- )
-   0 0 -1 0 -1 allocate-bus#		( mem-lo io-lo dma-lo mem-hi io-hi dma-hi bus# )
-   h# 1a my-b!  2drop 2drop 2drop
+   bus-a?  if
+      0 0 -1 0 -1 allocate-bus#	( mem-lo io-lo dma-lo mem-hi io-hi dma-hi bus# )
+      dup h# 1a my-b!
+   else
+      0 h# 1000 0 h# 100 0 allocate-bus#	( ... bus# )
+   then
+   to sub-bus#  2drop 2drop 2drop
 ;
 
 : disable-children  ( -- )
@@ -125,7 +133,7 @@ h# e8 constant pio-afsr
 : probe-children ( -- )  probe-list$ prober-xt execute  ;
 
 : create-bus-range ( -- )
-   my-bus#  encode-int  h# 1a my-b@  encode-int encode+
+   my-bus#  encode-int  sub-bus#  encode-int encode+
    " bus-range"  property
 ;
 
@@ -175,6 +183,9 @@ h# e8 constant pio-afsr
    bus-a? 0= if  disable-children  then
    set-address-maps				( )
    init-apb
+   \ The latency timer, on bus B's bridge only, as an Ultra 10's own
+   \ OpenBoot sets it.
+   bus-a? 0=  if  h# 50 h# 0d my-b!  then
    clear-status-bits
    enable-mem,io&bus-mastr
    slot-names

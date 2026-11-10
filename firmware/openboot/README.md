@@ -251,6 +251,21 @@ unused part with it. The IOMMU's table is the Ultra 10's 16 KiB, for the
 16 MB of DVMA from c000.0000 OpenBoot uses (the IOMMU is told 128K entries;
 the client sets up its own).
 
+### PCI
+
+The PCI spaces are given out as an Ultra 10's own OpenBoot gives them. The
+APB's bus A (`pci@1,1`, the machine's own devices) has memory from
+e000.0000 and I/O from c0.0000: the Ethernet at e000.0000, the Rage Pro at
+e100.0000 and e200.0000, the IDE controller's five I/O ranges from c0.0000
+in order, each at its own size; the EBus keeps its fixed windows (f000.0000
+and f100.0000). Bus B (`pci@1`, the slots) has memory from 1000 and I/O
+from 400, given out the same way, and what it leaves is the Sabre's
+`available` (to the top of the 4 GB and 16 MB spaces, as that firmware
+lists it). Devices are left with their command registers clear but for the
+EBus, and their drivers turn them on as they open; expansion ROMs keep the
+address they were read at, turned off. Bus B's bridge is given a latency
+timer of 0x50 and its subordinate bus number is left at ff.
+
 The release's own files are unchanged, but for:
 
 - `obp/dev/ide/ide.fth`: a wait for the IDE controller polls its status
@@ -259,12 +274,22 @@ The release's own files are unchanged, but for:
   transfer doesn't cost a millisecond a block.
 - `obp/fm/lib/suspend.fth`: the pager's prompt is an Ultra 10's, "More
   [<space>,<cr>,q,n,p,c] ?" (the release's begins with a space).
-- `obp/dev/pci/device-props.fth`: on the Ultra 5/10 a PCI device's cache
-  line size and latency timer are set but not made properties, as on an
-  Ultra 10 (its device tree has none).
+- `obp/dev/pci/device-props.fth`, `probe-reg.fth`, `make-device.fth` and
+  `pcibus.fth`: on the Ultra 5/10, PCI devices are given their addresses as
+  an Ultra 10's own OpenBoot gives them. While a device is probed its BARs
+  have temporary addresses from its bus's base up. Once probed, a device
+  whose "reg" has fixed addresses (the EBus) keeps them, with command 0x146;
+  any other has its BARs cleared, the relocatable spaces of its final "reg"
+  placed at the sizes it gives, from the bus's base up and each above the
+  last, `assigned-addresses` made from them, and its command register
+  cleared (its driver turns it on as it opens). Expansion ROMs keep no space.
+  Devices' cache line size and latency timer are left as reset and made no
+  properties, and bridges get no `available`.
 - `obp/os/bootprom/initdict.fth` and `obp/arch/sun4u/retained.fth`: a
   system may set the dictionary's growth step and the retained page's
   alignment (the Ultra 5/10's: a page, and 1 MiB).
+- `obp/pkg/console/banner.fth`: on the Ultra 5/10 the banner has no
+  copyright line, as an Ultra 10's has none.
 - `obp/fm/kernel/fileio.fth`: an error at the end of a string being
   evaluated shows the string ("Evaluating: boot"); the line was looked for
   from one past its end, and shown empty.

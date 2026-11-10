@@ -22,8 +22,10 @@ headerless
 
 h# e000.0000 constant bus-a-mem		h# 1000.0000 constant /bus-a-mem
 h#  c0.0000 constant bus-a-io		h#   40.0000 constant /bus-a-io
-h# 0000.0000 constant bus-b-mem		h# c000.0000 constant /bus-b-mem
-h#   00.0000 constant bus-b-io		h#   c0.0000 constant /bus-b-io
+\ Bus B's spaces start above its first 4 KB of memory and 1 KB of I/O
+\ space, as an Ultra 10's own OpenBoot gives them out.
+h# 0000.1000 constant bus-b-mem		h# bfff.f000 constant /bus-b-mem
+h#   00.0400 constant bus-b-io		h#   bf.fc00 constant /bus-b-io
 
 1 constant apb-dev#
 
@@ -48,7 +50,7 @@ h#   00.0000 constant bus-b-io		h#   c0.0000 constant /bus-b-io
       0 probe-function
    then
    3drop 2drop
-   clear-lists					\ Nothing left on bus 0
+   \ What is left is bus B's unused space, handed back by its bridge.
 ;
 
 : sabre-prober ( probe$ -- )  2drop probe-apb  ;
@@ -65,7 +67,7 @@ h#   00.0000 constant bus-b-io		h#   c0.0000 constant /bus-b-io
 : quietly ( ?? xt -- ?? )
    " probe-quietly" root-method  if  execute  else  execute  then
 ;
-: pci-prober31 ( probe-list$adr,len -- )
+: (pci-prober31) ( probe-list$adr,len -- )
    pci-depth 9 > if
       ." Maximum PCI probe depth " pci-depth . ." exceeded;"
       ." No further PCI bridge devices can be probed" cr
@@ -82,6 +84,15 @@ h#   00.0000 constant bus-b-io		h#   c0.0000 constant /bus-b-io
    repeat					( null$ )
    2drop
    r> to pci-depth
+;
+: pci-prober31 ( probe-list$adr,len -- )
+   \ The bus's base addresses, for its devices' temporary addresses while
+   \ they are probed (probe-reg.fth).
+   bus-mem-base >r  bus-io-base >r  p2-mem >r  p2-io >r
+   pci-memlist @ dup if  >mem.adr @  then  dup to bus-mem-base  to p2-mem
+   pci-io-list @ dup if  >mem.adr @  then  dup to bus-io-base  to p2-io
+   (pci-prober31)
+   r> to p2-io  r> to p2-mem  r> to bus-io-base  r> to bus-mem-base
 ;
 
 external
@@ -104,6 +115,30 @@ external
 : prober ( adr len -- )					['] sabre-prober quietly  ;
 : prober-xt ( -- adr )					['] pci-prober31  ;
 
+\ The Sabre's "available", as an Ultra 10's own OpenBoot gives it: what bus
+\ B leaves of its spaces, memory then I/O, the last piece of each taken to
+\ the top of the space (4 GB, 16 MB) as that firmware lists it.
+0 value av-node  0 value av-tag  0 value av-top
+: avail-entry ( xdr,len adr size -- xdr',len' )
+   >r >r  av-tag encode-int encode+  0 encode-int encode+
+   r> encode-int encode+  0 encode-int encode+  r> encode-int encode+
+;
+: avail-list ( xdr,len node tag top -- xdr',len' )
+   to av-top  to av-tag  to av-node
+   begin  av-node  while				( xdr,len )
+      av-node node-range				( xdr,len adr size )
+      av-node >next-node @ 0=  if  drop av-top over -  then
+      avail-entry					( xdr,len )
+      av-node >next-node @ to av-node
+   repeat
+;
+: make-sabre-available ( -- )
+   0 0 encode-bytes					( xdr,len )
+   pci-memlist @ h# 8200.0000 0 1 lxjoin avail-list	( xdr,len )
+   pci-io-list @ h# 8100.0000 h# 100.0000 avail-list	( xdr,len )
+   dup  if  " available" property  else  2drop  then
+;
+
 variable my-memlist  my-memlist off
 variable my-io-list  my-io-list off
 
@@ -112,7 +147,7 @@ variable my-io-list  my-io-list off
    set-pointers						( -- )
    setup-swapped-fcodes
    pci-master-probe
-   make-available-property				( -- )
+   make-sabre-available					( -- )
    get-pointers						( reg mem io )
    my-io-list ! my-memlist ! drop			( -- )
    restore-fcodes

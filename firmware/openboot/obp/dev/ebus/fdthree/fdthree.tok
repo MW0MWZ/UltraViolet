@@ -143,10 +143,17 @@ d# 80 constant #cylinders
    ." improperly connected, or defective." cr
 ;
 
-\ At the probe: no drive answering, the node disabled.
+\ At the probe, as an Ultra 10's own OpenBoot leaves the node: a drive
+\ answering, its unit number (0) and "manual" (the disk changed by hand);
+\ none, the node disabled.
 : floppy-probe ( -- )
    fdc-map fdc-reset  recalibrate  motor-off fdc-unmap
-   0= if  " disabled" encode-string " status" property  then
+   if
+      0 encode-int " unit" property
+      0 0 encode-bytes " manual" property
+   else
+      " disabled" encode-string " status" property
+   then
 ;
 floppy-probe
 

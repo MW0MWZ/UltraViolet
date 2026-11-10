@@ -291,14 +291,21 @@ create edid /edid allot
    edid c@ 0= and  edid 7 + c@ 0= and
    7 1 do  edid i + c@ ff = and  loop
 ;
+0 value edid-answered?		\ the monitor answered at I2C address 50
 : fetch-edid  ( -- )
    i2c-init
-   edid /edid erase
-   3 0 do  edid-read if  edid-ok? if  leave  then  then  loop
+   edid /edid erase  false to edid-answered?
+   3 0 do  edid-read if  true to edid-answered?  edid-ok? if  leave  then  then  loop
 ;
-\ The node's edid: the block, when one checks.
+\ The node's edid: the block, when one checks; and aty,flags as the card's
+\ own FCode gives it: 2, with 1 if the monitor answered and 8 if its EDID
+\ checks.
 : edid-property  ( -- )
    edid-ok? if  edid /edid encode-bytes " edid" property  then
+;
+: flags-property  ( -- )
+   2  edid-answered? if  1 or  then  edid-ok? if  8 or  then
+   encode-int " aty,flags" property
 ;
 
 \ The chip's mode of a width, height and rate.
@@ -484,7 +491,7 @@ default-mode to mode  set-mode
 " display" device-type
 mode-properties
 vram-mib encode-int " fb-memory" property
-2 encode-int " aty,flags" property
+flags-property
 0 encode-int " aty,status" property
 edid-property
 unmap-chip
@@ -495,7 +502,7 @@ my-address my-space encode-phys  0 encode-int encode+  0 encode-int encode+
 0 0 my-space bar0 or encode-phys encode+  0 encode-int encode+  01000000 encode-int encode+
 0 0 my-space bar2 or encode-phys encode+  0 encode-int encode+  00001000 encode-int encode+
 " reg" property
-" UltraViolet m64.fth 0.1" encode-string " pgx_version" property
+" UltraViolet m64.fth 0.2" encode-string " pgx_version" property
 " SUNW,m64B" device-name
 " ATY,GT-C" model
 " 113-41901-104" encode-string " aty,rom#" property
@@ -524,7 +531,7 @@ my-address my-space encode-phys  0 encode-int encode+  0 encode-int encode+
 : m64-install  ( -- )
    aperture -1 = if  map-chip  then
    aperture encode-int " address" property
-   fetch-edid  edid-property
+   fetch-edid  edid-property  flags-property
    select-mode  mode-properties
    set-mode  set-palette  display-on
    aperture to frame-buffer-adr
