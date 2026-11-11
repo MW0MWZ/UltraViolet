@@ -257,6 +257,102 @@ void post_data_access(void)
 	asi_st16(0x1fe01000006ULL, 0x1d, 0x2000);	/* the Sabre's status */
 }
 
+/* ---------------------------------------------------------------------
+ * All Sabre IOMMU Error Reporting Tests: PIO reads the PCI bus ends in
+ * an abort, with APB B's I/O and memory enabled and its memory map 8f
+ * (PCI memory 0-7fff.ffff and e000.0000-ffff.ffff; APB A's map without
+ * c000.0000 and e000.0000). A master abort: a read of c000.0000, which nothing
+ * claims, the processor's AFSR PRIV and TO, the Sabre's received master
+ * abort. A target abort: with APB B's bridge control in master-abort
+ * mode (bit 5; with parity and SERR# reporting), a read of e000.1000,
+ * which nothing behind it claims: APB B answers with a target abort
+ * (it signalled one, status bit 11), the Sabre received one (bit 12) and
+ * the processor's AFSR has PRIV and BERR. Each status is cleared by
+ * writing 1, APB B's PIO AFSR (e8) too, and the bridge put back.
+ */
+#define PCI_ABORT	0x1ffe0001000ULL
+#define SABRE_STATUS	0x1fe01000006ULL
+#define AFSR_PRIV	(1ULL << 31)
+#define AFSR_TO		(1ULL << 27)
+#define AFSR_BERR	(1ULL << 26)
+#define APB_COMMAND	0x04
+#define APB_STATUS	0x06
+#define APB_SEC_STATUS	0x1e
+#define APB_BRIDGE_CTL	0x3e
+
+static u32 apb_cmd, apb_ctl, apb_map0, apb_map1;
+
+static void apb_set(void)
+{
+	apb_cmd = asi_ld16(APB_CONFIG(1, APB_COMMAND), 0x1d);
+	apb_ctl = asi_ld8(APB_CONFIG(1, APB_BRIDGE_CTL), 0x1d);
+	apb_map0 = asi_ld8(APB_CONFIG(0, APB_MEM_MAP), 0x1d);
+	apb_map1 = asi_ld8(APB_CONFIG(1, APB_MEM_MAP), 0x1d);
+	asi_st16(APB_CONFIG(1, APB_COMMAND), 0x1d, apb_cmd | 0x147);
+	asi_st8(APB_CONFIG(0, APB_MEM_MAP), 0x1d, apb_map0 & ~0xc0);
+	asi_st8(APB_CONFIG(1, APB_MEM_MAP), 0x1d, 0x8f);
+}
+
+static void apb_clear(void)
+{
+	asi_stx(APB_CONFIG(1, 0xe8), 0x1d, ~0ULL);
+	asi_st16(APB_CONFIG(1, APB_STATUS), 0x1d, 0xf900);
+	asi_st16(APB_CONFIG(1, APB_SEC_STATUS), 0x1d, 0xf900);
+	asi_st16(SABRE_STATUS, 0x1d, 0xf900);
+}
+
+static void apb_back(void)
+{
+	apb_clear();
+	asi_st8(APB_CONFIG(1, APB_BRIDGE_CTL), 0x1d, apb_ctl);
+	asi_st8(APB_CONFIG(0, APB_MEM_MAP), 0x1d, apb_map0);
+	asi_st8(APB_CONFIG(1, APB_MEM_MAP), 0x1d, apb_map1);
+	asi_st16(APB_CONFIG(1, APB_COMMAND), 0x1d, apb_cmd);
+}
+
+/* Init Sabre, and its error status clear: the UE and CE AFSRs, the PCI
+   AFSR and its PCI status. */
+void post_init_sabre_err(void)
+{
+	post_init_sabre();
+	asi_stx(0x1fe00000030ULL, 0x15, ~0ULL);
+	asi_stx(0x1fe00000040ULL, 0x15, ~0ULL);
+	asi_stx(0x1fe00002010ULL, 0x15, ~0ULL);
+	asi_st16(SABRE_STATUS, 0x1d, 0xf900);
+	afsr_clear();
+}
+
+static void pio_abort(u64 pa, u64 afsr, u32 sabre_bit, const char *msg)
+{
+	afsr_clear();
+	acc_pa = pa;
+	acc_asi = 0x15;
+	post_compare(trap_run(ldx_pa), 0x32, "Data access error not taken");
+	post_compare(afsr_get() & 0xffffffffULL, afsr, "Sabre AFSR");
+	post_compare(asi_ld16(SABRE_STATUS, 0x1d) & sabre_bit, sabre_bit, msg);
+	afsr_clear();
+}
+
+void post_pio_master_abort(void)
+{
+	post_suspect("Sabre IOMMU (Functional)");
+	apb_set();
+	apb_clear();
+	pio_abort(PCI_NOTHING, AFSR_PRIV | AFSR_TO, 0x2000, "Received master abort");
+	apb_back();
+}
+
+void post_pio_target_abort(void)
+{
+	post_suspect("Sabre IOMMU (Functional)");
+	apb_set();
+	asi_st8(APB_CONFIG(1, APB_BRIDGE_CTL), 0x1d, 0x23);
+	apb_clear();
+	pio_abort(PCI_ABORT, AFSR_PRIV | AFSR_BERR, 0x1000, "Received target abort");
+	post_compare(asi_ld16(APB_CONFIG(1, APB_STATUS), 0x1d) & 0x800, 0x800, "APB signalled target abort");
+	apb_back();
+}
+
 /* Loads and stores not on their size's boundary (mem_address_not_aligned,
    34). */
 static void ldw_acc(void) { u32 asi_ld32(u64, u32); asi_ld32(acc_va, acc_asi); }

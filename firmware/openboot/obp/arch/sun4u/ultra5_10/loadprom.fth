@@ -1,6 +1,6 @@
 \ Copyright (C) 2026 Andy Taylor. Distributed under the same terms as the
 \ OpenBoot release it is part of (see LICENSE).
-id: @(#)loadprom.fth 1.0 26/11/07
+id: @(#)loadprom.fth 1.1 26/11/11
 purpose: Load file for the Sun Ultra 5 and Ultra 10 (UltraSPARC IIi)
 copyright: Copyright 2026 Andy Taylor
 
@@ -128,10 +128,8 @@ headers
 
 fload ${BP}/arch/sun4j/nvram-personality.fth
 
-\ Force a map of the drop-in ROM
-stand-init: direct-open-drop-in
-   direct-open-drop-in drop
-;
+\ (The release's platforms keep the flash PROM mapped from here on; an
+\ Ultra 10 maps it only while drop-ins are read, mapdi.fth.)
 
 stand-init: cpu-devices-
    " cpu-devices-" do-drop-in

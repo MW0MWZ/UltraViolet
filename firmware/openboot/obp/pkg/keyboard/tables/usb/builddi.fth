@@ -136,6 +136,14 @@ fload ${BP}/pkg/keyboard/tables/usb/usb-swiss-german.fth
 fload ${BP}/pkg/keyboard/tables/usb/usb-turkeyf.fth
 fload ${BP}/pkg/keyboard/tables/usb/usb-turkeyq.fth
 fload ${BP}/pkg/keyboard/tables/usb/usb-uk.fth
+[ifdef] Ultra5_10
+\ The Type 5 layouts the Ultra 10's keyboard has beyond these
+fload ${BP}/pkg/keyboard/tables/usb/usb-japan.fth
+fload ${BP}/pkg/keyboard/tables/usb/usb-canadian-french.fth
+fload ${BP}/pkg/keyboard/tables/usb/usb-hungary.fth
+fload ${BP}/pkg/keyboard/tables/usb/usb-poland.fth
+fload ${BP}/pkg/keyboard/tables/usb/usb-czech.fth
+[then]
 fload ${BP}/pkg/keyboard/tables/usb/aliases.fth
 
 all-done

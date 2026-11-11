@@ -1,6 +1,6 @@
 \ Copyright (C) 2026 Andy Taylor. Distributed under the same terms as the
 \ OpenBoot release it is part of (see LICENSE).
-id: @(#)simba.fth 1.0 26/11/07
+id: @(#)simba.fth 1.1 26/11/11
 purpose: The Advanced PCI Bridge (APB, "Simba"): pci@1 and pci@1,1
 copyright: Copyright 2026 Andy Taylor
 
@@ -12,6 +12,13 @@ copyright: Copyright 2026 Andy Taylor
 \ each given to a bus by a bit of its address map registers (APB User's
 \ Manual 3.3, 4.1.3). The bridge takes all the space its parent offers
 \ (the Sabre offers just the segments this bus is to have) and keeps it.
+\
+\ What depends on the board the APB is on (its slots, their names and
+\ wiring, the probe-list options, the space handed back after the probe,
+\ bus B's latency timer) is in one place below, for the Ultra 5/10
+\ (Ultra5_10); without it the bridge is set up as the release's generic
+\ bridge sets one up, with no interrupt map (the PCI standard's rotation
+\ of INTA#-INTD# applies) and no slot names.
 
 hex
 headerless
@@ -30,7 +37,7 @@ make-compatible-property
 d# 33000000 encode-int " clock-frequency" property
 7 encode-int " scsi-initiator-id" property
 
-\ Function 1 is bus A (the Ultra 5/10's own devices), function 0 bus B.
+\ Function 1 is bus A, function 0 bus B.
 : bus-a? ( -- flag )  my-space 8 rshift 7 and 0<>  ;
 
 \ APB registers (APB manual 4.1.3)
@@ -96,20 +103,7 @@ h# e8 constant pio-afsr
 
 : init-subordinate-bus# ( -- )  h# ff h# 1a my-b!  ;
 
-\ As an Ultra 10's own OpenBoot leaves them: bus A keeps all its space, and
-\ its subordinate bus number is brought down to the highest below; bus B
-\ hands its unused space back to the Sabre (whose "available" it is), and
-\ its subordinate bus number is left as set before the probe (ff).
 0 value sub-bus#
-: retain-pci-resource ( -- )
-   bus-a?  if
-      0 0 -1 0 -1 allocate-bus#	( mem-lo io-lo dma-lo mem-hi io-hi dma-hi bus# )
-      dup h# 1a my-b!
-   else
-      0 h# 1000 0 h# 100 0 allocate-bus#	( ... bus# )
-   then
-   to sub-bus#  2drop 2drop 2drop
-;
 
 : disable-children  ( -- )
    my-bus# d# 16 lshift  4 +
@@ -117,6 +111,10 @@ h# e8 constant pio-afsr
       h# 800 0 do  0 j i + config-w!  h# 100 +loop
    h# 800 +loop
 ;
+
+\ ---------- The board ----------
+
+[ifdef] Ultra5_10
 
 \ The probe list for the bus: the pcia-probe-list option for bus B (the
 \ slots), pcib-probe-list for bus A (the Ultra 5/10's own devices).
@@ -128,13 +126,6 @@ h# e8 constant pio-afsr
 : probe-list$ ( -- adr len )
    bus-a?  if  " pcib-probe-list"  else  " pcia-probe-list"  then
    option$ 0= if  " 1,2,3,4"  then
-;
-
-: probe-children ( -- )  probe-list$ prober-xt execute  ;
-
-: create-bus-range ( -- )
-   my-bus#  encode-int  sub-bus#  encode-int encode+
-   " bus-range"  property
 ;
 
 \ Bus A's devices are on the board (no slots); bus B's are the slots
@@ -171,8 +162,54 @@ h# e8 constant pio-afsr
    1 encode-int " #interrupt-cells" property
 ;
 
+\ The latency timer, on bus B's bridge only, as an Ultra 10's own
+\ OpenBoot sets it.
+: board-latency ( -- )  bus-a? 0=  if  h# 50 h# 0d my-b!  then  ;
+
+\ As an Ultra 10's own OpenBoot leaves them: bus A keeps all its space, and
+\ its subordinate bus number is brought down to the highest below; bus B
+\ hands its unused space back to the Sabre (whose "available" it is), and
+\ its subordinate bus number is left as set before the probe (ff).
+: retain-pci-resource ( -- )
+   bus-a?  if
+      0 0 -1 0 -1 allocate-bus#	( mem-lo io-lo dma-lo mem-hi io-hi dma-hi bus# )
+      dup h# 1a my-b!
+   else
+      0 h# 1000 0 h# 100 0 allocate-bus#	( ... bus# )
+   then
+   to sub-bus#  2drop 2drop 2drop
+;
+
+[else]
+
+\ The release's generic bridge: every device probed, no slot names, no
+\ interrupt map, the latency timer as reset, the space kept and the
+\ subordinate bus number brought down to the highest below.
+: probe-list$ ( -- adr len )
+   " 0,1,2,3,4,5,6,7,8,9,a,b,c,d,e,f,10,11,12,13,14,15,16,17,18,19,1a,1b,1c,1d,1e,1f"
+;
+: slot-names ( -- )  ;
+: make-interrupt-map ( -- )  ;
+: board-latency ( -- )  ;
+: retain-pci-resource ( -- )
+   0 0 -1 0 -1 allocate-bus#	( mem-lo io-lo dma-lo mem-hi io-hi dma-hi bus# )
+   dup h# 1a my-b!  to sub-bus#  2drop 2drop 2drop
+;
+
+[then]
+
+\ ---------- The bridge ----------
+
+: probe-children ( -- )  probe-list$ prober-xt execute  ;
+
+: create-bus-range ( -- )
+   my-bus#  encode-int  sub-bus#  encode-int encode+
+   " bus-range"  property
+;
+
 \ Bus A carries the EBus, with the console (ttya) and the flash PROM: it is
-\ left forwarding, and its devices enabled, while it is set up.
+\ left forwarding, and its devices enabled, while it is set up (on the
+\ Ultra 5/10; kept for any board, as the console may be there).
 : setup-apb  ( -- )
    bus-a? 0= if  disable-mem,io&bus-mastr  then
    init-primary-bus#
@@ -183,9 +220,7 @@ h# e8 constant pio-afsr
    bus-a? 0= if  disable-children  then
    set-address-maps				( )
    init-apb
-   \ The latency timer, on bus B's bridge only, as an Ultra 10's own
-   \ OpenBoot sets it.
-   bus-a? 0=  if  h# 50 h# 0d my-b!  then
+   board-latency
    clear-status-bits
    enable-mem,io&bus-mastr
    slot-names

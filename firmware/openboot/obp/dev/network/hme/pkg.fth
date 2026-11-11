@@ -53,19 +53,30 @@ external
 : load ( adr -- size )  " load" obp-tftp $call-method  ;
 
 \ watch-net: frames counted as they come (promiscuous), until a key
-\ is pressed.
+\ is pressed. A bad packet is one the MAC counts as an error and drops
+\ (too long, misaligned, or with a bad CRC: its three receive error
+\ counters, set back to zero as they are read), or one that overflowed its buffer.
+headerless
+: rx-errors ( -- n )
+   0  bmac-crc-errs 4 + bmac-len-errs do  i reg@ h# ff and +  0 i reg!  4 +loop
+;
+external
 : watch-net ( -- )
    map-resources
    my-args parse-devargs 2drop
    promiscuous to mac-mode
    bringup-link if
+      rx-errors drop
       ." Looking for Ethernet packets." cr
       ." '.' is a good packet.  'X' is a bad packet." cr
       ." Type any key to stop." cr
+      h# 800 alloc-mem					( buf )
       begin
-         h# 800 alloc-mem dup h# 800 receive if  ." ."  then  h# 800 free-mem
+         dup h# 800 receive if  rx-bad? if  ." X"  else  ." ."  then  then
+         rx-errors 0 ?do  ." X"  loop
          key?
-      until  key drop cr
+      until  key drop cr				( buf )
+      h# 800 free-mem
    then
    net-off unmap-resources
 ;

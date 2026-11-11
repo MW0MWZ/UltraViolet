@@ -20,9 +20,11 @@ h# 600 constant /buf
 h# 8000.0000 constant own
 h# 4000.0000 constant tx-sop
 h# 2000.0000 constant tx-eop
+h# 4000.0000 constant rx-overflow	\ (receive: the frame was longer than the buffer)
 
 0 instance value tx-next
 0 instance value rx-next
+0 instance value rx-bad?	\ the last frame received overflowed its buffer
 
 : tx-ring ( -- va )  cpu-dma-base  ;
 : rx-ring ( -- va )  cpu-dma-base h# 800 +  ;
@@ -187,6 +189,7 @@ h# 2000.0000 constant tx-eop
 \ Receiving: the next descriptor, once the device has given it back.
 : receive ( adr len -- #rcvd )
    rx-next rxd le-l@  dup own and if  3drop 0 exit  then	( adr len flags )
+   dup rx-overflow and 0<> to rx-bad?
    d# 16 rshift h# 3fff and  min				( adr len' )
    rx-next rx-buf -rot  dup >r  move  r>			( #rcvd )
    rx-next give-rxd

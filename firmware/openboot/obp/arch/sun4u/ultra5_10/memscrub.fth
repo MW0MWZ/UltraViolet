@@ -1,6 +1,6 @@
 \ Copyright (C) 2026 Andy Taylor. Distributed under the same terms as the
 \ OpenBoot release it is part of (see LICENSE).
-id: @(#)memscrub.fth 1.0 26/11/10
+id: @(#)memscrub.fth 1.1 26/11/11
 purpose: The memory's check bits set, shown as an Ultra 10 shows it
 copyright: Copyright 2026 Andy Taylor
 
@@ -12,12 +12,16 @@ copyright: Copyright 2026 Andy Taylor
 \ five backspaces); otherwise "Initializing Memory " and a turning bar
 \ (one of \-/| for the megabytes left, then a backspace); each range's
 \ line then cleared (a carriage return, 70 spaces, a carriage return).
+\ With silent-mode? true and not in diagnostic mode, the Ultra 10 shows
+\ none of it (the memory is cleared all the same).
 
 " /memory" find-device
 headerless
 
 : (backspaces) ( n -- )  0 ?do  control H emit  loop  ;
+: scrub-quiet? ( -- flag )  silent-mode? diagnostic-mode? 0= and  ;
 : .scrub-start ( pa len -- )
+   scrub-quiet?  if  2drop exit  then
    push-decimal
    diagnostic-mode?  if
       ." Initializing"  1meg round-up 1meg / 5 .r  ."  megs of memory at addr "
@@ -28,6 +32,7 @@ headerless
    pop-base
 ;
 : .scrub-left ( megs-left -- )
+   scrub-quiet?  if  drop exit  then
    diagnostic-mode?  if
       push-decimal 5 .r pop-base  5 (backspaces)
    else
@@ -43,7 +48,7 @@ headerless
       2 pick i 1meg * - 1meg min  scrub-4meg	( pa.lo pa.hi len )
       dup 1meg round-up 1meg / i - 1- .scrub-left
    loop  3drop
-   (cr d# 70 spaces (cr  false
+   scrub-quiet? 0=  if  (cr d# 70 spaces (cr  then  false
 ;
 
 headers

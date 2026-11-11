@@ -1,6 +1,6 @@
 \ Copyright (C) 2026 Andy Taylor. Distributed under the same terms as the
 \ OpenBoot release it is part of (see LICENSE).
-id: @(#)regs.fth 1.0 26/11/07
+id: @(#)regs.fth 1.1 26/11/11
 purpose: Sabre registers, configuration space and properties
 copyright: Copyright 2026 Andy Taylor
 
@@ -110,30 +110,35 @@ h# 2028 constant pci-tasr
 h# a580 constant iommu-tag-diag			\ 16 entries
 h# a600 constant iommu-data-diag		\ 16 entries
 
-\ PCI configuration space, little-endian, one 64 KB window per bus,
-\ mapped as it is first used.
-h# 100 /n * dup alloc-mem dup rot erase constant cfg-windows
-
-: cfg-window ( bus# -- va )
-   dup /n * cfg-windows +  dup @ ?dup if	( bus# adr va )
-      nip nip exit				( va )
-   then						( bus# adr )
-   swap bus#>cfg config-base + sabre-pa +	( adr pa )
-   h# 1.0000 (map-in) tuck swap !		( va )
+\ PCI configuration space, little-endian. As an Ultra 10 has it, one page
+\ is mapped for good, bus 0's first (the APB's functions; the node's
+\ "address"); any other is mapped for the access alone.
+h# 2000 constant /cfg-page
+: cfg-offset ( phys.hi -- offset )
+   dup cfg>bus# bus#>cfg  swap h# ffff and +
 ;
+: cfg-page-pa ( offset -- pa )
+   /cfg-page 1- invert and  config-base + sabre-pa +
+;
+0 cfg-page-pa /cfg-page (map-in) value cfg-page0
 
-: cfg-adr ( phys.hi -- va )
-   dup cfg>bus# cfg-window  swap h# ffff and +
+: cfg-in ( phys.hi -- va )
+   cfg-offset  dup /cfg-page u<  if  cfg-page0 + exit  then	( offset )
+   dup cfg-page-pa /cfg-page (map-in)  swap /cfg-page 1- and +	( va )
+;
+: cfg-out ( va -- )
+   dup cfg-page0 - /cfg-page u<  if  drop exit  then
+   /cfg-page 1- invert and  /cfg-page (map-out)
 ;
 
 external
 
-: config-b@ ( phys.hi -- b )  cfg-adr rb@  ;
-: config-w@ ( phys.hi -- w )  cfg-adr rw@ wbflip  ;
-: config-l@ ( phys.hi -- l )  cfg-adr rl@ lbflip  ;
-: config-b! ( b phys.hi -- )  cfg-adr rb!  ;
-: config-w! ( w phys.hi -- )  cfg-adr >r wbflip r> rw!  ;
-: config-l! ( l phys.hi -- )  cfg-adr >r lbflip r> rl!  ;
+: config-b@ ( phys.hi -- b )  cfg-in dup rb@ swap cfg-out  ;
+: config-w@ ( phys.hi -- w )  cfg-in dup rw@ swap cfg-out wbflip  ;
+: config-l@ ( phys.hi -- l )  cfg-in dup rl@ swap cfg-out lbflip  ;
+: config-b! ( b phys.hi -- )  cfg-in tuck rb! cfg-out  ;
+: config-w! ( w phys.hi -- )  cfg-in >r wbflip r@ rw! r> cfg-out  ;
+: config-l! ( l phys.hi -- )  cfg-in >r lbflip r@ rl! r> cfg-out  ;
 
 headerless
 
@@ -202,12 +207,14 @@ headerless
    1 " #virtual-dma-size-cells" integer-property
    1 " #virtual-dma-addr-cells" integer-property
 
-   sabre-regs encode-int  0 cfg-window en+  " address" property
+   sabre-regs encode-int  cfg-page0 en+  " address" property
 ;
 
 \ Map-ins of the PCI spaces (for obp/dev/pci/map.fth)
+\ (A mapping of its own: the caller maps it out.)
 : bus-map-cfg ( phys.hi len -- va )
-   drop cfg-adr
+   swap cfg-offset  tuck /cfg-page 1- and +		( offset len' )
+   over cfg-page-pa swap (map-in)  swap /cfg-page 1- and +	( va )
 ;
 
 : bus-map-io ( phys.lo phys.mid phys.hi len -- va )

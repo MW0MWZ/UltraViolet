@@ -173,6 +173,7 @@ Ultra5_10::Ultra5_10(const Options& options)
     block("smartcard", kEbusSmartCard, 0x100);
     block("pll", kEbusPll, 0x100);
     ebus_.add(kEbusEcppDma, EbusDma::kSize, &ecpp_dma_, false);
+    ebus_.add(kEbusEcppDma + 0x30000, EbusDma::FifoWindow::kSize, &ecpp_dma_.fifo_window(), false);
     ebus_.add(kEbusAudioPlayDma, EbusDma::kSize, &audio_play_dma_, false);
     ebus_.add(kEbusAudioRecDma, EbusDma::kSize, &audio_rec_dma_, false);
     ebus_.add(kEbusFloppyDma, EbusDma::kSize, &fd_dma_, false);

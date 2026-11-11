@@ -1,5 +1,7 @@
 \ suspend.fth 2.7 99/05/04
 \ Copyright 1985-1994 Bradley Forthware
+\ Adapted by Andy Taylor, 2026: on the Ultra 5/10 (Ultra5_10) the pager's
+\ prompt has no leading space, as an Ultra 10's has none.
 
 \ Smart keyboard driven exit
 \ Type q to abort the listing, anything else to pause it.
@@ -23,7 +25,11 @@ headerless
 ' (reset-page)  is reset-page
 : suspend  ( -- flag )
    #line off
-   ??cr dark  ." More [<space>,<cr>,q,n,p,c] ? "  light
+[ifdef] Ultra5_10
+   ??cr dark  ." More [<space>,<cr>,q,n,p,c] ? "  light	\ (No leading space)
+[else]
+   ??cr dark  ."  More [<space>,<cr>,q,n,p,c] ? "  light
+[then]
    key  #out @  (cr  spaces  (cr  #out off
    dup  ascii q  =   if  drop true  exit  then
    dup  ascii n  =   if  drop true  exit  then

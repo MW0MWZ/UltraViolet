@@ -294,7 +294,11 @@ bool Bridge::forwards_io(u32 addr) const {
 
 bool Bridge::master_abort(unsigned size, u64& value) {
     set_cfg16(kSecStatus, static_cast<u16>(cfg16(kSecStatus) | 0x2000));  // received master abort
-    if (cfg16(kBridgeControl) & 0x0020) return false;                     // master-abort mode: signalled
+    if (cfg16(kBridgeControl) & 0x0020) {  // master-abort mode: a target abort upstream
+        set_cfg16(kStatus, static_cast<u16>(cfg16(kStatus) | 0x0800));  // signalled target abort
+        target_abort_signalled = true;
+        return false;
+    }
     value = size >= 8 ? ~u64{0} : (u64{1} << (8 * size)) - 1;
     return true;
 }

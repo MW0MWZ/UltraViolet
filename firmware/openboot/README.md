@@ -84,6 +84,15 @@ whether the image installed has it (`POST_ON`; the image with it is
 platform (the Sun Fire T2000), checks the tool chain. Another machine is a
 platform folder under `obp/arch` and a file in `systems`.
 
+The release's shared files serve every machine. A change to one that only
+makes it behave as an Ultra 10 does is made under the system's flag
+(`[ifdef] Ultra5_10`, from `systems/ultra5_10.mk`) or kept in the
+platform's folder, so that another machine built from them gets the
+release's behaviour; fixes that hold for any machine are made for all. A
+driver for a chip keeps the board's part (slots, their names and wiring)
+under the flag in one place, as the APB's (`obp/dev/pci-bridge/simba`)
+does.
+
 The release's makefiles are for Solaris's make; `build.sh` does what they
 do, a stage at a time, and `host/reset.ld` lays out the reset code as the
 release's linker map (`obp/arch/sun4u/openboot.map`) does.
@@ -127,6 +136,23 @@ I/II/IIi's TLB and translation entries in `obp/cpu/sparc/ultra` (`map.fth`,
 | `obp/dev/network/hme` | the RIO's Ethernet (Happy Meal) |
 | `obp/dev/m64` | the Rage Pro: UltraViolet's FCode (`firmware/rage`) as a drop-in |
 
+The root node has the UPA methods a UPA card's FCode calls on an Ultra
+10 (`upa-get-portid`, `upa-set-queue-sizes`, `upa-slave-interrupt` and the
+rest, `rootnexus.fth`): the Creator3D's sets its request queue size in the
+IIi's FFB_Config register through them. It also has `decode-space` (a
+port ID as a UPA physical address's high cell) and the DMA methods
+(`dma-alloc`, `dma-map-in` and the rest), which are the PCI bus module's:
+all of an Ultra 10's DMA goes through its IOMMU. Mapping out a range that
+isn't mapped in gives a warning. `reset-all` says "Resetting ..."
+first, from the ok prompt or on a reboot. `watch-net` shows a bad packet
+('X') for each frame the Ethernet's MAC counts as an error (too long,
+misaligned, bad CRC) or that overflowed its buffer.
+The keyboard works in every Type 5 layout (21-36): the release's tables
+by USB usage, and, for the layouts the release has none of, the Ultra 10's
+own (`usb-japan.fth`, `usb-canadian-french.fth`, `usb-hungary.fth`,
+`usb-poland.fth`, `usb-czech.fth`, in `obp/pkg/keyboard/tables/usb`, as
+its keyboard gives them; Korea, Taiwan and Russia are the USA's).
+
 The machine's configuration variables (`loadconfig.fth`) and its
 diagnostic commands the release has no form of (`diag.fth`: `.speed`,
 `probe-pci`, `probe-pci-slot`, `eject-floppy`) are part of the platform;
@@ -138,8 +164,14 @@ registers, operations and trap; the UPA data bus; memory, through the
 E-cache and around it, with block loads and stores; the PCI bus module's
 PIO address decoding and byte enables, interrupt maps and states, IOMMU registers and TLB, and PCI registers; the
 MMUs' misses, byte order and ASIs; the traps for errors (a PCI master
-abort among them), misaligned accesses and protection (`post.fth` takes
-its result); the RIO EBus's DMA test is not there yet. The
+abort among them), misaligned accesses and protection; DMA through the
+IOMMU (reads and writes, TLB misses and hits, pass-through and the TLB's
+locking), made by the RIO EBus's parallel port DMA channel in its
+diagnostic mode; the RIO's PCI configuration headers (EBus and
+Ethernet); PIO reads ending in a master abort and in a target abort (APB
+B in master-abort mode). `post.fth` takes its result, and the board descriptor
+(0002.3333.0200.001b after a passing run, as an Ultra 10's, also kept in
+the NVRAM at 1d58). The
 selftests (`test`, `test-all`) of the Rage Pro, the Ethernet and the
 floppy drive are in their drivers.
 
@@ -238,18 +270,28 @@ pairs, the IIi manual's formula), and Mem_Control1's timings from a table
 by the clock in MHz, for 50 ns DRAMs, or 60 ns ones when both pairs are in
 use; the banner then names the speed ("256 MB (50 ns) memory installed").
 The free memory's check bits are then set ("Initializing ... megs of
-memory at addr ..." in diagnostic mode, "Initializing Memory" otherwise).
+memory at addr ..." in diagnostic mode, "Initializing Memory" otherwise,
+and nothing shown with `silent-mode?` true outside diagnostic mode).
 
 OpenBoot lives in the top 1 MiB of that pair side, as on an Ultra 10: its
 image in the top 512 KiB (mapped at f000.0000 by one locked 512 KiB TLB
-entry), its first 64 KiB of RAM below that, and the memory it takes as it
+entry), its first 64 KiB of RAM below that (mapped at fffe.0000, its
+run-time mappings taken below it), and the memory it takes as it
 runs (its heap, page tables, processor structures, the dictionary's
 growth a page at a time, the IOMMU's table) from the rest of the 1 MiB;
 the retained page (`arch/sun4u/retained.fth`) is the page just below.
+A compressed drop-in's buffers come from the bottom of the 1 MiB (the
+dictionary grows from its top), so that freeing them once its driver has
+run leaves no hole: the memory is initialised in two ranges, as on an
+Ultra 10.
 The rest is free for the client (`/memory`'s `available`), the 1 MiB's
 unused part with it. The IOMMU's table is the Ultra 10's 16 KiB, for the
 16 MB of DVMA from c000.0000 OpenBoot uses (the IOMMU is told 128K entries;
-the client sets up its own).
+the client sets up its own); as on an Ultra 10, a page's DVMA address is
+c000.0000 plus the low 24 bits of its virtual address. As on an Ultra 10,
+the flash PROM is mapped only while drop-ins are read, and of PCI
+configuration space only bus 0's first page stays mapped (the PCI node's
+`address`); any other page is mapped for the access alone.
 
 ### PCI
 
@@ -272,8 +314,9 @@ The release's own files are unchanged, but for:
   every 10 microseconds for the first millisecond before polling every
   millisecond, so that a drive's brief busy time between the blocks of a
   transfer doesn't cost a millisecond a block.
-- `obp/fm/lib/suspend.fth`: the pager's prompt is an Ultra 10's, "More
-  [<space>,<cr>,q,n,p,c] ?" (the release's begins with a space).
+- `obp/fm/lib/suspend.fth`: on the Ultra 5/10 the pager's prompt is an
+  Ultra 10's, "More [<space>,<cr>,q,n,p,c] ?" (the release's begins with
+  a space).
 - `obp/dev/pci/device-props.fth`, `probe-reg.fth`, `make-device.fth` and
   `pcibus.fth`: on the Ultra 5/10, PCI devices are given their addresses as
   an Ultra 10's own OpenBoot gives them. While a device is probed its BARs
@@ -290,6 +333,17 @@ The release's own files are unchanged, but for:
   alignment (the Ultra 5/10's: a page, and 1 MiB).
 - `obp/pkg/console/banner.fth`: on the Ultra 5/10 the banner has no
   copyright line, as an Ultra 10's has none.
+- `obp/arch/sun4u/fieldberr.fth` (with a hook in `catchexc.fth`): a probe
+  (`cprobe` and the like) that ends at the ok prompt with a trap it doesn't
+  field, such as an MMU miss, no longer leaves its trap handlers installed;
+  a later misaligned access gave "Error bed", and the next an illegal
+  instruction.
+- `obp/pkg/boot/bootparm.fth`: on the Ultra 5/10, with `silent-mode?` true
+  and not in diagnostic mode, the "Boot device" and "Rebooting with
+  command" lines are left out, as an Ultra 10 leaves them out.
+- `obp/pkg/decompressor/decompress.fth`: on the Ultra 5/10 a compressed
+  drop-in's buffers take their memory where the platform chooses
+  (`memprobe.fth`), at the bottom of OpenBoot's 1 MiB.
 - `obp/fm/kernel/fileio.fth`: an error at the end of a string being
   evaluated shows the string ("Evaluating: boot"); the line was looked for
   from one past its end, and shown empty.

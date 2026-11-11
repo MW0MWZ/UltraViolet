@@ -39,6 +39,10 @@
 \ any nuclear facility. 
 \ 
 \ ========== Copyright Header End ============================================
+\ Adapted by Andy Taylor, 2026: a trap the handlers below do not field
+\ (one that goes back to the ok prompt from inside guarded-execute) no
+\ longer leaves them installed: abandon-guards puts back what the
+\ outermost guarded-execute replaced.
 id: @(#)fieldberr.fth 1.14 03/08/20
 purpose: 
 copyright: Copyright 1999-2003 Sun Microsystems, Inc.  All Rights Reserved
@@ -143,8 +147,39 @@ c;
     landing-pad throw execute
 ;
 
+\ A trap these handlers do not field (an MMU miss, for one) goes back to the
+\ ok prompt from inside newguarded-execute, past the code below that puts
+\ the trap handlers back. The safe handlers would stay installed with the
+\ landing pad still set, and a later misaligned access would come back
+\ through that stale landing pad ("Error bed"), or, with the landing pad
+\ used up, as an illegal instruction. So the outermost call keeps what it
+\ replaced here too, and abandon-guards (called on such a trap) restores it.
+variable guard-depth
+5 /n* buffer: guard-saved	\ t30 t1f t32 t34 cpu-error-enable
+
+: guard-save  ( -- )
+   guard-depth @ 0=  if
+      trap30 vector@  trap1f vector@  trap32 vector@  trap34 vector@
+      cpu-error-enable@
+      guard-saved  5 0  do  tuck !  na1+  loop  drop
+   then
+   1 guard-depth +!
+;
+
+: guard-abandon  ( -- )
+   guard-depth @  if
+      guard-depth off
+      guard-saved  dup @ cpu-error-enable!	\ saved last to first
+      dup 1 na+ @ trap34 vector!   dup 2 na+ @ trap32 vector!
+      dup 3 na+ @ trap1f vector!   4 na+ @ trap30 vector!
+      0  mid@ >cpu-struct >guarded-pc  !
+   then
+;
+' guard-abandon is abandon-guards
+
 : newguarded-execute  ( ?? acf -- succeeded?-flag )
-   trap30  vector@ >r		   ( acf )	( R: t30 )	
+   guard-save
+   trap30  vector@ >r		   ( acf )	( R: t30 )
    trap1f  vector@ >r		   ( acf )	( R: t30 t1f )
    trap32  vector@ >r		   ( acf )	( R: t30 t1f t32 )
    trap34  vector@ >r		   ( acf )	( R: t30 t1f t32 )
@@ -177,6 +212,7 @@ c;
    r> trap32  vector!		   ( flag )	  ( R: t30 t1f )
    r> trap1f  vector!		   ( flag )	  ( R: t30 )
    r> trap30  vector!		   ( flag )	  ( R: )
+   -1 guard-depth +!
 ;
 
 

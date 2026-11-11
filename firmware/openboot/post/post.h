@@ -144,6 +144,23 @@ void post_data_access(void);
 void post_align(void);
 void post_priv(void);
 void post_protect(void);
+void post_init_sabre_err(void);
+void post_pio_master_abort(void);
+void post_pio_target_abort(void);
+
+/* tests-pci.c */
+void post_rio_ebus_config(void);
+void post_rio_net_config(void);
+
+/* tests-ebus.c */
+void post_dma_rd_miss(void);
+void post_dma_rd_hit(void);
+void post_dma_wr_miss(void);
+void post_dma_wr_hit(void);
+void post_dma_pass_rd(void);
+void post_dma_pass_wr(void);
+void post_dma_rd_lock(void);
+void post_dma_wr_lock(void);
 
 u32 post_main(u32 arg);
 void post_unexpected_trap(u32 tt, u64 tpc);

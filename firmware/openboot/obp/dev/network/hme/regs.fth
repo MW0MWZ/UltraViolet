@@ -41,6 +41,8 @@ h# 620c constant bmac-tx-cfg	h# 6230 constant bmac-tx-max
 h# 6308 constant bmac-rx-reset	h# 630c constant bmac-rx-cfg
 h# 6310 constant bmac-rx-max	h# 6318 constant bmac-madd2
 h# 631c constant bmac-madd1	h# 6320 constant bmac-madd0
+h# 6328 constant bmac-len-errs	h# 632c constant bmac-align-errs
+h# 6330 constant bmac-crc-errs
 h# 6340 constant bmac-hash3	\ (hash2 344, hash1 348, hash0 34c)
 \ MIF
 h# 700c constant mif-frame	h# 7010 constant mif-cfg

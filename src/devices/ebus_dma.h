@@ -29,7 +29,8 @@ public:
     static constexpr u32 kIntPend = 1u << 0, kErrPend = 1u << 1, kDrain = 1u << 2, kIntEn = 1u << 4,
                          kReset = 1u << 7, kWrite = 1u << 8, kEnDma = 1u << 9, kCycPend = 1u << 10,
                          kEnCnt = 1u << 13, kTc = 1u << 14, kTciDis = 1u << 23, kEnNext = 1u << 24,
-                         kDmaOn = 1u << 25, kALoaded = 1u << 26, kNaLoaded = 1u << 27;
+                         kDmaOn = 1u << 25, kALoaded = 1u << 26, kNaLoaded = 1u << 27,
+                         kDiagRdDone = 1u << 11, kDiagWrDone = 1u << 12, kDiagEn = 1u << 20;
     // DEV_ID (bits 31:28): all four channels on a real Ultra 10 read 0xC.
     static constexpr u32 kDevId = 0xCu << 28;
 
@@ -58,10 +59,26 @@ public:
 
     u32 csr() const;
 
+    // The channel's FIFO as its diagnostic window shows it: 16 entries of 8
+    // bytes, the first 4 bytes of entry n at 4n, the other 4 at 0x100 + 4n.
+    class FifoWindow final : public Device {
+    public:
+        static constexpr u32 kSize = 0x200, kEntries = 16;
+        explicit FifoWindow(EbusDma& dma) : dma_(dma) {}
+        const char* name() const override { return "ebus-dma-fifo"; }
+        bool read(u64 offset, unsigned size, u64& value) override;
+        bool write(u64 offset, unsigned size, u64 value) override;
+
+    private:
+        EbusDma& dma_;
+    };
+    FifoWindow& fifo_window() { return fifo_window_; }
+
 private:
     std::size_t grant(std::size_t length, bool to_memory) const;  // bytes the channel will take now
     std::size_t complete(std::size_t n, bool ok);
     void update_irq();
+    void diag_transfer();
 
     const char* name_;
     std::function<void(bool)> irq_;
@@ -74,6 +91,10 @@ private:
     bool loaded_ = false;       // A_LOADED: the current transfer is set up
     bool next_loaded_ = false;  // NA_LOADED: the next one is waiting
     bool tc_ = false, err_ = false, device_irq_ = false;
+    bool diag_rd_done_ = false, diag_wr_done_ = false;
+    static constexpr std::size_t kBurst = FifoWindow::kEntries * 8;
+    u8 fifo_[FifoWindow::kEntries * 8]{};
+    FifoWindow fifo_window_{*this};
     bool irq_out_ = false;
 };
 

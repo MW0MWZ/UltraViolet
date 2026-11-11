@@ -1,6 +1,6 @@
 \ Copyright (C) 2026 Andy Taylor. Distributed under the same terms as the
 \ OpenBoot release it is part of (see LICENSE).
-id: @(#)kbd.fth 1.0 26/11/07
+id: @(#)kbd.fth 1.1 26/11/11
 purpose: The Sun Type 5 keyboard, on the SuperIO's first UART
 copyright: Copyright 2026 Andy Taylor
 
@@ -46,15 +46,27 @@ create type5>usb
 create layout>country
    \ 21 USA, 22 USA (UNIX), 23 France, 24 Denmark, 25 Germany, 26 Italy,
    \ 27 Netherlands, 28 Norway, 29 Portugal, 2a Spain, 2b Sweden, 2c Swiss
-   \ French, 2d Swiss German, 2e UK
+   \ French, 2d Swiss German, 2e UK, 2f Korea, 30 Taiwan, 31 Japan, 32
+   \ Canadian French, 33 Hungary, 34 Poland, 35 Czech, 36 Russia
    d# 33 c, d# 33 c, d# 8 c, d# 6 c, d# 9 c, d# 14 c, d# 18 c, d# 19 c,
    d# 22 c, d# 25 c, d# 26 c, d# 27 c, d# 28 c, d# 32 c,
+   d# 16 c, d# 30 c, d# 15 c, d# 4 c, d# 12 c, d# 21 c, d# 5 c, d# 23 c,
+
+\ Whether the layout's key 58 is the ISO # ~ key (usage 32) or the ANSI \ |
+\ key (usage 31), by layout from 21: the ANSI ones, 21 and 22, Korea,
+\ Taiwan and Russia; and Japan, Hungary, Poland and Czech, which give
+\ nothing on key 7c (the ISO < > key), their key 58 being their tables' 31
+create layout-iso
+   0 c, 0 c, 1 c, 1 c, 1 c, 1 c, 1 c, 1 c,  1 c, 1 c, 1 c, 1 c, 1 c, 1 c,
+   0 c, 0 c, 0 c, 1 c, 0 c, 0 c, 0 c, 0 c,
 
 : get-kbd-cntry-id ( -- cntry-code )
-   layout h# 21 - dup 0 d# 14 within if  layout>country + c@  else  drop d# 33  then
+   layout h# 21 - dup 0 d# 22 within if  layout>country + c@  else  drop d# 33  then
 ;
 
-: iso-layout? ( -- flag )  layout h# 21 h# 23 within 0=  ;
+: iso-layout? ( -- flag )
+   layout h# 21 - dup 0 d# 22 within if  layout-iso + c@ 0<>  else  drop false  then
+;
 
 : >usage ( key# -- usage )
    dup h# 58 = iso-layout? and if  drop h# 32 exit  then	\ the # ~ key

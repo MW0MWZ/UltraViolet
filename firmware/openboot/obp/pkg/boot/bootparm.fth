@@ -39,6 +39,9 @@
 \ any nuclear facility. 
 \ 
 \ ========== Copyright Header End ============================================
+\ Adapted by Andy Taylor, 2026: on the Ultra 5/10 (Ultra5_10) the "Boot
+\ device" and "Rebooting with command" lines are left out with silent-mode?
+\ true outside diagnostic mode, as an Ultra 10 leaves them out.
 id: @(#)bootparm.fth 3.39 06/04/25
 purpose: Implements the boot command - parses arguments, etc.
 copyright: Copyright 2006 Sun Microsystems, Inc.  All Rights Reserved.
@@ -225,7 +228,13 @@ headerless
 : $boot-read  ( cmd-str -- )
    parse-boot-command                         ( file-str device-str )
 
+[ifdef] Ultra5_10
+   \ (The Ultra 10 leaves this line out with silent-mode? true, outside
+   \ diagnostic mode.)
+   min+mode?  silent-mode? diagnostic-mode? 0= and 0=  and  if
+[else]
    min+mode? if                               ( file-str device-str )
+[then]
       ." Boot device: "  2dup type            ( file-str device-str )
       ."   File and args: " 2over type cr     ( file-str device-str )
    then
@@ -367,7 +376,12 @@ headerless
    \  Cursor position is restored in fwritestr.fth
    2drop                                    ( bootcmd$ )
 
+[ifdef] Ultra5_10
+   \ (Left out as the "Boot device" line is.)
+   min+mode?  silent-mode? diagnostic-mode? 0= and 0=  and  if
+[else]
    min+mode? if                             ( bootcmd$ )
+[then]
       ." Rebooting with command: " 2dup type cr  ( bootcmd$ )
    then                                     ( bootcmd$ )
 

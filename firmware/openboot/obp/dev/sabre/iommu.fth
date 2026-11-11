@@ -1,6 +1,6 @@
 \ Copyright (C) 2026 Andy Taylor. Distributed under the same terms as the
 \ OpenBoot release it is part of (see LICENSE).
-id: @(#)iommu.fth 1.0 26/11/07
+id: @(#)iommu.fth 1.2 26/11/11
 purpose: The Sabre's IOMMU and the DMA methods of its children
 copyright: Copyright 2026 Andy Taylor
 
@@ -54,8 +54,11 @@ h# ffff.e000 h# 1ff lxjoin constant tte-pa-mask
 
 init-iommu
 
-variable dma-list	dma-list off
-virtual-dma-base /dvma-used dma-list free-memrange
+\ A page's DVMA address is tied to its virtual address, as an Ultra 10's
+\ is: the 16 MB from C000.0000 the low 24 bits of OpenBoot's virtual
+\ addresses (its memory is in the top 16 MB of its virtual range), so the
+\ same page always has the same DVMA address and nothing is allocated.
+: >dvma ( va -- dvma )  h# ff.ffff and  virtual-dma-base +  ;
 
 : map-dvma-page ( pa dvma -- )
    swap tte-pa-mask and tte-valid or  over >tsb-entry x!	( dvma )
@@ -64,6 +67,15 @@ virtual-dma-base /dvma-used dma-list free-memrange
 
 : unmap-dvma-page ( dvma -- )
    0 over >tsb-entry x!  iommu-flush-page
+;
+
+\ A range to map out: in OpenBoot's DVMA, each page mapped.
+: dvma-mapped? ( dvma len -- flag )
+   over virtual-dma-base u<  if  2drop false exit  then
+   2dup +  virtual-dma-base /dvma-used + u>  if  2drop false exit  then
+   true -rot  bounds ?do				( flag )
+      i low32 and >tsb-entry x@ tte-valid and 0=  if  drop false  then
+   pagesize +loop
 ;
 
 external
@@ -78,24 +90,25 @@ external
 ;
 
 : dma-map-in ( virt size cache? -- dma-virt )
-   drop						( virt size )
-   over pagesize 1- and  tuck +			( virt offset size' )
-   pagesize round-up >r				( virt offset ) ( r: len )
-   pagesize r@ dma-list allocate-memrange	( virt offset dvma false | .. true )
-   if  cmn-error[ " Out of DVMA space" ]cmn-end abort  then	( virt offset dvma )
-   rot page#mask and  r>  0 ?do			( offset dvma va )
-      dup >physical drop  2 pick i +  map-dvma-page
-      pagesize +
-   pagesize +loop  drop				( offset dvma )
-   +						( dma-virt )
+   drop  over pagesize 1- and +  pagesize round-up	( virt len )
+   over page#mask and  swap bounds		( virt end start )
+   \ (A loop index is a 32-bit FCode number, sign-extended: as an address
+   \ it is taken to its low 32 bits.)
+   2dup ?do  i low32 and c@ drop  pagesize +loop	\ Unmapped: a data access trap
+   ?do  i low32 and  dup >physical drop  swap >dvma  map-dvma-page
+   pagesize +loop
+   >dvma						( dma-virt )
 ;
 
 : dma-map-out ( virt dma-virt size -- )
    rot drop					( dma-virt size )
    over pagesize 1- and +  pagesize round-up	( dma-virt len )
    swap page#mask and swap			( dvma len )
-   2dup bounds ?do  i unmap-dvma-page  pagesize +loop
-   dma-list free-memrange
+   2dup dvma-mapped?  0=  if
+      ." WARNING: attempt to map-out non dma-alloc'd range: "
+      base @ >r hex  swap . .  r> base !  cr exit
+   then
+   bounds ?do  i low32 and unmap-dvma-page  pagesize +loop
 ;
 
 headerless
