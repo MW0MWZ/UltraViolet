@@ -47,6 +47,10 @@ public:
         (void)size;
         return 0;
     }
+
+    // Memory reached through a device (DRAM decoded otherwise than in
+    // address order): device DMA reaches it as it reaches host memory.
+    virtual bool is_memory() const { return false; }
 };
 
 class Bus {
@@ -125,9 +129,11 @@ public:
         if (code_write_handler_) code_write_handler_(page, host, size);
     }
     // Device DMA into memory: copies and invalidates cached code it overwrites.
-    // Returns false if any of it is not writable host memory.
+    // Returns false if any of it is neither writable host memory nor a
+    // memory device.
     bool write_block(u64 paddr, const u8* data, std::size_t length);
-    // Device DMA from memory. Returns false if any of it is not host memory.
+    // Device DMA from memory. Returns false if any of it is neither host
+    // memory nor a memory device.
     bool read_block(u64 paddr, u8* data, std::size_t length) const;
 
     // See Device::stable_until. Host memory (RAM and ROM) changes only by
@@ -139,6 +145,16 @@ public:
     u64 slow_accesses() const { return slow_accesses_; }
     // Device DMA into memory (write_block calls).
     u64 dma_writes() const { return dma_writes_; }
+
+    // A device ending a failed read with a bus error (a target abort) rather
+    // than leaving it to time out says so here; the processor takes it with
+    // the error.
+    void signal_bus_error() { bus_error_ = true; }
+    bool take_bus_error() {
+        const bool b = bus_error_;
+        bus_error_ = false;
+        return b;
+    }
 
     // Debugger hook: every device (MMIO) read, after it completes.
     std::function<void(u64 paddr, unsigned size, u64 value)> device_read_hook;
@@ -211,6 +227,7 @@ private:
     std::vector<std::unique_ptr<Chunk>> owned_;
     std::vector<std::unique_ptr<Region>> regions_;
     ErrorHandler error_handler_;
+    bool bus_error_ = false;
     RomWriteHandler rom_write_handler_;
     CodeWriteHandler code_write_handler_;
     std::function<void()> remap_handler_;

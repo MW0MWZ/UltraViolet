@@ -54,7 +54,11 @@ decimal
    ascii `      notsign      bk-vbar    53      allk		\ lft of 1
                 ascii "                 31      sk		\ 2
                 p-strlg                 32      sk		\ 3
+[ifdef] Ultra5_10
+\ (The Ultra 10's UK keyboard gives nothing for AltGraph 5)
+[else]
                              ascii %    34      ak		\ 5
+[then]
                 ascii @                 52      sk  
    ascii #      ascii ~                 50      nsk 		\ lft of lowRtn
    ascii \      ascii |                 100     nsk		\ left of z

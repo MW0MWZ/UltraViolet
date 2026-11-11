@@ -91,8 +91,17 @@ bool Bus::write_block(u64 paddr, const u8* data, std::size_t length) {
     while (length) {
         if (paddr > kAddressMask) return false;
         const Page& p = page(paddr);
-        if (!p.host || !p.writable) return false;
         const u64 in_page = paddr & kPageMask;
+        if (!p.host && p.device && p.device->is_memory()) {
+            const std::size_t chunk = static_cast<std::size_t>(std::min<u64>(length, kPageSize - in_page));
+            for (std::size_t i = 0; i < chunk; ++i)
+                if (!p.device->write(paddr + i - p.device_base, 1, data[i])) return false;
+            paddr += chunk;
+            data += chunk;
+            length -= chunk;
+            continue;
+        }
+        if (!p.host || !p.writable) return false;
         const std::size_t chunk = static_cast<std::size_t>(std::min<u64>(length, kCodeMask + 1 - (in_page & kCodeMask)));
         u8* const h = p.host + in_page;
         std::memcpy(h, data, chunk);
@@ -108,10 +117,18 @@ bool Bus::read_block(u64 paddr, u8* data, std::size_t length) const {
     while (length) {
         if (paddr > kAddressMask) return false;
         const Page& p = page(paddr);
-        if (!p.host) return false;
         const u64 in_page = paddr & kPageMask;
         const std::size_t chunk = static_cast<std::size_t>(std::min<u64>(length, kPageSize - in_page));
-        std::memcpy(data, p.host + in_page, chunk);
+        if (!p.host) {
+            if (!p.device || !p.device->is_memory()) return false;
+            for (std::size_t i = 0; i < chunk; ++i) {
+                u64 v;
+                if (!p.device->read(paddr + i - p.device_base, 1, v)) return false;
+                data[i] = static_cast<u8>(v);
+            }
+        } else {
+            std::memcpy(data, p.host + in_page, chunk);
+        }
         paddr += chunk;
         data += chunk;
         length -= chunk;

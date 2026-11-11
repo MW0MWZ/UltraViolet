@@ -57,10 +57,10 @@ constexpr u64 kRstPor = 1ull << 31, kRstSoftPor = 1ull << 30, kRstSoftXir = 1ull
 // PIO write error status (PCI AFSR): primary master abort, target abort,
 // excessive retries, parity error; the secondary bits four below; the
 // byte mask of the logged write (bit 32 byte 0).
-constexpr u64 kAfsrPma = 1ull << 63, kAfsrPrimary = 0xFull << 60, kAfsrErrors = 0xFFull << 56,
+constexpr u64 kAfsrPma = 1ull << 63, kAfsrPta = 1ull << 62, kAfsrPrimary = 0xFull << 60, kAfsrErrors = 0xFFull << 56,
               kAfsrByteMask = 0xFFull << 32;
 // The module's PCI status: signalled target abort, received master abort.
-constexpr u16 kStatusSta = 0x0800, kStatusRma = 0x2000;
+constexpr u16 kStatusSta = 0x0800, kStatusRta = 0x1000, kStatusRma = 0x2000;
 constexpr u64 kPciCtlErrEn = 1ull << 8;  // the PCI error interrupt enable
 
 // DMA error status (UE AFSR): primary DMA read and write, secondary read
@@ -151,6 +151,7 @@ void Sabre::map_mem_window(u64 pa, u64 size) { bus_.map_device(pa, size, mem_win
 
 void Sabre::reset(bool power_on) {
     regs_.clear();
+    for (unsigned i = 0; i < 16; ++i) tlb_lru_[i] = static_cast<u8>(i);
     // Only a power-on reset initialises Mem_Control0/1 (IIi manual 18.2:
     // SOFT_POR, B_POR and the XIRs leave refresh running as it was).
     if (power_on) {
@@ -312,9 +313,8 @@ bool Sabre::regs_write(u64 offset, unsigned size, u64 value) {
         // (ERR and ERRSTS, 26:24, cleared by writing 1; the rest as written)
         case kIommuCtl: iommu_ctl_ = (iommu_ctl_ & ~v & 0x07000000ull) | (v & 0x00FF0007ull); return true;
         case kIommuTsb: iommu_tsb_ = v & 0x1FFFFFFE000ull; return true;
-        // (DMA translations are not cached here; what the diagnostic accesses
-        // see of the IOMMU's TLB is: a flush invalidates each entry whose tag
-        // matches the address, IIi manual 19.3.2.3.)
+        // A flush invalidates each TLB entry whose tag matches the address
+        // (IIi manual 19.3.2.3).
         case kIommuFlush:
             for (unsigned i = 0; i < 16; ++i)
                 if (iommu_tag_matches(i, (v >> 13) & 0x7FFFF)) {
@@ -460,15 +460,15 @@ void Sabre::pio_error(u64 bit) {
     if (!(pci_afsr_ & kAfsrPrimary)) pci_afsr_ |= bit;
     else pci_afsr_ |= bit >> 4;  // a second error sets the secondary bit
     if (bit == kAfsrPma) host_->received(kStatusRma);
+    if (bit == kAfsrPta) host_->received(kStatusRta);
     update_error_interrupts();
 }
 
 // A DVMA access without a usable translation (an invalid entry, or a
 // write to a page not writable): the uncorrectable error status records a
 // translation error with its direction (the primary bits, or the secondary
-// ones while a primary error is held), the AFAR the TTE's address (the
-// IOMMU missed: it caches no translations), and the IOMMU control register
-// the kind of error. The master's cycle is target-aborted.
+// ones while a primary error is held), the AFAR the TTE's address, and the
+// IOMMU control register the kind of error. The master's cycle is target-aborted.
 void Sabre::dma_error(u32 dvma, bool write, unsigned kind, u64 tte_pa) {
     if (!(ue_afsr_ & (kUePdrd | kUePdwr | kUePdte))) {
         const u64 offset = (tte_pa >> 3) & 7;  // the doubleword in its 64 bytes
@@ -492,8 +492,9 @@ void Sabre::update_error_interrupts() {
 
 bool Sabre::io_read(u64 offset, unsigned size, u64& value) {
     u32 v;
+    pci::target_abort_signalled = false;
     if (size > 4 || !root_.io_read(static_cast<u32>(offset), size, v)) {
-        host_->received(kStatusRma);  // a time-out to the processor, not logged here
+        read_failed();
         return false;
     }
     value = swap_size(v, size);
@@ -502,15 +503,29 @@ bool Sabre::io_read(u64 offset, unsigned size, u64& value) {
 
 bool Sabre::io_write(u64 offset, unsigned size, u64 value) {
     pio_write(kIoBase + offset, size);
+    pci::target_abort_signalled = false;
     if (size > 4 || !root_.io_write(static_cast<u32>(offset), size, static_cast<u32>(swap_size(value, size))))
-        pio_error(kAfsrPma);
+        pio_error(pci::target_abort_signalled ? kAfsrPta : kAfsrPma);
     return true;
+}
+
+// A PIO read that fails is not logged here: a master abort reaches the
+// processor as a time-out, a target abort as a bus error (its AFSR's TO or
+// BERR); the module's status records which it received.
+void Sabre::read_failed() {
+    if (pci::target_abort_signalled) {
+        host_->received(kStatusRta);
+        bus_.signal_bus_error();
+    } else {
+        host_->received(kStatusRma);
+    }
 }
 
 bool Sabre::mem_read(u64 offset, unsigned size, u64& value) {
     u64 v;
+    pci::target_abort_signalled = false;
     if (!root_.mem_read(static_cast<u32>(offset), size, v)) {
-        host_->received(kStatusRma);  // a time-out to the processor, not logged here
+        read_failed();
         UV_LOG(Debug, "sabre", "PCI master abort: read%u @ %08llx", size * 8, static_cast<unsigned long long>(offset));
         return false;
     }
@@ -522,8 +537,9 @@ u64 Sabre::mem_stable(u64 offset, unsigned size) { return root_.mem_stable(stati
 
 bool Sabre::mem_write(u64 offset, unsigned size, u64 value) {
     pio_write(kMemBase + offset, size);
+    pci::target_abort_signalled = false;
     if (!root_.mem_write(static_cast<u32>(offset), size, swap_size(value, size))) {
-        pio_error(kAfsrPma);
+        pio_error(pci::target_abort_signalled ? kAfsrPta : kAfsrPma);
         UV_LOG(Debug, "sabre", "PCI master abort: write%u @ %08llx", size * 8, static_cast<unsigned long long>(offset));
     }
     return true;
@@ -539,7 +555,7 @@ bool Sabre::translate(u32 dvma, bool write, u64& pa) const {
     return translate(dvma, write, pa, kind, tte_pa);
 }
 
-bool Sabre::translate(u32 dvma, bool write, u64& pa, unsigned& kind, u64& tte_pa) const {
+bool Sabre::translate(u32 dvma, bool write, u64& pa, unsigned& kind, u64& tte_pa, u64* tte_out) const {
     if (!(iommu_ctl_ & 1)) {
         pa = dvma;
         return true;
@@ -563,6 +579,53 @@ bool Sabre::translate(u32 dvma, bool write, u64& pa, unsigned& kind, u64& tte_pa
     const bool tte64k = (tte >> 61) & 1;
     const u64 mask = tte64k ? 0xFFFF : 0x1FFF;
     pa = ((tte & 0x1FFFFFFE000ull) & ~mask) | (dvma & mask);
+    if (tte_out) *tte_out = tte;
+    return true;
+}
+
+// The IOMMU's TLB (IIi manual 19.3.2): 16 entries, held where their
+// diagnostic accesses show them (tags at A580 + 8n: W 21, streaming 20,
+// 64K 19, VA<31:13> 18:0; data at A600 + 8n: V 30, cacheable 28, PA<40:13>
+// 27:0). A DMA address is looked up there first; a miss walks the TSB and
+// loads the translation into the least recently used entry, or, with the
+// control register's LRU_LCKEN (bit 23) set, into the entry LRU_LCKPTR
+// (22:19) names, the only one then replaced (19.3.2.1, "IOMMU locking").
+// Software flushes an entry when it changes the TSB under it.
+void Sabre::tlb_used(unsigned n) {
+    auto it = std::find(tlb_lru_.begin(), tlb_lru_.end(), static_cast<u8>(n));
+    std::rotate(it, it + 1, tlb_lru_.end());
+}
+
+bool Sabre::iommu_map(u32 dvma, bool write, u64& pa, unsigned& kind, u64& tte_pa) {
+    if (!(iommu_ctl_ & 1)) {
+        pa = dvma;
+        return true;
+    }
+    const u64 vpn = (dvma >> 13) & 0x7FFFF;
+    for (unsigned n = 0; n < 16; ++n) {
+        const auto d = regs_.find(kIommuDataDiag + 8 * n);
+        if (d == regs_.end() || !(d->second & (u64{1} << 30)) || !iommu_tag_matches(n, vpn)) continue;
+        const u64 tag = regs_[kIommuTagDiag + 8 * n];
+        if (write && !(tag & (u64{1} << 21))) {
+            kind = kIommuProtection;
+            const unsigned tsb_size = static_cast<unsigned>(iommu_ctl_ >> 16) & 7;
+            const unsigned page_shift = (iommu_ctl_ & 4) ? 16 : 13;
+            tte_pa = iommu_tsb_ + ((dvma >> page_shift) & ((u64{1024} << tsb_size) - 1)) * 8;
+            return false;
+        }
+        const u64 mask = (tag & (u64{1} << 19)) ? 0xFFFF : 0x1FFF;
+        pa = (((d->second & 0xFFFFFFFull) << 13) & ~mask) | (dvma & mask);
+        tlb_used(n);
+        return true;
+    }
+    u64 tte = 0;
+    if (!translate(dvma, write, pa, kind, tte_pa, &tte)) return false;
+    const unsigned n = (iommu_ctl_ & (u64{1} << 23)) ? static_cast<unsigned>(iommu_ctl_ >> 19) & 0xF : tlb_lru_[0];
+    const bool big = (tte >> 61) & 1;
+    regs_[kIommuTagDiag + 8 * n] = (tte & 2 ? u64{1} << 21 : 0) | (((tte >> 60) & 1) << 20) | (u64{big} << 19) |
+                                   (big ? vpn & 0x7FFF8 : vpn);
+    regs_[kIommuDataDiag + 8 * n] = (u64{1} << 30) | (((tte >> 4) & 1) << 28) | ((tte >> 13) & 0xFFFFFFFull);
+    tlb_used(n);
     return true;
 }
 
@@ -578,7 +641,7 @@ bool Sabre::dma_read(u32 dvma, u8* data, std::size_t length) {
         u64 pa;
         unsigned kind;
         u64 tte_pa;
-        if (!translate(dvma, false, pa, kind, tte_pa)) {
+        if (!iommu_map(dvma, false, pa, kind, tte_pa)) {
             dma_error(dvma, false, kind, tte_pa);
             return false;
         }
@@ -597,7 +660,7 @@ bool Sabre::dma_write(u32 dvma, const u8* data, std::size_t length) {
         u64 pa;
         unsigned kind;
         u64 tte_pa;
-        if (!translate(dvma, true, pa, kind, tte_pa)) {
+        if (!iommu_map(dvma, true, pa, kind, tte_pa)) {
             dma_error(dvma, true, kind, tte_pa);
             return false;
         }

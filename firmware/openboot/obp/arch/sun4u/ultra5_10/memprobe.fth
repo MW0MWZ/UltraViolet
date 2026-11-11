@@ -1,6 +1,6 @@
 \ Copyright (C) 2026 Andy Taylor. Distributed under the same terms as the
 \ OpenBoot release it is part of (see LICENSE).
-id: @(#)memprobe.fth 1.1 26/11/09
+id: @(#)memprobe.fth 1.2 26/11/11
 purpose: Sizing the Ultra 5/10's memory: the /memory node
 copyright: Copyright 2026 Andy Taylor
 
@@ -164,6 +164,35 @@ h# a5a5.a5a5.a5a5.a5a5 constant pattern3
    2dup + physmax 2dup @ u> if ! else 2drop then
    2dup free-bank  (free-range)
 ;
+
+\ OpenBoot's 1 MiB is taken from the top as it starts (its dictionary
+\ grows a page at a time from there); a compressed drop-in's buffers
+\ (pkg/decompressor/decompress.fth), claimed and released while its driver
+\ runs and grows the dictionary, are taken from the bottom, so that
+\ releasing them leaves no hole between used pages.
+0 value low-want	\ Pages wanted
+0 value low-page	\ The lowest that fits, or -1
+: obp-pages ( -- first-page end-page )
+   obp-base bytes>pages  dup /obp-memory bytes>pages +
+;
+: lower-fit? ( node -- false )
+   node-range over +				( page# end )
+   obp-pages nip umin				( page# end' )
+   swap obp-pages drop max			( end' start )
+   tuck low-want + u>=  if			( start )
+      low-page umin to low-page
+   else
+      drop
+   then  false
+;
+: (obp-low-claim) ( size -- pa.lo pa.hi true | false )
+   mmu-pagesize round-up  dup bytes>pages to low-want	( size )
+   -1 to low-page
+   physavail ['] lower-fit? find-node 2drop		( size )
+   low-page -1 =  if  drop false exit  then		( size )
+   low-page pages>bytes 0 rot  3dup claim-physical  drop  true
+;
+also decompressor  ' (obp-low-claim) to decomp-phys-claim  previous
 
 headers
 : ecc-off ( -- )  mc0@ h# 1000.0000 invert and mc0!  ;

@@ -48,5 +48,10 @@ decimal
 
 0      33  alias-keyboard: undefined   	kend-alias
 30     33  alias-keyboard: taiwan      	kend-alias
+[ifdef] Ultra5_10
+\ Japan has its own table (usb-japan.fth); Russia's Type 5 layout is the USA's
+23     33  alias-keyboard: russia  	kend-alias
+[else]
 15     33  alias-keyboard: japan   	kend-alias
+[then]
 16     33  alias-keyboard: korea   	kend-alias

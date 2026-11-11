@@ -13,7 +13,10 @@ h# 1fe.0000.f020 constant reset-control-pa
 h# 1ff.f172.4000 constant power-pa		\ EBus BAR1 + 72.4000
 h# 4000.0000 constant soft-por
 
+\ The Ultra 10 says so first ("Resetting ... ", then two line ends),
+\ from the ok prompt and on a reboot from the operating system alike.
 chain: (reset-all
+   ." Resetting ... " cr cr
    soft-por reset-control-pa bypass-asi spacex!
    begin again
 ;

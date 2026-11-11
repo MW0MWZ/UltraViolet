@@ -1,6 +1,6 @@
 \ Copyright (C) 2026 Andy Taylor. Distributed under the same terms as the
 \ OpenBoot release it is part of (see LICENSE).
-id: @(#)methods.fth 1.0 26/11/07
+id: @(#)methods.fth 1.1 26/11/11
 purpose: The Sabre's methods, and the probing of the APB's buses
 copyright: Copyright 2026 Andy Taylor
 
@@ -59,13 +59,18 @@ h#   00.0400 constant bus-b-io		h#   bf.fc00 constant /bus-b-io
 \ mode (the release's own 4.x ones kept quiet): for each device on the bus
 \ (a Simba's: it is the prober-xt the bridges below use, and runs as them),
 \ "Probing <bus> at Device <n>  ", the names of the nodes made for it as
-\ they are set, or "Nothing there" (OpenBoot's diagmsg.fth, by the root's
-\ methods). An Ultra 10 says nothing for the Sabre's own bus, the two Simbas.
-: root-method ( method$ -- xt true | false )
-   " /" find-package  if  find-method  else  2drop false  then
+\ they are set, or "Nothing there" (OpenBoot's diagmsg.fth, by methods of
+\ /packages/SUNW,builtin-drivers). An Ultra 10 says nothing for the Sabre's
+\ own bus, the two Simbas.
+: probe-method ( method$ -- xt true | false )
+   " /packages/SUNW,builtin-drivers" find-package  if
+      find-method
+   else
+      2drop false
+   then
 ;
 : quietly ( ?? xt -- ?? )
-   " probe-quietly" root-method  if  execute  else  execute  then
+   " probe-quietly" probe-method  if  execute  else  execute  then
 ;
 : (pci-prober31) ( probe-list$adr,len -- )
    pci-depth 9 > if
@@ -78,9 +83,9 @@ h#   00.0400 constant bus-b-io		h#   bf.fc00 constant /bus-b-io
       ascii , left-parse-string			( rem$ dev#$ )
       " "  2swap				( rem$ arg$ dev#$ )
       2dup my-self ihandle>phandle		( rem$ arg$ dev#$ dev#$ phandle )
-      " probe-line-open" root-method  if  execute  else  3drop  then
+      " probe-line-open" probe-method  if  execute  else  3drop  then
       ['] pci-probe-self quietly		( rem$ )
-      " probe-line-close" root-method  if  execute  then
+      " probe-line-close" probe-method  if  execute  then
    repeat					( null$ )
    2drop
    r> to pci-depth

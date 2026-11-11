@@ -371,13 +371,15 @@ bool UltraSparc::phys_read(const Access& acc, unsigned size, u64& value) {
         }
     }
     if (!ok) {
-        // The AFSR (UltraSPARC IIi User's Manual, table 16-3): TO (27), the
-        // time-out, PRIV (31) for privileged code, ME (32) when it is a
-        // second time-out not yet cleared.
-        constexpr u64 kAfsrTo = u64{1} << 27, kAfsrPriv = u64{1} << 31, kAfsrMe = u64{1} << 32;
-        if (afsr_ & kAfsrTo) afsr_ |= kAfsrMe;
-        else afar_ = acc.pa;
-        afsr_ |= kAfsrTo | ((pstate_ & pstate::PRIV) ? kAfsrPriv : 0);
+        // The AFSR (UltraSPARC IIi User's Manual, table 16-3): TO (27) for a
+        // time-out, BERR (26) for a bus error the device signalled (a PCI
+        // target abort), PRIV (31) for privileged code, ME (32) when the
+        // same error is already logged; the AFAR the first error's address.
+        constexpr u64 kAfsrBerr = u64{1} << 26, kAfsrTo = u64{1} << 27, kAfsrPriv = u64{1} << 31, kAfsrMe = u64{1} << 32;
+        const u64 bit = bus_.take_bus_error() ? kAfsrBerr : kAfsrTo;
+        if (afsr_ & bit) afsr_ |= kAfsrMe;
+        if (!(afsr_ & (kAfsrTo | kAfsrBerr))) afar_ = acc.pa;
+        afsr_ |= bit | ((pstate_ & pstate::PRIV) ? kAfsrPriv : 0);
         take_trap(tt::kDataAccessError);
         return false;
     }

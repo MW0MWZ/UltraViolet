@@ -275,6 +275,18 @@ static const char *cpu_name(void)
 	return (rd_ver() >> 32 & 0xffff) == 0x12 ? "UltraSPARC-LC" : "UltraSPARC";
 }
 
+#define BOARD_DESCRIPTOR	0x0002333302000000ULL
+#define BOARD_PASSED		0x1bULL
+#define NVRAM_BOARD		0x1d58
+
+static void board_to_nvram(void)
+{
+	int i;
+
+	for (i = 0; i < 8; i++)
+		nvram_st8(NVRAM_BOARD + i, (u8)(post_board >> (56 - 8 * i)));
+}
+
 /* ---------------------------------------------------------------------
  * The run. arg: 1 | diag-level << 8 | mfg-mode << 16, from the reset code.
  */
@@ -391,6 +403,30 @@ u32 post_main(u32 arg)
 	test(post_align, "CPU Addr Align Trap");
 	test(post_priv, "DMMU Access Priv Page");
 	test(post_protect, "DMMU Write Protected Page");
+	group("All Advanced Sabre IOMMU Tests");
+	step(post_init_sabre, "Init Sabre");
+	test(post_dma_rd_miss, "Consist DMA Rd, IOMMU miss Ebus");
+	max_test(post_dma_rd_hit, "Consist DMA Rd, IOMMU hit Ebus");
+	max_test(post_dma_wr_miss, "Consist DMA Wr, IOMMU miss Ebus");
+	max_test(post_dma_wr_hit, "Consist DMA Wr, IOMMU hit Ebus");
+	max_test(post_dma_pass_rd, "Pass-Thru DMA Rd, Ebus device");
+	max_test(post_dma_pass_wr, "Pass-Thru DMA Wr, Ebus device");
+	max_test(post_dma_rd_lock, "Consist DMA Rd, IOMMU LRU Lock Ebus");
+	max_test(post_dma_wr_lock, "Consist DMA Wr, IOMMU LRU Locked Ebus");
+	group("All Basic Cheerio Tests");
+	test(post_rio_ebus_config, "Cheerio Ebus PCI Config Space");
+	test(post_rio_net_config, "Cheerio Ethernet PCI Config Space");
+	step(0, "Cheerio Init");
+	group("All Sabre IOMMU Error Reporting Tests");
+	step(post_init_sabre_err, "Init Sabre");
+	test(post_pio_master_abort, "PIO Read, Master Abort");
+	test(post_pio_target_abort, "PIO Read, Target Abort");
+
+	/* The board descriptor, also kept in the NVRAM at 1d58 (an Ultra
+	   10's passing run gives 0002.3333.0200.001b; what a failure's low
+	   byte would be is not known). */
+	post_board = BOARD_DESCRIPTOR | (post_status ? 0 : BOARD_PASSED);
+	board_to_nvram();
 
 	post_puts("Status of this POST run:\t");
 	post_puts(post_status ? "FAIL\n" : "PASS\n");

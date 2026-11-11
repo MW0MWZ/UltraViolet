@@ -43,7 +43,8 @@
 \ structure's physical address is the patched constant cpu-struct-pa (sun4v
 \ keeps it in a scratchpad register), the globals are chosen through
 \ PSTATE (AG) in place of sun4v's global levels, and the hypervisor's TSB,
-\ watchdog and mondo queue calls are left out.
+\ watchdog and mondo queue calls are left out. A trap that goes back to the
+\ ok prompt first calls abandon-guards (see fieldberr.fth).
 id: @(#)catchexc.fth 1.3 06/04/19
 purpose: 
 copyright: Copyright 2006 Sun Microsystems, Inc.  All Rights Reserved.
@@ -505,8 +506,14 @@ previous previous definitions
 
 headerless
 
+\ A trap that goes back to the ok prompt from inside guarded-execute
+\ (fieldberr.fth) skips the code that puts its trap handlers back; this
+\ puts them back.
+defer abandon-guards  ' noop is abandon-guards
+
 : (do-last-trap)
    last-trap# 0= last-trap# h# 60 = or if exit then
+   abandon-guards
 
   obp-control-relinquished? if
       [ also cmn-messaging ]

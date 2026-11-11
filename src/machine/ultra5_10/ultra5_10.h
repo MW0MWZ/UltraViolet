@@ -282,6 +282,7 @@ private:
     class MismatchedBank final : public Device {
     public:
         const char* name() const override { return "dram-columns"; }
+        bool is_memory() const override { return true; }
         bool read(u64 offset, unsigned size, u64& value) override;
         bool write(u64 offset, unsigned size, u64 value) override;
         u8* host = nullptr;

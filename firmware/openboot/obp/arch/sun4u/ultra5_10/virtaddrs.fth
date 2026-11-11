@@ -43,7 +43,7 @@
 \ f000.0000, as Solaris expects it, and OpenBoot in the top 1 MiB of memory
 \ as an Ultra 10 has it: its image in the top 512 KiB, mapped at f000.0000
 \ (ROMbase, the dictionary's origin) by one locked 512 KiB entry, its RAM
-\ in the 64 KiB below, the page tables' root in the page below that, and
+\ (64 KiB, mapped at fffe.0000) in the 64 KiB below, the page tables' root in the page below that, and
 \ the rest of the 1 MiB the memory it takes from as it starts.
 id: @(#)virtaddrs.fth 1.1 06/02/16
 purpose: 
@@ -69,7 +69,9 @@ ROMbase ROMsize +  constant ROMtop
 
 \ Heap size includes the temporary RS/DS stacks used before we can alloc
 \ the per-cpu stacks.
-h#    8.0000	   constant RAMsize		\ Increase RAMsize to 512K
+\ An Ultra 10's OpenBoot RAM: 64 KiB, at the top of the monitor's range
+\ (fffe.0000); its user area grows within it.
+h#    1.0000	   constant RAMsize
 h#    1.0000	   constant RAMsize-start	\ Initial RAM for heap/user
 h#      8000	   constant HEAPsize		\ Initial Heap size
 

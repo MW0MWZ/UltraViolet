@@ -70,4 +70,9 @@ usbkbds.dat: ${BP}/pkg/keyboard/tables/usb/usb-swiss-german.fth
 usbkbds.dat: ${BP}/pkg/keyboard/tables/usb/usb-turkeyf.fth
 usbkbds.dat: ${BP}/pkg/keyboard/tables/usb/usb-turkeyq.fth
 usbkbds.dat: ${BP}/pkg/keyboard/tables/usb/usb-uk.fth
+usbkbds.dat: ${BP}/pkg/keyboard/tables/usb/usb-czech.fth
+usbkbds.dat: ${BP}/pkg/keyboard/tables/usb/usb-poland.fth
+usbkbds.dat: ${BP}/pkg/keyboard/tables/usb/usb-hungary.fth
+usbkbds.dat: ${BP}/pkg/keyboard/tables/usb/usb-canadian-french.fth
+usbkbds.dat: ${BP}/pkg/keyboard/tables/usb/usb-japan.fth
 usbkbds.dat: ${BP}/pkg/keyboard/tables/usb/aliases.fth

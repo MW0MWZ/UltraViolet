@@ -18,6 +18,7 @@ void EbusDma::reset() {
     control_ = 0;
     addr_ = count_ = staged_count_ = next_addr_ = next_count_ = 0;
     loaded_ = next_loaded_ = tc_ = err_ = false;
+    diag_rd_done_ = diag_wr_done_ = false;
     update_irq();
 }
 
@@ -26,6 +27,8 @@ u32 EbusDma::csr() const {
     if (device_irq_ || (tc_ && !(control_ & kTciDis))) v |= kIntPend;
     if (err_) v |= kErrPend;
     if (tc_) v |= kTc;
+    if (diag_rd_done_) v |= kDiagRdDone;
+    if (diag_wr_done_) v |= kDiagWrDone;
     if (loaded_) v |= kALoaded;
     if (next_loaded_) v |= kNaLoaded;
     if (loaded_ && (control_ & kEnDma)) v |= kDmaOn;
@@ -78,6 +81,7 @@ bool EbusDma::write(u64 offset, unsigned size, u64 value) {
         if (m & v & kErrPend) err_ = false;
         if (control_ & kReset) {
             loaded_ = next_loaded_ = tc_ = err_ = false;
+            diag_rd_done_ = diag_wr_done_ = false;
             count_ = next_count_ = 0;
         }
     }
@@ -94,7 +98,41 @@ bool EbusDma::write(u64 offset, unsigned size, u64 value) {
             loaded_ = true;
         }
     }
+    if ((control_ & (kDiagEn | kEnDma)) == (kDiagEn | kEnDma) && loaded_ && !(control_ & kReset)) diag_transfer();
     update_irq();
+    return true;
+}
+
+// Diagnostic mode (DIAG_EN): with no device, the channel makes one burst
+// itself, a read from memory (or a write, with WRITE set), and shows it
+// done in DIAG_RD_DONE / DIAG_WR_DONE.
+void EbusDma::diag_transfer() {
+    if (control_ & kWrite) {
+        if (!diag_wr_done_) {
+            if (mem_write_ && mem_write_(addr_, fifo_, kBurst)) diag_wr_done_ = true;
+            else err_ = true;
+        }
+    } else if (!diag_rd_done_) {
+        if (mem_read_ && mem_read_(addr_, fifo_, kBurst)) diag_rd_done_ = true;
+        else err_ = true;
+    }
+}
+
+namespace {
+unsigned fifo_byte(u64 offset) {
+    const unsigned o = static_cast<unsigned>(offset) & (EbusDma::FifoWindow::kSize - 1);
+    return ((o >> 2) & (EbusDma::FifoWindow::kEntries - 1)) * 8 + ((o >> 8) & 1) * 4 + (o & 3);
+}
+}  // namespace
+
+bool EbusDma::FifoWindow::read(u64 offset, unsigned size, u64& value) {
+    value = 0;
+    for (unsigned i = 0; i < size; ++i) value = value << 8 | dma_.fifo_[fifo_byte(offset + i)];
+    return true;
+}
+
+bool EbusDma::FifoWindow::write(u64 offset, unsigned size, u64 value) {
+    for (unsigned i = 0; i < size; ++i) dma_.fifo_[fifo_byte(offset + i)] = static_cast<u8>(value >> (8 * (size - 1 - i)));
     return true;
 }
 

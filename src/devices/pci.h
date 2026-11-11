@@ -159,6 +159,12 @@ private:
     DmaWrite dma_write_;
 };
 
+// Set when a bridge ends a cycle it forwarded with a target abort (its
+// master-abort mode set and nothing on its secondary bus claiming the
+// cycle); the host bridge takes and clears it when a cycle fails, to tell
+// a target abort from a master abort.
+inline thread_local bool target_abort_signalled = false;
+
 // A PCI bus segment: up to 32 devices of 8 functions.
 class Bus {
 public:
@@ -236,7 +242,9 @@ private:
     // A cycle forwarded that no function on the secondary bus claims:
     // received master abort in the secondary status; with the bridge
     // control's master-abort mode clear, a read completes with all ones and
-    // a write is discarded (true), else the abort goes on upstream (false).
+    // a write is discarded (true), else the bridge ends the cycle on its
+    // primary bus with a target abort (false), as the PCI-to-PCI bridge
+    // specification has it.
     bool master_abort(unsigned size, u64& value);
     Bus secondary_;
 };

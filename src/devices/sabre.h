@@ -87,11 +87,14 @@ private:
     bool mem_write(u64 offset, unsigned size, u64 value);
     u64 mem_stable(u64 offset, unsigned size);
     void pio_error(u64 bit);
+    void read_failed();
     void pio_write(u64 pa, unsigned size);
     bool claims(u32 dvma) const;
     void dma_error(u32 dvma, bool write, unsigned kind, u64 tte_pa);
     void update_error_interrupts();
-    bool translate(u32 dvma, bool write, u64& pa, unsigned& kind, u64& tte_pa) const;
+    bool translate(u32 dvma, bool write, u64& pa, unsigned& kind, u64& tte_pa, u64* tte_out = nullptr) const;
+    bool iommu_map(u32 dvma, bool write, u64& pa, unsigned& kind, u64& tte_pa);
+    void tlb_used(unsigned n);
 
     u64& imap(unsigned ino);
     void dispatch(unsigned ino);
@@ -112,6 +115,7 @@ private:
     std::array<bool, 2> pulse_{};           // the graphics and expansion pulses, not yet sent
     Timer retry_timer_;
     u64 iommu_ctl_ = 0, iommu_tsb_ = 0;
+    std::array<u8, 16> tlb_lru_{};          // the TLB's entries, least recently used first
     u64 pci_ctl_ = 0, pci_afsr_ = 0, pci_afar_ = 0, pci_diag_ = 0, pci_tasr_ = 0;
     u64 ue_afsr_ = 0, ce_afsr_ = 0, uece_afar_ = 0;
     u64 reset_ctl_ = 0;

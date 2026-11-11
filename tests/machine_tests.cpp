@@ -683,10 +683,19 @@ TEST(a_cycle_nothing_claims_behind_simba_reads_all_ones_and_is_noted_there) {
     CHECK_EQ(m.sabre().reg(0x2010) >> 56, 0u);  // (its byte mask logged, no error)
     cfg_write32(m, cfg(0, 1, 1, 0x1C), 0x20000000u);  // cleared by writing 1
     CHECK(!(sec_status() & 0x2000));
-    // With master-abort mode set the abort goes on to the processor.
+    // With master-abort mode set the bridge ends the read with a target
+    // abort: its primary status shows it signalled, the Sabre's that it
+    // received one, and the processor gets a bus error (BERR, not TO).
     cfg_write32(m, cfg(0, 1, 1, 0x3C), 0x00200000u);
     CHECK(!b.read(nowhere, v));
     CHECK(sec_status() & 0x2000);
+    CHECK(cfg_read32(m, cfg(0, 1, 1, 4)) >> 16 & 0x0800);
+    CHECK(cfg_read32(m, cfg(0, 0, 0, 4)) >> 16 & 0x1000);
+    CHECK(b.take_bus_error());
+    // A write: the Sabre's PIO AFSR logs a target abort (P_TA).
+    b.write(Sabre::kRegsBase + 0x2010, ~u64{0});
+    CHECK(b.write(nowhere, u32{0}));
+    CHECK_EQ(m.sabre().reg(0x2010) >> 56, 0x40u);
 }
 
 TEST(sabre_reserved_registers_read_as_a_real_ultra_10_does) {
@@ -852,6 +861,73 @@ TEST(sabre_dma_answers_only_its_target_space_and_logs_translation_errors) {
     CHECK(!m.sabre().dma_write(0xC0004000u, buf, 4));
     CHECK_EQ(m.sabre().reg(0x30) >> 56, 0x21u);  // P_DWR, P_DTE
     CHECK_EQ(m.sabre().reg(0x200) & (7ull << 24), 1ull << 24);  // error, protection
+}
+
+// The IOMMU's TLB (IIi manual 19.3.2): a miss walks the TSB and loads the
+// least recently used entry, which its diagnostic registers then show; a
+// hit uses the entry, not the TSB, until software flushes it.
+TEST(sabre_iommu_tlb_loads_on_a_miss_and_is_used_until_flushed) {
+    Ultra5_10 m(small_options());
+    auto& b = m.bus();
+    const u64 r = Sabre::kRegsBase, tsb = 0x10000;
+    u8 buf[4]{};
+    store_be<u64>(m.bus().host_write_ptr(0x200000), u64{0x11223344} << 32);
+    store_be<u64>(m.bus().host_write_ptr(0x300000), u64{0x55667788} << 32);
+    store_be<u64>(m.bus().host_write_ptr(tsb), 0x8000000000000012ull | 0x200000);  // valid, cacheable, writable
+    b.write(r + 0x2028, u64{0xFF});
+    b.write(r + 0x208, u64{tsb});
+    b.write(r + 0x200, u64{1});
+    CHECK(m.sabre().dma_read(0xDF800000u, buf, 4));
+    CHECK_EQ(load_be<u32>(buf), 0x11223344u);
+    CHECK_EQ(m.sabre().reg(0xA580), (1u << 21) | 0x6FC00u);           // W, VA<31:13>
+    CHECK_EQ(m.sabre().reg(0xA600), (1u << 30) | (1u << 28) | 0x100u);  // V, C, PA<40:13>
+    // The TSB changed under it: the TLB's translation still holds.
+    store_be<u64>(m.bus().host_write_ptr(tsb), 0x8000000000000012ull | 0x300000);
+    CHECK(m.sabre().dma_read(0xDF800000u, buf, 4));
+    CHECK_EQ(load_be<u32>(buf), 0x11223344u);
+    // Flushed, the next access walks the TSB again.
+    b.write(r + 0x210, u64{0xDF800000u});
+    CHECK(m.sabre().dma_read(0xDF800000u, buf, 4));
+    CHECK_EQ(load_be<u32>(buf), 0x55667788u);
+    CHECK_EQ(m.sabre().reg(0xA608), (1u << 30) | (1u << 28) | 0x180u);  // the next entry
+}
+
+// IOMMU locking (IIi manual 19.3.2.1): with LRU_LCKEN set, a miss loads
+// only the entry LRU_LCKPTR names, whichever entry is least recently used.
+TEST(sabre_iommu_lock_replaces_only_the_locked_entry) {
+    Ultra5_10 m(small_options());
+    auto& b = m.bus();
+    const u64 r = Sabre::kRegsBase, tsb = 0x10000;
+    u8 buf[4]{};
+    for (unsigned i = 0; i < 3; ++i)
+        store_be<u64>(m.bus().host_write_ptr(tsb + 8 * i), 0x8000000000000010ull | (0x200000 + 0x2000 * i));
+    b.write(r + 0x2028, u64{0xFF});
+    b.write(r + 0x208, u64{tsb});
+    b.write(r + 0x200, u64{(1u << 23) | (5u << 19) | 1});  // locked to entry 5
+    for (unsigned i = 0; i < 3; ++i) CHECK(m.sabre().dma_read(0xDF800000u + 0x2000 * i, buf, 4));
+    CHECK_EQ(m.sabre().reg(0xA580 + 8 * 5), 0x6FC02u);  // the last miss
+    CHECK_EQ(m.sabre().reg(0xA600 + 8 * 5), (1u << 30) | (1u << 28) | 0x102u);
+    CHECK_EQ(m.sabre().reg(0xA600) & (1u << 30), 0u);  // entry 0 never loaded
+}
+
+// DMA reaches a bank whose DIMMs' column addressing differs from the
+// memory controller's (decoded through a device, not host memory) as the
+// processor does.
+TEST(sabre_dma_reaches_a_bank_with_mismatched_columns) {
+    auto opt = small_options();
+    opt.ram_mb = 96;  // 32 + 32 MB (11-bit columns) and 16 + 16 MB (10-bit)
+    Ultra5_10 m(opt);
+    auto& b = m.bus();
+    b.write(Sabre::kRegsBase + 0x2028, u64{0xFF});
+    CHECK(b.write(u64{0x800000}, u64{0x0123456789ABCDEFull}));
+    u8 buf[8]{};
+    CHECK(m.sabre().dma_read(0x800000u, buf, 8));
+    CHECK_EQ(load_be<u64>(buf), 0x0123456789ABCDEFull);
+    const u8 back[4] = {1, 2, 3, 4};
+    CHECK(m.sabre().dma_write(0x800004u, back, 4));
+    u64 v = 0;
+    CHECK(b.read(u64{0x800000}, v));
+    CHECK_EQ(v, 0x0123456701020304ull);
 }
 
 TEST(m48t59_clock_reads_and_sets_in_bcd) {
@@ -1311,6 +1387,40 @@ TEST(ebus_dma_routes_device_interrupts_and_counts_to_terminal_count) {
     put(0, get(0));  // writing the CSR back clears TC, as drivers do
     CHECK(!(get(0) & EbusDma::kTc));
     CHECK(!irq);
+}
+
+// Diagnostic mode (DIAG_EN): with EN_DMA and an address loaded the channel
+// reads a burst from memory itself, shows DIAG_RD_DONE, and its FIFO window
+// shows the bytes (entry n's first 4 bytes at 4n, the other 4 at 0x100 + 4n).
+TEST(ebus_dma_diagnostic_read_fills_its_fifo) {
+    EbusDma dma("test-dma");
+    std::vector<u8> mem(512);
+    for (std::size_t i = 0; i < mem.size(); ++i) mem[i] = static_cast<u8>(i);
+    dma.set_dma_port([&](u32 a, u8* d, std::size_t n) { std::copy_n(mem.begin() + a, n, d); return true; },
+                     [&](u32 a, const u8* d, std::size_t n) { std::copy_n(d, n, mem.begin() + a); return true; });
+    auto put = [&](unsigned reg, u32 v) { dma.write(reg, 4, byteswap(v)); };
+    auto get = [&](unsigned reg) {
+        u64 v = 0;
+        dma.read(reg, 4, v);
+        return byteswap(static_cast<u32>(v));
+    };
+    auto fifo = [&](unsigned off) {
+        u64 v = 0;
+        dma.fifo_window().read(off, 4, v);
+        return static_cast<u32>(v);
+    };
+    put(0, EbusDma::kReset);
+    put(0, 0);
+    put(4, 0x80);
+    CHECK(!(get(0) & EbusDma::kDiagRdDone));
+    put(0, EbusDma::kDiagEn | EbusDma::kEnDma);
+    CHECK(get(0) & EbusDma::kDiagRdDone);
+    CHECK_EQ(fifo(0x000), 0x80818283u);
+    CHECK_EQ(fifo(0x100), 0x84858687u);
+    CHECK_EQ(fifo(0x03C), 0xF8F9FAFBu);
+    CHECK_EQ(fifo(0x13C), 0xFCFDFEFFu);
+    put(0, EbusDma::kReset);
+    CHECK(!(get(0) & EbusDma::kDiagRdDone));
 }
 
 TEST(ebus_dma_chains_the_next_transfer_at_terminal_count) {

@@ -39,6 +39,10 @@
 \ any nuclear facility. 
 \ 
 \ ========== Copyright Header End ============================================
+\ Adapted by Andy Taylor, 2026: on the Ultra 5/10 (Ultra5_10) the buffers'
+\ physical memory may be chosen by the platform (decomp-phys-claim, set in
+\ arch/sun4u/ultra5_10/memprobe.fth), so that freeing them leaves no hole
+\ in OpenBoot's memory.
 id: @(#)decompress.fth 1.11 02/02/28
 purpose: 
 copyright: Copyright 1997-2001 Sun Microsystems, Inc.  All Rights Reserved
@@ -59,7 +63,16 @@ headerless
 
 : decomp-cleanup ( err$ -- )  ." Decomp: " type cr   r> drop  ;
 
+[ifdef] Ultra5_10
+: no-phys-claim ( len -- false )  drop false  ;
+defer decomp-phys-claim ( len -- pa.lo pa.hi true | false )
+' no-phys-claim is decomp-phys-claim
+[then]
+
 : decomp-alloc ( len -- va )
+[ifdef] Ultra5_10
+   dup decomp-phys-claim  if  0 mem-mode (map) exit  then	( len )
+[then]
    0 tuck [ also client-services ] claim [ previous ]
 ;
 
