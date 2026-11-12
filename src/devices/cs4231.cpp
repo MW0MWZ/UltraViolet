@@ -37,6 +37,35 @@ s16 a_law(u8 v) {
     return static_cast<s16>((v & 0x80) ? magnitude : -magnitude);
 }
 
+// G.711 mu-law and A-law encoding (the inverses of the above).
+u8 mu_law_encode(int pcm) {
+    const int sign = pcm < 0 ? 0x80 : 0;
+    int magnitude = std::min(pcm < 0 ? -pcm : pcm, 32635) + 0x84;
+    int exponent = 7;
+    for (int mask = 0x4000; !(magnitude & mask) && exponent > 0; --exponent, mask >>= 1) {
+    }
+    const int mantissa = (magnitude >> (exponent + 3)) & 0x0F;
+    return static_cast<u8>(~(sign | (exponent << 4) | mantissa));
+}
+
+u8 a_law_encode(int pcm) {
+    static constexpr int kSegmentEnd[8] = {0x1F, 0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF};
+    int v = pcm >> 3;
+    u8 mask = 0xD5;
+    if (v < 0) {
+        mask = 0x55;
+        v = -v - 1;
+    }
+    int segment = 0;
+    while (segment < 8 && v > kSegmentEnd[segment]) ++segment;
+    if (segment >= 8) return static_cast<u8>(0x7F ^ mask);
+    const int a = (segment << 4) | ((segment < 2 ? v >> 1 : v >> segment) & 0x0F);
+    return static_cast<u8>(a ^ mask);
+}
+
+// A gain in 1.5 dB steps as a factor.
+double db_steps(int steps) { return std::pow(10.0, 1.5 * steps / 20.0); }
+
 // The silence a capture of each format records.
 u8 silence(u8 format) {
     switch (format >> 5) {
@@ -86,7 +115,10 @@ void Cs4231::reset() {
     last_frame_ = {};
     adpcm_[0] = adpcm_[1] = {};
     adpcm_pending_ = -1;
+    adpcm_capture_[0] = adpcm_capture_[1] = {};
+    adpcm_capture_pending_ = -1;
     pio_.clear();
+    capture_pio_.clear();
     frame_timer_.cancel();
     timer_.cancel();
     calibrate_.cancel();
@@ -131,12 +163,16 @@ bool Cs4231::read(u64 offset, unsigned size, u64& value) {
                 b = (status_ & kStInt) | kStSamplePosition;
                 if (errors_) b |= kStSer;
                 if ((regs_[kInterface] & (kPen | kPpio)) == (kPen | kPpio) && pio_.size() < 4) b |= kStPrdy;
-                if ((regs_[kInterface] & (kCen | kCpio)) == (kCen | kCpio)) b |= kStCrdy;
+                if ((regs_[kInterface] & (kCen | kCpio)) == (kCen | kCpio) && !capture_pio_.empty()) b |= kStCrdy;
                 break;
             }
             case kPio:
-                // Captured data in PIO mode: silence.
-                b = silence(capture_format());
+                // Captured data in PIO mode (silence if none is waiting).
+                if (capture_pio_.empty()) b = silence(capture_format());
+                else {
+                    b = capture_pio_.front();
+                    capture_pio_.pop_front();
+                }
                 break;
         }
         value = value << 8 | b;
@@ -212,7 +248,12 @@ void Cs4231::write_indexed(unsigned i, u8 v) {
                 adpcm_[0] = adpcm_[1] = {};
                 adpcm_pending_ = -1;
             }
-            if ((regs_[i] & kCen) && !(was & kCen)) capture_count_ = capture_base();
+            if ((regs_[i] & kCen) && !(was & kCen)) {
+                capture_count_ = capture_base();
+                adpcm_capture_[0] = adpcm_capture_[1] = {};
+                adpcm_capture_pending_ = -1;
+                capture_pio_.clear();
+            }
             update_engine();
             return;
         }
@@ -233,8 +274,24 @@ void Cs4231::write_indexed(unsigned i, u8 v) {
             regs_[i] = v;
             update_irq();
             return;
+        case kLeftAux1: case kRightAux1: case kLeftAux2: case kRightAux2: case kLeftLine: case kRightLine:
+            regs_[i] = v;
+            update_engine();  // a live input unmuted or muted
+            return;
         default: regs_[i] = v; return;
     }
+}
+
+void Cs4231::set_input_live(Input in, bool live) {
+    live_[static_cast<unsigned>(in)] = live;
+    update_engine();
+}
+
+bool Cs4231::analog_heard() const {
+    auto passes = [this](Input in, unsigned left) {
+        return live_[static_cast<unsigned>(in)] && (!(regs_[left] & kInputMute) || !(regs_[left + 1] & kInputMute));
+    };
+    return passes(Input::Line, kLeftLine) || passes(Input::Aux1, kLeftAux1) || passes(Input::Aux2, kLeftAux2);
 }
 
 void Cs4231::timer_restart() {
@@ -244,7 +301,7 @@ void Cs4231::timer_restart() {
 }
 
 void Cs4231::update_engine() {
-    const bool on = playing() || capturing();
+    const bool on = playing() || capturing() || analog_heard();
     if (on == engine_on_) return;
     engine_on_ = on;
     if (on) {
@@ -259,15 +316,13 @@ void Cs4231::update_engine() {
 void Cs4231::tick() {
     if (!engine_on_) return;
     const u64 now = sched_.now();
-    const double rate = sample_rate(regs_[kPlayFormat]);
+    const bool digital = playing() || capturing();
+    const double rate = digital ? sample_rate(regs_[kPlayFormat]) : kAnalogRate;
     const double due = static_cast<double>(now - last_) / cpu_hz_ * rate + frame_debt_;
     last_ = now;
     const unsigned frames = static_cast<unsigned>(due);
     frame_debt_ = due - frames;
-    if (frames) {
-        if (playing()) play(frames);
-        if (capturing()) capture(frames);
-    }
+    if (frames) mix(frames, rate);
     // The next block: a millisecond's frames, or fewer to reach a counter's
     // end on time when its interrupt is enabled and not already raised.
     unsigned next = std::max(1u, static_cast<unsigned>(rate * kBlockSeconds));
@@ -275,6 +330,92 @@ void Cs4231::tick() {
     if (playing() && watched && !(regs_[kAltStatus] & kPi)) next = std::min(next, play_count_ + 1u);
     if (capturing() && watched && !(regs_[kAltStatus] & kCi)) next = std::min(next, capture_count_ + 1u);
     frame_timer_.schedule_in(static_cast<u64>((next - frame_debt_) / rate * cpu_hz_) + 1);
+}
+
+// One block of frames through the codec: the inputs and the DAC into the
+// output mixer, an input (or the mix) into the ADC.
+void Cs4231::mix(unsigned frames, double rate) {
+    const std::size_t n = std::size_t{frames} * 2;
+    // Each input's frames, fetched when first wanted.
+    std::array<bool, 4> fetched{};
+    auto input = [&](Input which) -> const std::vector<s16>& {
+        const unsigned i = static_cast<unsigned>(which);
+        if (!fetched[i]) {
+            fetched[i] = true;
+            in_[i].assign(n, 0);
+            if (live_[i] && inputs_[i]) inputs_[i](in_[i].data(), frames, rate);
+        }
+        return in_[i];
+    };
+
+    // The ADC: its source and gain per channel (the mixer's output, source
+    // 3, is filled in below).
+    const bool capture_on = capturing();
+    adc_.assign(n, 0.0);
+    bool adc_from_mix = false;
+    for (unsigned c = 0; c < 2; ++c) {
+        const u8 control = regs_[c ? kRightInput : kLeftInput];
+        const unsigned source = control >> 6;
+        if (source == 3) {
+            adc_from_mix = true;
+            continue;
+        }
+        if (!capture_on && !(regs_[kLoopback] & kLoopbackEnable)) continue;
+        double gain = db_steps(control & 0x0F);
+        if (source == static_cast<unsigned>(Input::Mic) && (control & kMicGain)) gain *= 10.0;  // +20 dB
+        const std::vector<s16>& x = input(static_cast<Input>(source));
+        for (unsigned f = 0; f < frames; ++f) adc_[f * 2 + c] = x[f * 2 + c] * gain;
+    }
+
+    // The DAC, with the ADC's loopback mixed in before its attenuation.
+    out_.assign(n, 0);
+    const bool dac_on = playing();
+    if (dac_on) play(frames);
+    std::vector<double> mixed(n, 0.0);
+    const u8 loop = regs_[kLoopback];
+    const double loop_gain = (loop & kLoopbackEnable) ? db_steps(-(loop >> 2)) : 0.0;
+    for (unsigned c = 0; c < 2; ++c) {
+        const u8 att = regs_[c ? kRightOut : kLeftOut];
+        if (att & 0x80) continue;  // muted
+        const double gain = db_steps(-(att & 0x3F));
+        const bool loop_this = loop_gain > 0 && (regs_[c ? kRightInput : kLeftInput] >> 6) != 3;
+        for (unsigned f = 0; f < frames; ++f) {
+            double v = dac_on ? out_[f * 2 + c] : 0.0;
+            if (loop_this) v += adc_[f * 2 + c] * loop_gain;
+            mixed[f * 2 + c] = v * gain;
+        }
+    }
+    // The analog inputs the mixer passes: LINE, AUX1, AUX2.
+    static constexpr struct {
+        Input in;
+        unsigned left;
+    } kMixed[] = {{Input::Line, kLeftLine}, {Input::Aux1, kLeftAux1}, {Input::Aux2, kLeftAux2}};
+    for (const auto& m : kMixed) {
+        if (!live_[static_cast<unsigned>(m.in)]) continue;
+        for (unsigned c = 0; c < 2; ++c) {
+            const u8 control = regs_[m.left + c];
+            if (control & kInputMute) continue;
+            const double gain = db_steps(8 - (control & 0x1F));  // 01000: 0 dB
+            const std::vector<s16>& x = input(m.in);
+            for (unsigned f = 0; f < frames; ++f) mixed[f * 2 + c] += x[f * 2 + c] * gain;
+        }
+    }
+    if (adc_from_mix)
+        for (unsigned c = 0; c < 2; ++c) {
+            const u8 control = regs_[c ? kRightInput : kLeftInput];
+            if ((control >> 6) != 3) continue;
+            const double gain = db_steps(control & 0x0F);
+            for (unsigned f = 0; f < frames; ++f) adc_[f * 2 + c] = mixed[f * 2 + c] * gain;
+        }
+    if (capture_on) capture(frames);
+
+    if (!sink_ || (!dac_on && !analog_heard())) return;
+    // Nothing is heard with the speaker, line and headphone outputs all off.
+    const bool heard = !(regs_[kMonoControl] & kMonoMute) || !(regs_[kPinControl] & kXctl0) ||
+                       !(regs_[kPinControl] & kXctl1);
+    for (std::size_t i = 0; i < n; ++i)
+        out_[i] = heard ? static_cast<s16>(std::lround(std::clamp(mixed[i], -32768.0, 32767.0))) : s16{0};
+    sink_(out_.data(), frames, static_cast<unsigned>(std::lround(rate)));
 }
 
 // Counts `frames` sample periods off a counter: each time it passes zero,
@@ -384,30 +525,77 @@ void Cs4231::play(unsigned frames) {
         }
     }
     count(play_count_, play_base(), frames, kPi);
-
-    if (!sink_) return;
-    // The DAC attenuation (1.5 dB steps) and mutes; nothing is heard with
-    // the speaker, line and headphone outputs all off.
-    const bool heard = !(regs_[kMonoControl] & kMonoMute) || !(regs_[kPinControl] & kXctl0) ||
-                       !(regs_[kPinControl] & kXctl1);
-    for (unsigned c = 0; c < 2; ++c) {
-        const u8 out = regs_[c ? kRightOut : kLeftOut];
-        const double gain = (!heard || (out & 0x80)) ? 0.0 : std::pow(10.0, -1.5 * (out & 0x3F) / 20.0);
-        for (unsigned f = 0; f < frames; ++f)
-            out_[f * 2 + c] = static_cast<s16>(std::lround(out_[f * 2 + c] * gain));
-    }
-    sink_(out_.data(), frames, static_cast<unsigned>(std::lround(sample_rate(format))));
 }
 
+unsigned Cs4231::adpcm_encode(int channel, int sample) {
+    Adpcm& a = adpcm_capture_[channel];
+    int step = kAdpcmStep[a.index];
+    int diff = sample - a.predictor;
+    unsigned nibble = 0;
+    if (diff < 0) {
+        nibble = 8;
+        diff = -diff;
+    }
+    int delta = step >> 3;
+    for (unsigned bit = 4; bit; bit >>= 1, step >>= 1) {
+        if (diff >= step) {
+            nibble |= bit;
+            diff -= step;
+            delta += step;
+        }
+    }
+    a.predictor = std::clamp(a.predictor + ((nibble & 8) ? -delta : delta), -32768, 32767);
+    a.index = std::clamp(a.index + kAdpcmIndex[nibble], 0, 88);
+    return nibble;
+}
+
+// The ADC's frames (adc_) in the capture format, to the capture channel or
+// the PIO data register; what neither takes is an overrun. Mono records
+// the left channel.
 void Cs4231::capture(unsigned frames) {
     const u8 format = capture_format();
-    const unsigned channels = (format & kStereo) ? 2 : 1;
-    const std::size_t want = (format >> 5) == kAdpcm ? (std::size_t{frames} * channels + 1) / 2
-                                                      : std::size_t{frames} * channels * sample_bytes(format);
-    if (!(regs_[kInterface] & kCpio)) {
-        bytes_.assign(want, silence(format));
-        const std::size_t taken = (capture_dma_ && !transfers_stopped()) ? capture_dma_->to_memory(bytes_.data(), want) : 0;
-        if (taken < want) errors_ |= kCor;  // overrun: the samples are lost
+    const unsigned code = format >> 5, channels = (format & kStereo) ? 2 : 1;
+    bytes_.clear();
+    for (unsigned f = 0; f < frames; ++f)
+        for (unsigned c = 0; c < channels; ++c) {
+            const int v = static_cast<int>(std::lround(std::clamp(adc_[f * 2 + c], -32768.0, 32767.0)));
+            switch (code) {
+                case kLinear8: bytes_.push_back(static_cast<u8>((v >> 8) + 0x80)); break;
+                case kMuLaw: bytes_.push_back(mu_law_encode(v)); break;
+                case kALaw: bytes_.push_back(a_law_encode(v)); break;
+                case kLinear16Le:
+                    bytes_.push_back(static_cast<u8>(v));
+                    bytes_.push_back(static_cast<u8>(v >> 8));
+                    break;
+                case kLinear16Be:
+                    bytes_.push_back(static_cast<u8>(v >> 8));
+                    bytes_.push_back(static_cast<u8>(v));
+                    break;
+                case kAdpcm: {
+                    const unsigned nibble = adpcm_encode(static_cast<int>(c), v);  // the low half first
+                    if (adpcm_capture_pending_ < 0) adpcm_capture_pending_ = static_cast<int>(nibble);
+                    else {
+                        bytes_.push_back(static_cast<u8>(adpcm_capture_pending_ | (nibble << 4)));
+                        adpcm_capture_pending_ = -1;
+                    }
+                    break;
+                }
+                default: bytes_.push_back(silence(format)); break;  // reserved formats
+            }
+        }
+    if (regs_[kInterface] & kCpio) {
+        // The codec's FIFO holds 16 samples' worth; more is an overrun.
+        for (u8 b : bytes_) {
+            if (capture_pio_.size() >= 64) {
+                errors_ |= kCor;
+                break;
+            }
+            capture_pio_.push_back(b);
+        }
+    } else {
+        const std::size_t taken =
+            (capture_dma_ && !transfers_stopped()) ? capture_dma_->to_memory(bytes_.data(), bytes_.size()) : 0;
+        if (taken < bytes_.size()) errors_ |= kCor;  // overrun: the samples are lost
     }
     count(capture_count_, capture_base(), frames, kCi);
 }

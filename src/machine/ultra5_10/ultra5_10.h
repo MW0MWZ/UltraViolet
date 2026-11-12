@@ -42,6 +42,7 @@
 #include "devices/simba.h"
 #include "mem/bus.h"
 #include "net/net_backend.h"
+#include "storage/cd_image.h"
 #include "storage/disk_image.h"
 
 namespace uv {
@@ -113,6 +114,12 @@ public:
         // The host clock guest time keeps to (default: the system's), as
         // the pacer takes it.
         Pacer::HostClock host_clock;
+        // While this is non-zero (another thread wants the machine), run()
+        // returns after the block of instructions it is in, however few of
+        // those asked for it has run: a guest slower than the wall clock
+        // (code fetched from the PROM) gives the machine up as soon as one
+        // faster does. None: run() runs them all.
+        const std::atomic<unsigned>* yield_when = nullptr;
     };
 
     // On-board interrupt numbers (INO) of the EBus devices. The audio's
@@ -130,8 +137,8 @@ public:
     // A reset of the whole system: at power-on, or (`power_on` false) the
     // processor's SOFT_POR, which leaves the memory controller as it is.
     void reset(bool power_on = true);
-    // Runs up to `instructions` instructions (stops early if the CPU halts
-    // or the system switches itself off).
+    // Runs up to `instructions` instructions (stops early if the CPU halts,
+    // the system switches itself off, or Options::yield_when asks it to).
     void run(u64 instructions);
     // The system has switched itself off (the power control register): it
     // runs no further until reset.
@@ -198,6 +205,12 @@ public:
     Cs4231& audio() { return audio_; }
     // Where the audio's playback goes (16-bit stereo frames at a rate).
     void set_audio_sink(Cs4231::AudioSink sink) { audio_.set_audio_sink(std::move(sink)); }
+    // What the line-in or microphone jack hears (none: nothing plugged in).
+    void set_audio_input(Cs4231::Input jack, Cs4231::InputSource source) {
+        const bool live = static_cast<bool>(source);
+        audio_.set_input(jack, std::move(source));
+        audio_.set_input_live(jack, live);
+    }
     // A press of the front-panel power button: its interrupt, which asks
     // the system to shut down (Solaris, Linux and OpenBSD switch off).
     void press_power_button();
@@ -260,7 +273,8 @@ private:
     std::mutex input_mutex_;
     std::vector<InputEvent> input_;
     std::atomic<bool> input_waiting_{false};
-    DiskImage disk_image_, cd_image_;
+    DiskImage disk_image_;
+    CdImage cd_image_;
     std::unique_ptr<AtaDisk> disk_;
     AtapiCdrom cdrom_;
     std::vector<std::unique_ptr<RegisterBlock>> blocks_;

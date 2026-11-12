@@ -108,7 +108,7 @@ TEST(session_thread_runs_the_machine_and_a_hold_stops_it) {
 TEST(session_hold_is_had_while_the_machine_waits_for_the_wall_clock) {
     app::Settings s = loop_settings();
     s.timing = Pacer::Mode::Cycle;  // a cycle an instruction, waiting when ahead
-    s.cpu_mhz = 270;                // the slowest module, slower than the host: mostly waiting
+    s.cpu_mhz = 270;                // the slowest module
     s.ecache_kb = 256;
     app::Session session(s);
     std::string error;
@@ -119,9 +119,11 @@ TEST(session_hold_is_had_while_the_machine_waits_for_the_wall_clock) {
     if (!session.on()) return;
     session.start_thread();
     wait_ms(30);
-    // Each hold is had at once, not after the machine's waits. The machine is
-    // mostly waiting, so holds that waited for it would make most of them
-    // slow: the median is checked, as the host can stall any one thread.
+    // Each hold is had at once: not after the machine's waits when it is
+    // ahead of the wall clock, nor after the rest of its slice when it is
+    // behind (its loop is fetched from the PROM, which some hosts run at
+    // less than 270 MHz: a millisecond's slice then takes 20 ms or more).
+    // The median is checked, as the host can stall any one thread.
     std::vector<std::chrono::steady_clock::duration> took;
     for (int i = 0; i < 20; ++i) {
         const auto start = std::chrono::steady_clock::now();

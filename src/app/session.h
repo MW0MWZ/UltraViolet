@@ -89,6 +89,9 @@ public:
     // Where the machine's audio goes (from its thread; set before or after
     // power-on).
     void set_audio_output(Cs4231::AudioSink out);
+    // What the machine's line-in ("line") or microphone ("microphone") jack
+    // hears, from its thread ("none": neither has anything plugged in).
+    void set_audio_input(const std::string& jack, Cs4231::InputSource in);
 
     // The CD-ROM drive and the set of discs: the one in the drive (-1:
     // empty), changing it, ejecting, inserting another (added to the set).
@@ -111,6 +114,7 @@ public:
 
 private:
     void wire_serial();
+    void wire_audio_input();
     void machine_thread();
     void host_sleep(u64 ns);
 
@@ -127,6 +131,8 @@ private:
     std::condition_variable wake_;
     std::function<void(unsigned, u8)> serial_out_;
     Cs4231::AudioSink audio_out_;
+    std::string audio_jack_ = "none";
+    Cs4231::InputSource audio_in_;
     bool turbo_ = false;
     int disc_ = -1;
 };

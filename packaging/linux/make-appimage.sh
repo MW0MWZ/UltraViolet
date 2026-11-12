@@ -32,6 +32,11 @@ l=$doc/licenses
 mkdir -p $l
 cp /src/LICENSE /src/README.md $doc/
 cp /src/third_party/imgui/LICENSE.txt $l/imgui.txt
+# The firmware built into the program: OpenBoot (Sun's licence and FirmWorks'), and the
+# Rage Pro and Creator3D FCode.
+cp /src/firmware/openboot/LICENSE $l/openboot.txt
+cp /src/firmware/rage/LICENSE $l/rage-fcode.txt
+cp /src/firmware/creator3d/LICENSE $l/creator3d-fcode.txt
 cp /usr/local/share/licenses/SDL3/LICENSE.txt $l/SDL3.txt
 cd /tmp
 linuxdeploy --appdir $d -d /tmp/ultraviolet.desktop -i /tmp/icon/ultraviolet.png

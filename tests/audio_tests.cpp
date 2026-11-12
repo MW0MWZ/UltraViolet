@@ -270,3 +270,157 @@ TEST(cs4231_counters_timer_and_calibration_interrupt) {
     r.run_for(5.0 / 8000);
     CHECK_EQ(r.get(Cs4231::kErrorStatus) & Cs4231::kAci, 0u);
 }
+
+namespace {
+
+// An input that hears a constant level on each side, and how often it was asked.
+struct Level {
+    s16 left, right;
+    unsigned asked = 0;
+    Cs4231::InputSource source() {
+        return [this](s16* f, std::size_t n, double) {
+            ++asked;
+            for (std::size_t i = 0; i < n; ++i) f[i * 2] = left, f[i * 2 + 1] = right;
+        };
+    }
+};
+
+}  // namespace
+
+TEST(cs4231_mixes_a_live_input_with_nothing_digital_running) {
+    Rig r;
+    r.setup(Cs4231::kLinear8 << 5);
+    Level cd{8000, -8000};
+    r.codec.set_input(Cs4231::Input::Aux1, cd.source());
+    r.codec.set_input_live(Cs4231::Input::Aux1, true);
+    r.run_for(2e-3);
+    CHECK(r.heard.empty());  // AUX1 muted (as reset leaves it): nothing runs
+    r.set(Cs4231::kLeftAux1, 0x08);   // 0 dB
+    r.set(Cs4231::kRightAux1, 0x0C);  // 6 dB down
+    r.run_for(2.1e-3);
+    CHECK(r.heard.size() >= 2 * 88);
+    CHECK_EQ(r.rate, 44100u);
+    CHECK(r.heard[0] == 8000);
+    CHECK(r.heard[1] < -3950 && r.heard[1] > -4050);
+    // Gone quiet: the mixer stops.
+    r.codec.set_input_live(Cs4231::Input::Aux1, false);
+    const std::size_t had = r.heard.size();
+    r.run_for(2e-3);
+    CHECK_EQ(r.heard.size(), had);
+    // With the DAC playing at 8 kHz, the input is mixed at that rate on top of it.
+    r.codec.set_input_live(Cs4231::Input::Aux1, true);
+    std::fill(r.mem.begin(), r.mem.begin() + 64, 0x90);  // 8-bit: +0x1000
+    r.dma(r.play, 8, 64);
+    r.dma(r.play, 4, 0);
+    r.dma(r.play, 0, EbusDma::kEnDma | EbusDma::kEnCnt);
+    r.set(Cs4231::kInterface, Cs4231::kPen);
+    r.heard.clear();
+    r.run_for(2.1e-3);
+    CHECK_EQ(r.rate, 8000u);
+    CHECK(!r.heard.empty() && r.heard[0] == 8000 + 0x1000);
+}
+
+TEST(cs4231_captures_the_selected_input_in_the_capture_format) {
+    Rig r;
+    r.setup(static_cast<u8>(Cs4231::kLinear16Be << 5 | Cs4231::kStereo));
+    Level cd{8000, -8000}, mic{1000, -1000}, line{-300, 300};
+    r.codec.set_input(Cs4231::Input::Aux1, cd.source());
+    r.codec.set_input(Cs4231::Input::Mic, mic.source());
+    r.codec.set_input(Cs4231::Input::Line, line.source());
+    for (auto in : {Cs4231::Input::Aux1, Cs4231::Input::Mic, Cs4231::Input::Line}) r.codec.set_input_live(in, true);
+    auto capture = [&](u8 left_control, u8 right_control) {
+        r.set(Cs4231::kLeftInput, left_control);
+        r.set(Cs4231::kRightInput, right_control);
+        std::fill(r.mem.begin(), r.mem.begin() + 16, 0x55);
+        r.dma(r.rec, 8, 16);
+        r.dma(r.rec, 4, 0);
+        r.dma(r.rec, 0, EbusDma::kWrite | EbusDma::kEnDma | EbusDma::kEnCnt);
+        r.set(Cs4231::kInterface, Cs4231::kCen);
+        r.run_for(1.1e-3);
+        r.set(Cs4231::kInterface, 0);
+    };
+    // AUX1 (the CD) on the left, the line on the right, both at 0 dB.
+    capture(0x40, 0x00);
+    CHECK_EQ(load_be<u16>(&r.mem[0]), 8000u);
+    CHECK_EQ(static_cast<s16>(load_be<u16>(&r.mem[2])), 300);
+    CHECK_EQ(load_be<u16>(&r.mem[12]), 8000u);
+    // The microphone with its +20 dB, and with 6 dB of gain.
+    capture(0xA0, 0x84);
+    CHECK_EQ(load_be<u16>(&r.mem[0]), 10000u);
+    CHECK(static_cast<s16>(load_be<u16>(&r.mem[2])) < -1980 && static_cast<s16>(load_be<u16>(&r.mem[2])) > -2010);
+    // The mixer's output: what is heard (AUX1 unmuted, the DAC silent).
+    r.set(Cs4231::kLeftAux1, 0x08);
+    r.set(Cs4231::kRightAux1, 0x08);
+    capture(0xC0, 0xC0);
+    CHECK_EQ(load_be<u16>(&r.mem[0]), 8000u);
+    CHECK_EQ(static_cast<s16>(load_be<u16>(&r.mem[2])), -8000);
+}
+
+TEST(cs4231_capture_encodes_every_format) {
+    struct Case {
+        u8 format;
+        s16 level;
+        std::vector<u8> bytes;  // the first ones captured (mono: the left channel)
+    };
+    const Case cases[] = {
+        {Cs4231::kLinear8 << 5, 0x1234, {0x92, 0x92}},
+        {Cs4231::kMuLaw << 5, 8000, {0xA0, 0xA0}},
+        {Cs4231::kMuLaw << 5, -8000, {0x20}},
+        {Cs4231::kALaw << 5, 8000, {0x8A}},  // decodes to 8064
+        {Cs4231::kALaw << 5, -8000, {0x0A}},
+        {Cs4231::kLinear16Le << 5, 0x1234, {0x34, 0x12, 0x34, 0x12}},
+    };
+    for (const Case& c : cases) {
+        Rig r;
+        r.setup(c.format);
+        Level cd{c.level, 0};
+        r.codec.set_input(Cs4231::Input::Aux1, cd.source());
+        r.codec.set_input_live(Cs4231::Input::Aux1, true);
+        r.set(Cs4231::kLeftInput, 0x40);
+        r.dma(r.rec, 8, 16);
+        r.dma(r.rec, 4, 0);
+        r.dma(r.rec, 0, EbusDma::kWrite | EbusDma::kEnDma | EbusDma::kEnCnt);
+        r.set(Cs4231::kInterface, Cs4231::kCen);
+        r.run_for(1.1e-3);
+        for (std::size_t i = 0; i < c.bytes.size(); ++i) CHECK_EQ(r.mem[i], c.bytes[i]);
+    }
+    // IMA ADPCM: what is captured plays back as the level it heard.
+    Rig r;
+    r.setup(Cs4231::kAdpcm << 5);
+    Level cd{12000, 0};
+    r.codec.set_input(Cs4231::Input::Aux1, cd.source());
+    r.codec.set_input_live(Cs4231::Input::Aux1, true);
+    r.set(Cs4231::kLeftInput, 0x40);
+    r.dma(r.rec, 8, 64);
+    r.dma(r.rec, 4, 0);
+    r.dma(r.rec, 0, EbusDma::kWrite | EbusDma::kEnDma | EbusDma::kEnCnt);
+    r.set(Cs4231::kInterface, Cs4231::kCen);
+    r.run_for(20e-3);
+    r.set(Cs4231::kInterface, 0);
+    r.codec.set_input_live(Cs4231::Input::Aux1, false);
+    r.dma(r.play, 8, 64);
+    r.dma(r.play, 4, 0);
+    r.dma(r.play, 0, EbusDma::kEnDma | EbusDma::kEnCnt);
+    r.set(Cs4231::kInterface, Cs4231::kPen);
+    r.run_for(20e-3);
+    CHECK(r.heard.size() >= 2 * 128);
+    CHECK(r.heard[2 * 127] > 11000 && r.heard[2 * 127] < 13000);
+}
+
+TEST(cs4231_pio_capture_reads_samples_from_the_data_register) {
+    Rig r;
+    r.setup(Cs4231::kLinear8 << 5);
+    Level line{0x2000, 0};
+    r.codec.set_input(Cs4231::Input::Line, line.source());
+    r.codec.set_input_live(Cs4231::Input::Line, true);
+    r.set(Cs4231::kInterface, Cs4231::kCpio, true);
+    r.out(Cs4231::kIndex, 0);
+    r.set(Cs4231::kInterface, Cs4231::kCen);
+    CHECK_EQ(r.in(Cs4231::kStatus) & Cs4231::kStCrdy, 0u);  // nothing yet
+    r.run_for(1.1e-3);
+    CHECK(r.in(Cs4231::kStatus) & Cs4231::kStCrdy);
+    CHECK_EQ(r.in(Cs4231::kPio), 0xA0u);
+    // Left unread, the FIFO overruns.
+    r.run_for(20e-3);
+    CHECK(r.get(Cs4231::kErrorStatus) & Cs4231::kCor);
+}

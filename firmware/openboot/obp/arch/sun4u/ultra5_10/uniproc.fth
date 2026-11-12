@@ -65,15 +65,23 @@ h# 061 end-trap
 
 headers
 defer clear-keyboard  ' noop is clear-keyboard
-\ The banner's "Keyboard Present" when the console's input is the keyboard
-\ (it answered when the console was set up), else "No Keyboard".
+\ Whether the console's input is the keyboard (it answered when the
+\ console was set up).
 : keyboard-input? ( -- flag )
    stdin @ ?dup 0= if  false exit  then  ihandle>phandle	( phandle )
    " keyboard" locate-device if  drop false  else  =  then
 ;
+\ The banner's "Keyboard Present" when a keyboard answers, whatever the
+\ console is: with input-device set to ttya the Ultra 10's banner still
+\ reports a keyboard plugged in. When the keyboard is not the console's
+\ input it is opened (reset) to ask it, and closed again.
+: keyboard-present? ( -- flag )
+   keyboard-input? if  true exit  then
+   " keyboard" open-dev ?dup if  close-dev true  else  false  then
+;
 defer .keyboard-type
 : (.keyboard-type) ( -- )
-   keyboard-input? if  ." Keyboard Present"  else  ." No Keyboard"  then
+   keyboard-present? if  ." Keyboard Present"  else  ." No Keyboard"  then
 ;
 ' (.keyboard-type) is .keyboard-type
 

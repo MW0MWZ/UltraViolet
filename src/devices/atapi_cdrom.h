@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andy Taylor
-// An ATAPI CD-ROM drive (SFF-8020i / MMC-1 era) reading a 2048-byte-sector
-// image (an .iso): the PACKET protocol with PIO byte counts or DMA, and
-// the commands such a drive answers: TEST UNIT READY, REQUEST SENSE,
-// INQUIRY, MODE SENSE/SELECT (6 and 10), START STOP UNIT (eject and load),
-// PREVENT ALLOW MEDIUM REMOVAL, READ CAPACITY, READ (10 and 12), SEEK,
-// READ TOC (formats 0-2), READ SUB-CHANNEL, READ HEADER, READ CD (MSF),
-// MECHANISM STATUS and SET CD SPEED. The disc is a single mode 1 data
-// track; READ CD builds raw sectors (sync, header, EDC/ECC) from it.
+// An ATAPI CD-ROM drive (SFF-8020i / MMC-1 era) reading a CD image
+// (storage/cd_image.h: an .iso, a raw image or a cue sheet with audio and
+// data tracks in one or more sessions): the PACKET protocol with PIO byte
+// counts or DMA, and the commands such a drive answers: TEST UNIT READY,
+// REQUEST SENSE, INQUIRY, MODE SENSE/SELECT (6 and 10; the CD audio control
+// page's port volumes and channels can be changed), START STOP UNIT (eject
+// and load), PREVENT ALLOW MEDIUM REMOVAL, READ CAPACITY, READ (10 and 12),
+// SEEK, READ TOC (formats 0-2), READ SUB-CHANNEL, READ HEADER, READ CD (and
+// MSF; audio, mode 1 and mode 2 forms 1 and 2), PLAY AUDIO (10, 12, MSF and
+// track/index), PAUSE/RESUME, STOP PLAY/SCAN, MECHANISM STATUS and SET CD
+// SPEED.
+//
+// Audio is played as a real drive plays it, to its analog output: the
+// cable to the system board (on an Ultra 5/10, the CS4231's AUX1 input).
+// analog() gives that output as the codec samples it.
 #pragma once
 
 #include <array>
@@ -19,9 +26,14 @@
 
 namespace uv {
 
+class CdImage;
+
 class AtapiCdrom final : public AtaDevice {
 public:
     static constexpr unsigned kBlock = 2048;
+    static constexpr unsigned kAudioRate = 44100;  // CD audio: 588 stereo frames a sector, 75 sectors a second
+    // READ SUB-CHANNEL's audio status
+    static constexpr u8 kPlaying = 0x11, kPaused = 0x12, kPlayDone = 0x13, kPlayError = 0x14, kNoAudioStatus = 0x15;
 
     AtapiCdrom(Scheduler& scheduler, double cpu_hz, std::string vendor = "UVIOLET", std::string product = "ATAPI CD-ROM",
                std::string revision = "1.0");
@@ -31,13 +43,22 @@ public:
 
     // Puts a disc in the drive and closes the tray (nullptr: empty). The
     // guest sees a medium change.
-    void insert(DiskImage* image);
+    void insert(CdImage* image);
     bool has_media() const { return media_; }
     bool locked() const { return prevent_; }
     // The guest ejected the disc (START STOP UNIT).
     std::function<void()> on_eject;
 
+    // The disc's addressable blocks (to the last session's lead-out).
     u32 blocks() const;
+
+    // The analog output: `frames` stereo frames at `rate` up to the present
+    // guest time, through the audio control page's volumes (silence when
+    // not playing).
+    void analog(s16* frames, std::size_t count, double rate);
+    // Audio play started or stopped (the analog output has sound, or not).
+    std::function<void(bool)> on_audio;
+    u8 audio_status() const { return audio_status_; }
 
 protected:
     void execute(u8 command) override;
@@ -50,7 +71,9 @@ protected:
     u8 reset_status() const override { return 0; }
 
 private:
-    enum class Source { Reply, Media, Raw, Discard, Packet, Identify };
+    enum class Source { Reply, Media, Raw, Parameters, Packet, Identify };
+    // What a sector is, as READ CD's expected sector type names it.
+    enum class Kind { Audio, Mode1, Formless, Form1, Form2 };
 
     void packet();
     void good();
@@ -58,19 +81,29 @@ private:
     bool need_media();
     void reply(std::vector<u8> data, std::size_t allocation);
     void data_phase(bool to_host, u64 bytes);
+    bool readable(u32 lba, u64 count, bool data_only);
     void read_blocks(u64 lba, u64 count);
     void read_cd(u64 lba, u64 count, u8 type, u8 flags, u8 subchannel);
+    bool sector_kind(u32 lba, u8 type, Kind& kind);
+    unsigned field_bytes(Kind kind, u8 flags) const;
+    bool next_sector();
     void mode_sense(bool ten);
+    void mode_select();
     void read_toc();
     void read_subchannel();
-    bool build_raw_sector(u32 lba);
     void build_identify();
     void set_features();
     void signature();
     std::vector<u8> mode_page(u8 page, unsigned control) const;
 
+    // Audio play
+    void play(u32 from, u32 to);
+    void stop_play(u8 status);
+    u64 play_position() const;  // in samples (588 a sector) from LBA 0
+    u32 audio_lba() const;      // the sector playing, or the last read
+
     std::string vendor_, product_, revision_;
-    DiskImage* image_ = nullptr;
+    CdImage* image_ = nullptr;
     bool media_ = false, tray_open_ = false, prevent_ = false;
     u8 sense_key_ = 0, asc_ = 0, ascq_ = 0;
     u8 unit_attention_ = 0x29;  // ASC of a pending unit attention (0: none); power-on reset
@@ -86,12 +119,24 @@ private:
     u64 pos_ = 0;
     u32 cur_lba_ = 0;  // last block read (for READ SUB-CHANNEL)
 
-    // READ CD: the fields wanted from each raw sector
-    u32 raw_lba_ = 0;
-    u8 raw_flags_ = 0;
+    // READ and READ CD: sectors in turn, the fields wanted from each
+    u32 sector_lba_ = 0;
+    u8 raw_type_ = 0, raw_flags_ = 0;
     std::array<u8, 2352> raw_{};
-    std::size_t raw_off_ = 0, raw_len_ = 0;
-    std::vector<u8> raw_out_;
+    std::vector<u8> sector_out_;
+    std::size_t sector_off_ = 0;
+
+    // Audio play: the samples from `play_from_` (at guest time `play_t0_`)
+    // up to the sector `play_end_`; when paused, the position reached.
+    Timer play_timer_;
+    u8 audio_status_ = kNoAudioStatus;
+    u64 play_from_ = 0, play_t0_ = 0;
+    u32 play_end_ = 0;
+    // The CD audio control page: each output port's channels and volume.
+    std::array<u8, 2> port_channels_{0x01, 0x02}, port_volume_{0xFF, 0xFF};
+    // Two sectors of audio, kept for analog()
+    std::array<std::array<u8, 2352>, 2> audio_cache_{};
+    std::array<u32, 2> audio_cached_{~0u, ~0u};
 
     std::array<u8, 512> identify_{};
 };

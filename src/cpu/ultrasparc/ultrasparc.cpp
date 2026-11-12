@@ -945,7 +945,16 @@ u32 UltraSparc::jit_run_checked(Block& b) {
     const u8 j_ccr = ccr_;
     const u64 j_pc = pc_, j_npc = npc_;
     globals_ = globals, windows_ = windows, ccr_ = ccr, pc_ = pc, npc_ = npc;
-    for (u32 i = 0; i < k; ++i) execute(b.insns[i]);
+    for (u32 i = 0; i < k; ++i) {
+        // (Only instructions run where the block has them can be run again:
+        // not past an annulled delay slot, nor into a block the translation
+        // went on to. There the translation's state is kept, unchecked.)
+        if (pc_ != pc + 4 * i) {
+            globals_ = j_globals, windows_ = j_windows, ccr_ = j_ccr, pc_ = j_pc, npc_ = j_npc;
+            return k;
+        }
+        execute(b.insns[i]);
+    }
     if (j_pc == pc_ && j_npc == npc_ && j_ccr == ccr_ && j_globals == globals_ && j_windows == windows_) return k;
     std::string diff;
     char buf[160];

@@ -20,6 +20,11 @@ strip -o $s/ultraviolet.exe $b/ultraviolet.exe
 cp README.md $s/
 cp LICENSE $s/LICENSE.txt
 cp third_party/imgui/LICENSE.txt $s/licenses/imgui.txt
+# The firmware built into the program: OpenBoot (Sun's licence and FirmWorks'), and the
+# Rage Pro and Creator3D FCode.
+cp firmware/openboot/LICENSE $s/licenses/openboot.txt
+cp firmware/rage/LICENSE $s/licenses/rage-fcode.txt
+cp firmware/creator3d/LICENSE $s/licenses/creator3d-fcode.txt
 # The DLLs (all of them, through their own imports) and the packages they come from.
 for dll in $(ldd $b/ultraviolet.exe | awk '$3 ~ /^\/ucrt64\// {print $3}' | sort -u); do
   cp $dll $s/

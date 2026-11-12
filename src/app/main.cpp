@@ -90,7 +90,9 @@ void usage() {
         "                   window; the default) or ttya (no keyboard: OpenBoot and Solaris\n"
         "                   take the first serial port; the default with --headless)\n"
         "  --keyboard ID    the keyboard's layout: us (default), uk or a number\n"
-        "  --mac ADDR       Ethernet address for a new NVRAM (default: a random Sun address)\n",
+        "  --mac ADDR       Ethernet address for a new NVRAM (default: a random Sun address)\n"
+        "  --audio-in JACK  this computer's recording device in the line-in (line) or\n"
+        "                   microphone (microphone) jack; none (the default) for neither\n",
         UV_VERSION);
     // Only the network connections this build and host can make.
     const bool user = net::slirp_available(), tap = net::tap_available();
@@ -341,7 +343,7 @@ int main(int argc, char** argv) {
                        {"--ecache-kb", "ecache_kb"}, {"--console", "console"}, {"--keyboard", "keyboard"},
                        {"--timing", "timing"},       {"--log", "log"},         {"--upa", "upa"},
                        {"--resolution", "resolution"},
-                       {"--creator3d-fcode", "creator3d_fcode"}};
+                       {"--creator3d-fcode", "creator3d_fcode"}, {"--audio-in", "audio_input"}};
         static const struct {
             const char* flag;
             const char* key;

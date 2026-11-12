@@ -11,6 +11,7 @@
 #include "devices/ata.h"
 #include "devices/atapi_cdrom.h"
 #include "machine/ultra5_10/ultra5_10.h"
+#include "storage/cd_image.h"
 #include "storage/disk_image.h"
 #include "test.h"
 
@@ -91,6 +92,16 @@ struct Rig {
         for (i = 0; i < 6; ++i) data(static_cast<u16>(b[2 * i] | (b[2 * i + 1] << 8)));
         wait();
     }
+    // Writes a data-out phase's bytes, a PIO block at a time.
+    void write_all(const std::vector<u8>& bytes) {
+        std::size_t at = 0;
+        while ((reg(7) & ata::kDrq) && at < bytes.size()) {
+            const unsigned n = reg(4) | (reg(5) << 8);
+            for (unsigned i = 0; i < n; i += 2, at += 2)
+                data(static_cast<u16>((at < bytes.size() ? bytes[at] : 0) | ((at + 1 < bytes.size() ? bytes[at + 1] : 0) << 8)));
+            wait();
+        }
+    }
     // Reads every PIO block the device offers.
     std::vector<u8> read_all() {
         std::vector<u8> out;
@@ -106,6 +117,65 @@ struct Rig {
         return out;
     }
 };
+
+// A disc of four tracks in two sessions, as a cue sheet over three files:
+//   a.bin (BINARY): track 1, 100 raw mode 1 sectors (each sector's LBA in
+//     its first four data bytes); track 2, audio, an in-file pregap of 150
+//     then 50 sectors (every frame 1000 left, -2000 right);
+//   b.bin (MOTOROLA, named B.BIN in the sheet): track 3, audio after a
+//     PREGAP of 75 not in the file: 50 sectors of 3000, -3000 big-endian;
+//   c.bin, session 2: track 4, 20 mode 2 form 1 sectors (0xC000 + n).
+// Track 4 is at 425 + 6750 + 4500 + 150 = 11825.
+std::string make_cue_disc() {
+    const auto dir = std::filesystem::temp_directory_path() / "uv-cue";
+    std::filesystem::create_directories(dir);
+    std::vector<u8> s(CdImage::kRawSector);
+    {
+        std::ofstream f(dir / "a.bin", std::ios::binary | std::ios::trunc);
+        for (u32 n = 0; n < 100; ++n) {
+            std::fill(s.begin(), s.end(), 0);
+            cd_sync_header(s.data(), n, 1);
+            store_be<u32>(s.data() + 16, n);
+            cd_mode1_ecc(s.data());
+            f.write(reinterpret_cast<const char*>(s.data()), static_cast<std::streamsize>(s.size()));
+        }
+        for (unsigned i = 0; i < 588; ++i) store_le<u16>(&s[i * 4], 1000), store_le<u16>(&s[i * 4 + 2], static_cast<u16>(-2000));
+        for (u32 n = 0; n < 200; ++n) f.write(reinterpret_cast<const char*>(s.data()), static_cast<std::streamsize>(s.size()));
+    }
+    {
+        std::ofstream f(dir / "b.bin", std::ios::binary | std::ios::trunc);
+        for (unsigned i = 0; i < 588; ++i) store_be<u16>(&s[i * 4], 3000), store_be<u16>(&s[i * 4 + 2], static_cast<u16>(-3000));
+        for (u32 n = 0; n < 50; ++n) f.write(reinterpret_cast<const char*>(s.data()), static_cast<std::streamsize>(s.size()));
+    }
+    {
+        std::ofstream f(dir / "c.bin", std::ios::binary | std::ios::trunc);
+        for (u32 n = 0; n < 20; ++n) {
+            std::fill(s.begin(), s.end(), 0);
+            cd_sync_header(s.data(), 11825 + n, 2);
+            s[18] = s[22] = 0x08;  // submode: data, form 1
+            store_be<u32>(s.data() + 24, 0xC000 + n);
+            f.write(reinterpret_cast<const char*>(s.data()), static_cast<std::streamsize>(s.size()));
+        }
+    }
+    const auto cue = dir / "disc.cue";
+    std::ofstream(cue) << "REM SESSION 01\r\n"
+                          "FILE \"a.bin\" BINARY\r\n"
+                          "  TRACK 01 MODE1/2352\r\n"
+                          "    INDEX 01 00:00:00\r\n"
+                          "  TRACK 02 AUDIO\r\n"
+                          "    FLAGS DCP\r\n"
+                          "    INDEX 00 00:01:25\r\n"
+                          "    INDEX 01 00:03:25\r\n"
+                          "FILE \"B.BIN\" MOTOROLA\r\n"
+                          "  TRACK 03 AUDIO\r\n"
+                          "    PREGAP 00:01:00\r\n"
+                          "    INDEX 01 00:00:00\r\n"
+                          "REM SESSION 02\r\n"
+                          "FILE c.bin BINARY\r\n"
+                          "  TRACK 04 MODE2/2352\r\n"
+                          "    INDEX 01 00:00:00\r\n";
+    return cue.string();
+}
 
 u16 word(const std::vector<u8>& b, unsigned w) { return static_cast<u16>(b[2 * w] | (b[2 * w + 1] << 8)); }
 
@@ -201,8 +271,8 @@ TEST(ata_disk_writes_by_pio_and_reads_back_by_dma) {
 }
 
 TEST(atapi_cdrom_reports_unit_attention_then_reads) {
-    DiskImage img;
-    CHECK(img.open(make_image("uv-cd.iso", 100, 2048), true));
+    CdImage img;
+    CHECK(img.open(make_image("uv-cd.iso", 100, 2048)));
     Rig r;
     AtapiCdrom cd(r.sched, 1e6);
     r.ch.attach(0, &cd);
@@ -255,8 +325,8 @@ TEST(atapi_cdrom_reports_unit_attention_then_reads) {
 }
 
 TEST(atapi_cdrom_removal_lock_lasts_until_a_hardware_reset) {
-    DiskImage img;
-    CHECK(img.open(make_image("uv-cd.iso", 100, 2048), true));
+    CdImage img;
+    CHECK(img.open(make_image("uv-cd.iso", 100, 2048)));
     Rig r;
     AtapiCdrom cd(r.sched, 1e6);
     r.ch.attach(0, &cd);
@@ -290,8 +360,8 @@ TEST(atapi_cdrom_removal_lock_lasts_until_a_hardware_reset) {
 }
 
 TEST(atapi_cdrom_read_cd_builds_raw_sectors_and_dma_reads) {
-    DiskImage img;
-    CHECK(img.open(make_image("uv-cd2.iso", 20, 2048), true));
+    CdImage img;
+    CHECK(img.open(make_image("uv-cd2.iso", 20, 2048)));
     Rig r;
     AtapiCdrom cd(r.sched, 1e6);
     r.ch.attach(0, &cd);
@@ -420,4 +490,201 @@ TEST(ata_fast_disk_shortens_the_delays_not_the_sequence) {
     const u64 slow = read_time(false), fast = read_time(true);
     CHECK(slow > 3900);  // 65536 bytes at 16.6 MB/s, and 20 us
     CHECK(fast < 100);
+}
+
+TEST(cd_image_lays_out_a_cue_sheets_tracks_and_sessions) {
+    CdImage img;
+    CHECK(img.open(make_cue_disc()));
+    const auto& t = img.tracks();
+    CHECK_EQ(t.size(), 4u);
+    CHECK(t[0].begin == 0 && t[0].start == 0 && t[0].end == 100 && t[0].control == 0x4);
+    CHECK(t[1].begin == 100 && t[1].start == 250 && t[1].end == 300 && t[1].control == 0x2);
+    CHECK(t[2].begin == 300 && t[2].start == 375 && t[2].end == 425 && t[2].swap);
+    CHECK(t[3].session == 2 && t[3].begin == 11675 && t[3].start == 11825 && t[3].end == 11845);
+    CHECK_EQ(img.sessions().size(), 2u);
+    CHECK_EQ(img.sessions()[0].leadout, 425u);
+    CHECK_EQ(img.leadout(), 11845u);
+    CHECK(img.xa());
+    CHECK(img.track_at(500) == nullptr);
+    std::vector<u8> s(CdImage::kRawSector);
+    CHECK(img.read_raw(260, s.data()));
+    CHECK_EQ(load_le<u16>(&s[0]), 1000u);
+    CHECK_EQ(load_le<u16>(&s[2]), static_cast<u16>(-2000));
+    CHECK(img.read_raw(380, s.data()));  // MOTOROLA: swapped to little-endian
+    CHECK_EQ(load_le<u16>(&s[0]), 3000u);
+    CHECK(img.read_raw(320, s.data()));  // the PREGAP, not in the file: silence
+    CHECK_EQ(load_le<u32>(&s[0]), 0u);
+    CHECK(img.read_raw(5, s.data()));
+    CHECK_EQ(s[15], 1u);
+    CHECK_EQ(load_be<u32>(&s[16]), 5u);
+    u8 d[2 * CdImage::kDataSector];
+    CHECK(img.read_data(98, d, 2));  // across into track 2: audio
+    CHECK(!img.read_data(99, d, 2));
+    CHECK(img.read_data(11826, d));
+    CHECK_EQ(load_be<u32>(d), 0xC001u);
+    CHECK(!img.read_data(250, d));
+    // A sheet naming a file that is not there.
+    const auto bad = std::filesystem::temp_directory_path() / "uv-cue" / "bad.cue";
+    std::ofstream(bad) << "FILE \"missing.bin\" BINARY\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n";
+    CHECK(!img.open(bad.string()));
+    CHECK(img.error().find("missing.bin") != std::string::npos);
+}
+
+TEST(atapi_cdrom_reads_a_disc_of_audio_and_data_tracks_in_two_sessions) {
+    CdImage img;
+    CHECK(img.open(make_cue_disc()));
+    Rig r;
+    AtapiCdrom cd(r.sched, 1e6);
+    r.ch.attach(0, &cd);
+    cd.insert(&img);
+    r.packet({0x03, 0, 0, 0, 18, 0});  // clears the unit attention
+    r.read_all();
+    auto sense = [&] {
+        r.packet({0x03, 0, 0, 0, 18, 0});
+        return r.read_all()[12];
+    };
+    // READ TOC: four tracks and the last session's lead-out.
+    r.packet({0x43, 0, 0, 0, 0, 0, 0, 0, 100, 0});
+    std::vector<u8> toc = r.read_all();
+    CHECK_EQ(toc.size(), 44u);
+    CHECK(toc[2] == 1 && toc[3] == 4);
+    CHECK(toc[5] == 0x14 && toc[6] == 1);
+    CHECK(toc[13] == 0x12 && toc[14] == 2 && load_be<u32>(&toc[16]) == 250);  // audio, copy permitted
+    CHECK(toc[30] == 4 && load_be<u32>(&toc[32]) == 11825);
+    CHECK(toc[38] == 0xAA && load_be<u32>(&toc[40]) == 11845);
+    // Format 1: the last session's first track.
+    r.packet({0x43, 0, 1, 0, 0, 0, 0, 0, 12, 0});
+    toc = r.read_all();
+    CHECK(toc[3] == 2 && toc[6] == 4 && load_be<u32>(&toc[8]) == 11825);
+    // Format 2, the raw TOC: points A0, A1, A2 and the tracks of each session.
+    r.packet({0x43, 0, 2, 0, 0, 0, 0, 0, 200, 0});
+    toc = r.read_all();
+    CHECK_EQ(toc.size(), 4u + 11 * (3 + 3) + 11 * (3 + 1));
+    CHECK(toc[4] == 1 && toc[7] == 0xA0 && toc[12] == 1 && toc[13] == 0x20);  // first track 1, CD-ROM XA
+    CHECK(toc[4 + 11 * 6] == 2 && toc[7 + 11 * 6] == 0xA0 && toc[12 + 11 * 6] == 4);
+    // READ (10): an audio sector, or one between the sessions, cannot be read.
+    r.packet({0x28, 0, 0, 0, 0, 250, 0, 0, 1, 0});
+    CHECK_EQ(r.reg(7) & 0x01, 0x01u);
+    CHECK_EQ(sense(), 0x64u);
+    r.packet({0x28, 0, 0, 0, 0x01, 0xF4, 0, 0, 1, 0});
+    CHECK_EQ(sense(), 0x21u);
+    r.packet({0x28, 0, 0, 0, 0x2E, 0x31, 0, 0, 2, 0}, 2048);  // 11825: mode 2 form 1's user data
+    std::vector<u8> d = r.read_all();
+    CHECK_EQ(d.size(), 4096u);
+    CHECK_EQ(load_be<u32>(d.data()), 0xC000u);
+    CHECK_EQ(load_be<u32>(d.data() + 2048), 0xC001u);
+    // READ CD: audio as CD-DA; asked for as mode 1, refused.
+    r.packet({0xBE, 0x04, 0, 0, 0x01, 0x04, 0, 0, 2, 0x10, 0});
+    d = r.read_all();
+    CHECK_EQ(d.size(), 2u * 2352);
+    CHECK_EQ(load_le<u16>(d.data() + 2352), 1000u);
+    r.packet({0xBE, 0x08, 0, 0, 0x01, 0x04, 0, 0, 1, 0x10, 0});
+    CHECK_EQ(sense(), 0x64u);
+    // Mode 2 form 1: user data alone, or the whole sector.
+    r.packet({0xBE, 0x10, 0, 0, 0x2E, 0x31, 0, 0, 1, 0x10, 0});
+    d = r.read_all();
+    CHECK_EQ(d.size(), 2048u);
+    CHECK_EQ(load_be<u32>(d.data()), 0xC000u);
+    r.packet({0xBE, 0x00, 0, 0, 0x2E, 0x31, 0, 0, 1, 0xF8, 0});
+    d = r.read_all();
+    CHECK_EQ(d.size(), 2352u);
+    CHECK(d[15] == 2 && d[18] == 0x08 && load_be<u32>(d.data() + 24) == 0xC000u);
+    // READ HEADER: the mode of each kind of sector.
+    r.packet({0x44, 0, 0, 0, 0x01, 0x04, 0, 0, 8, 0});
+    CHECK_EQ(r.read_all()[0], 0u);
+    r.packet({0x44, 0, 0, 0, 0x2E, 0x31, 0, 0, 8, 0});
+    CHECK_EQ(r.read_all()[0], 2u);
+}
+
+TEST(atapi_cdrom_plays_audio_to_its_analog_output) {
+    CdImage img;
+    CHECK(img.open(make_cue_disc()));
+    Rig r;
+    AtapiCdrom cd(r.sched, 1e6);
+    r.ch.attach(0, &cd);
+    cd.insert(&img);
+    int audio_changes = 0;
+    cd.on_audio = [&](bool) { ++audio_changes; };
+    r.packet({0x03, 0, 0, 0, 18, 0});
+    r.read_all();
+    auto sense = [&] {
+        r.packet({0x03, 0, 0, 0, 18, 0});
+        return r.read_all()[12];
+    };
+    struct Position {
+        u8 status, control, track, index;
+        u32 absolute, relative;
+    };
+    auto where = [&] {
+        r.packet({0x42, 0, 0x40, 1, 0, 0, 0, 0, 16, 0});
+        const std::vector<u8> q = r.read_all();
+        return Position{q[1], q[5], q[6], q[7], load_be<u32>(&q[8]), load_be<u32>(&q[12])};
+    };
+    CHECK_EQ(where().status, AtapiCdrom::kNoAudioStatus);
+    // A data track cannot be played; pausing with nothing playing is out of sequence.
+    r.packet({0x45, 0, 0, 0, 0, 5, 0, 0, 10, 0});
+    CHECK_EQ(sense(), 0x64u);
+    r.packet({0x4B, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+    CHECK_EQ(sense(), 0x2Cu);
+    // PLAY AUDIO MSF from track 2 (00:05:25) to the end of the first session (00:07:50).
+    r.packet({0x47, 0, 0, 0, 5, 25, 0, 7, 50, 0});
+    CHECK_EQ(r.reg(7) & 0x01, 0x00u);
+    CHECK_EQ(audio_changes, 1);
+    Position p = where();
+    CHECK(p.status == AtapiCdrom::kPlaying && p.control == 0x12 && p.track == 2 && p.index == 1);
+    CHECK(p.absolute == 250 && p.relative == 0);
+    r.run(500000);  // half a second: 37.5 sectors
+    p = where();
+    CHECK(p.track == 2 && p.absolute >= 286 && p.absolute <= 288 && p.relative == p.absolute - 250);
+    s16 out[8];
+    cd.analog(out, 4, 44100);
+    CHECK(out[0] == 1000 && out[1] == -2000 && out[6] == 1000 && out[7] == -2000);
+    // Its output ports' channels and volumes, through MODE SELECT: port 0 the right channel at half.
+    r.packet({0x55, 0x10, 0, 0, 0, 0, 0, 0, 24, 0});
+    r.write_all({0, 0, 0, 0, 0, 0, 0, 0, 0x0E, 0x0E, 0x04, 0, 0, 0, 0, 0, 0x02, 128, 0x02, 0xFF, 0, 0, 0, 0});
+    CHECK_EQ(r.reg(7) & 0x01, 0x00u);
+    r.packet({0x5A, 0, 0x0E, 0, 0, 0, 0, 0, 24, 0});
+    std::vector<u8> page = r.read_all();
+    CHECK(page[16] == 0x02 && page[17] == 128);
+    cd.analog(out, 1, 44100);
+    CHECK(out[0] == -1004 && out[1] == -2000);
+    // Paused, it stays where it was and is silent.
+    r.packet({0x4B, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+    const u32 at = where().absolute;
+    r.run(1000000);
+    p = where();
+    CHECK(p.status == AtapiCdrom::kPaused && p.absolute == at);
+    cd.analog(out, 1, 44100);
+    CHECK(out[0] == 0 && out[1] == 0);
+    // Resumed, it goes on into track 3's pregap (index 0, counting down to
+    // index 1; not in its file: silence), then track 3 (held big-endian).
+    r.packet({0x4B, 0, 0, 0, 0, 0, 0, 0, 1, 0});
+    r.run(500000);
+    p = where();
+    CHECK(p.status == AtapiCdrom::kPlaying && p.track == 3 && p.index == 0);
+    CHECK(static_cast<s32>(p.relative) == static_cast<s32>(p.absolute) - 375 && static_cast<s32>(p.relative) < 0);
+    cd.analog(out, 1, 44100);
+    CHECK(out[0] == 0 && out[1] == 0);
+    r.run(750000);
+    p = where();
+    CHECK(p.status == AtapiCdrom::kPlaying && p.track == 3 && p.index == 1);
+    cd.analog(out, 1, 44100);
+    CHECK_EQ(out[1], -3000);
+    // It stops at the end, which is reported once.
+    r.run(2000000);
+    p = where();
+    CHECK(p.status == AtapiCdrom::kPlayDone && p.absolute == 424);
+    CHECK_EQ(where().status, AtapiCdrom::kNoAudioStatus);
+    CHECK_EQ(audio_changes, 4);  // play, pause, resume, end
+    // PLAY AUDIO TRACK/INDEX of track 3, then STOP PLAY/SCAN.
+    r.packet({0x48, 0, 0, 0, 3, 1, 0, 3, 1, 0});
+    p = where();
+    CHECK(p.status == AtapiCdrom::kPlaying && p.absolute == 375);
+    r.packet({0x4E, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+    CHECK_EQ(where().status, AtapiCdrom::kNoAudioStatus);
+    // A read stops a play.
+    r.packet({0x45, 0, 0, 0, 0, 250, 0, 0, 10, 0});
+    r.packet({0x28, 0, 0, 0, 0, 3, 0, 0, 1, 0});
+    r.read_all();
+    CHECK_EQ(where().status, AtapiCdrom::kNoAudioStatus);
 }

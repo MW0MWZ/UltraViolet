@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Andy Taylor
 cmake_minimum_required(VERSION 3.21)
-project(UltraViolet VERSION 1.1.0 DESCRIPTION "Sun UltraSPARC (Ultra 5/10) emulator" LANGUAGES CXX)
+project(UltraViolet VERSION 1.2.0 DESCRIPTION "Sun UltraSPARC (Ultra 5/10) emulator" LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -71,6 +71,7 @@ add_library(uv_emu STATIC
   src/devices/ata.cpp
   src/devices/atapi_cdrom.cpp
   src/devices/cmd646.cpp
+  src/storage/cd_image.cpp
   src/storage/disk_image.cpp
   src/machine/ultra5_10/ultra5_10.cpp
   src/net/guest_names.cpp

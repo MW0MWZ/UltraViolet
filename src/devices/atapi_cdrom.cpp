@@ -3,11 +3,12 @@
 #include "devices/atapi_cdrom.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 #include "core/log.h"
 #include "core/text.h"
-#include "storage/disk_image.h"
+#include "storage/cd_image.h"
 
 namespace uv {
 
@@ -40,7 +41,6 @@ Msf to_msf(u32 lba) {
     return {static_cast<u8>(x / (75 * 60)), static_cast<u8>((x / 75) % 60), static_cast<u8>(x % 75)};
 }
 u32 from_msf(const u8* p) { return (u32{p[0]} * 60 + p[1]) * 75 + p[2]; }
-u8 bcd(u8 v) { return static_cast<u8>(((v / 10) << 4) | (v % 10)); }
 
 // A TOC address field: MSF (0, M, S, F) or LBA.
 void put_addr(u8* p, u32 lba, bool msf) {
@@ -52,66 +52,35 @@ void put_addr(u8* p, u32 lba, bool msf) {
     }
 }
 
-// ECMA-130 error detection and correction for mode 1 sectors: a 32-bit EDC
-// over sync, header and data, then the P and Q Reed-Solomon parity over
-// GF(2^8) (x^8 + x^4 + x^3 + x^2 + 1).
-struct EccTables {
-    u8 f[256], b[256];
-    u32 edc[256];
-    EccTables() {
-        for (unsigned i = 0; i < 256; ++i) {
-            const unsigned j = (i << 1) ^ ((i & 0x80) ? 0x11D : 0);
-            f[i] = static_cast<u8>(j);
-            b[i ^ j] = static_cast<u8>(i);
-            u32 e = i;
-            for (int k = 0; k < 8; ++k) e = (e >> 1) ^ ((e & 1) ? 0xD8018001u : 0);
-            edc[i] = e;
-        }
+// A track-relative address as MSF (no 150-sector offset), or a signed LBA.
+void put_relative(u8* p, s64 rel, bool msf) {
+    if (msf) {
+        const u32 x = static_cast<u32>(rel < 0 ? -rel : rel);
+        p[0] = 0, p[1] = static_cast<u8>(x / (75 * 60)), p[2] = static_cast<u8>((x / 75) % 60), p[3] = static_cast<u8>(x % 75);
+    } else {
+        put_be32(p, static_cast<u32>(static_cast<s32>(rel)));
     }
-};
-const EccTables& ecc_tables() {
-    static const EccTables t;
-    return t;
 }
 
-void ecc_block(const u8* src, unsigned major_count, unsigned minor_count, unsigned major_mult, unsigned minor_inc,
-               u8* dest) {
-    const EccTables& t = ecc_tables();
-    const unsigned size = major_count * minor_count;
-    for (unsigned major = 0; major < major_count; ++major) {
-        unsigned index = (major >> 1) * major_mult + (major & 1);
-        u8 a = 0, b = 0;
-        for (unsigned minor = 0; minor < minor_count; ++minor) {
-            const u8 v = src[index];
-            index += minor_inc;
-            if (index >= size) index -= size;
-            a ^= v;
-            b ^= v;
-            a = t.f[a];
-        }
-        a = t.b[t.f[a] ^ b];
-        dest[major] = a;
-        dest[major + major_count] = static_cast<u8>(a ^ b);
-    }
-}
+constexpr u32 kSamplesPerSector = 588;
 
 }  // namespace
 
+
 AtapiCdrom::AtapiCdrom(Scheduler& scheduler, double cpu_hz, std::string vendor, std::string product, std::string revision)
     : AtaDevice(scheduler, cpu_hz), vendor_(std::move(vendor)), product_(std::move(product)),
-      revision_(std::move(revision)) {
+      revision_(std::move(revision)), play_timer_(scheduler, [this] { stop_play(kPlayDone); }) {
     hard_reset();
 }
 
-u32 AtapiCdrom::blocks() const {
-    if (!image_) return 0;
-    return static_cast<u32>(std::min<u64>((image_->size() + kBlock - 1) / kBlock, 0xFFFFFFFFu));
-}
+u32 AtapiCdrom::blocks() const { return image_ ? image_->leadout() : 0; }
 
-void AtapiCdrom::insert(DiskImage* image) {
+void AtapiCdrom::insert(CdImage* image) {
+    stop_play(kNoAudioStatus);
     image_ = image && image->is_open() ? image : nullptr;
     media_ = image_ != nullptr;
     tray_open_ = false;
+    audio_cached_ = {~0u, ~0u};
     if (media_) unit_attention_ = 0x28;  // not ready to ready: medium may have changed
 }
 
@@ -124,6 +93,7 @@ void AtapiCdrom::reset_state() {
     AtaDevice::reset_state();
     signature();
     packet_cmd_ = false;
+    stop_play(kNoAudioStatus);
 }
 
 // A power-on or hardware reset ends any prevention of medium removal
@@ -132,6 +102,8 @@ void AtapiCdrom::reset_state() {
 void AtapiCdrom::hardware_reset() {
     prevent_ = false;
     unit_attention_ = 0x29;
+    port_channels_ = {0x01, 0x02};
+    port_volume_ = {0xFF, 0xFF};
 }
 
 void AtapiCdrom::before_drq(bool to_host, std::size_t length) {
@@ -270,7 +242,8 @@ void AtapiCdrom::transfer_done(bool dma, bool to_host) {
         return;
     }
     if (packet_cmd_) {
-        if (src_ == Source::Media) cur_lba_ = static_cast<u32>(pos_ / kBlock) - 1;
+        if (src_ == Source::Media || src_ == Source::Raw) cur_lba_ = sector_lba_ - 1;
+        if (src_ == Source::Parameters) mode_select();
         return good();
     }
     AtaDevice::transfer_done(dma, to_host);
@@ -287,20 +260,26 @@ bool AtapiCdrom::data_in(u8* dst, std::size_t length) {
             pos_ += length;
             return true;
         case Source::Media:
-            if (!image_ || !image_->read(pos_, dst, length)) {
-                check_condition(kMediumError, 0x11);  // unrecovered read error
-                return false;
-            }
-            pos_ += length;
-            return true;
         case Source::Raw:
             while (length) {
-                if (raw_off_ == raw_len_) {
-                    if (!build_raw_sector(raw_lba_++)) return false;
+                if (sector_off_ == sector_out_.size()) {
+                    if (src_ == Source::Media && length >= kBlock) {
+                        // Whole sectors straight from the image.
+                        const u32 n = static_cast<u32>(length / kBlock);
+                        if (!image_ || !image_->read_data(sector_lba_, dst, n)) {
+                            check_condition(kMediumError, 0x11);  // unrecovered read error
+                            return false;
+                        }
+                        sector_lba_ += n;
+                        dst += std::size_t{n} * kBlock;
+                        length -= std::size_t{n} * kBlock;
+                        continue;
+                    }
+                    if (!next_sector()) return false;
                 }
-                const std::size_t n = std::min(length, raw_len_ - raw_off_);
-                std::memcpy(dst, raw_out_.data() + raw_off_, n);
-                raw_off_ += n;
+                const std::size_t n = std::min(length, sector_out_.size() - sector_off_);
+                std::memcpy(dst, sector_out_.data() + sector_off_, n);
+                sector_off_ += n;
                 dst += n;
                 length -= n;
             }
@@ -316,40 +295,105 @@ bool AtapiCdrom::data_out(const u8* src, std::size_t length) {
         std::memcpy(cdb_.data(), src, std::min(length, cdb_.size()));
         return true;
     }
-    return true;  // parameter data (MODE SELECT) is taken and not used
+    if (src_ == Source::Parameters) reply_.insert(reply_.end(), src, src + length);
+    return true;
 }
 
-// One sector as READ CD returns it: the fields selected in byte 9 of the
-// command (sync, header, user data, EDC/ECC) of the mode 1 raw sector.
-bool AtapiCdrom::build_raw_sector(u32 lba) {
-    u8* s = raw_.data();
-    std::memset(s, 0, raw_.size());
-    s[0] = 0x00;
-    std::memset(s + 1, 0xFF, 10);
-    s[11] = 0x00;
-    const Msf a = to_msf(lba);
-    s[12] = bcd(a.m), s[13] = bcd(a.s), s[14] = bcd(a.f), s[15] = 0x01;
-    if (!image_ || !image_->read(u64{lba} * kBlock, s + 16, kBlock)) {
+// Whether `count` sectors from `lba` are all on the disc (none between
+// sessions) and, for `data_only`, none of them audio; if not, the command
+// ends with the reason.
+bool AtapiCdrom::readable(u32 lba, u64 count, bool data_only) {
+    const u64 end = u64{lba} + count;
+    for (u64 l = lba; l < end;) {
+        const CdImage::Track* t = image_->track_at(static_cast<u32>(l));
+        if (!t) {
+            check_condition(kIllegalRequest, 0x21);  // logical block address out of range
+            return false;
+        }
+        if (data_only && t->type == CdImage::TrackType::Audio) {
+            check_condition(kIllegalRequest, 0x64);  // illegal mode for this track
+            return false;
+        }
+        l = t->end;
+    }
+    return true;
+}
+
+// What the sector at `lba` is, and whether it is what READ CD's expected
+// sector type asks for (0: any).
+bool AtapiCdrom::sector_kind(u32 lba, u8 type, Kind& kind) {
+    const CdImage::Track* t = image_->track_at(lba);
+    if (!t) return false;
+    switch (t->type) {
+        case CdImage::TrackType::Audio: kind = Kind::Audio; break;
+        case CdImage::TrackType::Mode1: kind = Kind::Mode1; break;
+        case CdImage::TrackType::Mode2:
+            if (type == 3) kind = Kind::Formless;
+            else {
+                if (!image_->read_raw(lba, raw_.data())) return false;
+                kind = (raw_[18] & 0x20) ? Kind::Form2 : Kind::Form1;  // the subheader's submode: form 2
+            }
+            break;
+    }
+    static constexpr Kind kWanted[6] = {Kind::Audio, Kind::Audio, Kind::Mode1, Kind::Formless, Kind::Form1, Kind::Form2};
+    return type == 0 || (type <= 5 && kind == kWanted[type]);
+}
+
+// The bytes READ CD returns of a sector of a kind: the fields selected in
+// byte 9 (sync, header codes, user data, EDC/ECC). An audio sector is its
+// 2352 bytes of samples, if user data is asked for.
+unsigned AtapiCdrom::field_bytes(Kind kind, u8 flags) const {
+    if (kind == Kind::Audio) return (flags & 0x10) ? 2352 : 0;
+    const unsigned headers = (flags >> 5) & 3;
+    const bool xa = kind == Kind::Form1 || kind == Kind::Form2;
+    static constexpr unsigned kUser[5] = {0, 2048, 2336, 2048, 2324}, kEdc[5] = {0, 288, 0, 280, 4};
+    const unsigned k = static_cast<unsigned>(kind);
+    return ((flags & 0x80) ? 12 : 0) + ((headers & 1) ? 4 : 0) + ((headers & 2) && xa ? 8 : 0) +
+           ((flags & 0x10) ? kUser[k] : 0) + ((flags & 0x08) ? kEdc[k] : 0);
+}
+
+// The next sector of a READ (its user data) or READ CD (the fields asked for).
+bool AtapiCdrom::next_sector() {
+    sector_out_.clear();
+    sector_off_ = 0;
+    const u32 lba = sector_lba_++;
+    if (src_ == Source::Media) {
+        sector_out_.resize(kBlock);
+        if (image_ && image_->read_data(lba, sector_out_.data())) return true;
         check_condition(kMediumError, 0x11);
         return false;
     }
-    if (raw_flags_ & 0x08) {
-        const EccTables& t = ecc_tables();
-        u32 edc = 0;
-        for (unsigned i = 0; i < 0x810; ++i) edc = (edc >> 8) ^ t.edc[(edc ^ s[i]) & 0xFF];
-        s[0x810] = static_cast<u8>(edc), s[0x811] = static_cast<u8>(edc >> 8);
-        s[0x812] = static_cast<u8>(edc >> 16), s[0x813] = static_cast<u8>(edc >> 24);
-        ecc_block(s + 0xC, 86, 24, 2, 86, s + 0x81C);   // P parity
-        ecc_block(s + 0xC, 52, 43, 86, 88, s + 0x8C8);  // Q parity
+    Kind kind;
+    if (!image_ || !sector_kind(lba, raw_type_, kind) || !image_->read_raw(lba, raw_.data())) {
+        check_condition(kMediumError, 0x11);
+        return false;
     }
-    raw_out_.clear();
-    const unsigned headers = (raw_flags_ >> 5) & 3;
-    if (raw_flags_ & 0x80) raw_out_.insert(raw_out_.end(), s, s + 12);
-    if (headers == 1 || headers == 3) raw_out_.insert(raw_out_.end(), s + 12, s + 16);  // mode 1 has no subheader
-    if (raw_flags_ & 0x10) raw_out_.insert(raw_out_.end(), s + 16, s + 16 + kBlock);
-    if (raw_flags_ & 0x08) raw_out_.insert(raw_out_.end(), s + 0x810, s + 2352);
-    raw_off_ = 0;
-    raw_len_ = raw_out_.size();
+    const u8* s = raw_.data();
+    auto add = [&](unsigned from, unsigned to) { sector_out_.insert(sector_out_.end(), s + from, s + to); };
+    const u8 f = raw_flags_;
+    const unsigned headers = (f >> 5) & 3;
+    switch (kind) {
+        case Kind::Audio:
+            if (f & 0x10) add(0, 2352);
+            break;
+        case Kind::Mode1:
+        case Kind::Formless:
+            if (f & 0x80) add(0, 12);
+            if (headers & 1) add(12, 16);
+            if (f & 0x10) add(16, kind == Kind::Mode1 ? 2064 : 2352);
+            if ((f & 0x08) && kind == Kind::Mode1) add(2064, 2352);
+            break;
+        case Kind::Form1:
+        case Kind::Form2: {
+            const unsigned user_end = kind == Kind::Form1 ? 2072 : 2348;
+            if (f & 0x80) add(0, 12);
+            if (headers & 1) add(12, 16);
+            if (headers & 2) add(16, 24);
+            if (f & 0x10) add(24, user_end);
+            if (f & 0x08) add(user_end, 2352);
+            break;
+        }
+    }
     return true;
 }
 
@@ -357,34 +401,44 @@ void AtapiCdrom::read_blocks(u64 lba, u64 count) {
     if (!need_media()) return;
     if (lba + count > blocks()) return check_condition(kIllegalRequest, 0x21);  // LBA out of range
     if (count == 0) return good();
+    if (!readable(static_cast<u32>(lba), count, true)) return;
+    stop_play(kNoAudioStatus);  // a read ends audio play
     src_ = Source::Media;
-    pos_ = lba * kBlock;
+    sector_lba_ = static_cast<u32>(lba);
+    sector_out_.clear();
+    sector_off_ = 0;
     power_ = 0xFF;
     data_phase(true, count * kBlock);
 }
 
 void AtapiCdrom::read_cd(u64 lba, u64 count, u8 type, u8 flags, u8 subchannel) {
     if (!need_media()) return;
-    // A single mode 1 data track: CD-DA and mode 2 sector types do not match it.
-    if (type != 0 && type != 2) return check_condition(kIllegalRequest, 0x64);
+    if (type > 5) return check_condition(kIllegalRequest, 0x24);
     // Neither C2 error pointers nor sub-channel data are offered (capabilities page).
     if ((flags & 0x06) || subchannel) return check_condition(kIllegalRequest, 0x24);
     if (lba + count > blocks()) return check_condition(kIllegalRequest, 0x21);
-    const unsigned headers = (flags >> 5) & 3;
-    const unsigned per = ((flags & 0x80) ? 12 : 0) + ((headers == 1 || headers == 3) ? 4 : 0) +
-                         ((flags & 0x10) ? kBlock : 0) + ((flags & 0x08) ? 288 : 0);
-    if (count == 0 || per == 0) return good();
+    if (count == 0) return good();
+    if (!readable(static_cast<u32>(lba), count, false)) return;
+    u64 total = 0;
+    for (u64 l = lba; l < lba + count; ++l) {
+        Kind kind;
+        if (!sector_kind(static_cast<u32>(l), type, kind)) return check_condition(kIllegalRequest, 0x64);
+        total += field_bytes(kind, flags);
+    }
+    if (total == 0) return good();
+    stop_play(kNoAudioStatus);
     src_ = Source::Raw;
+    raw_type_ = type;
     raw_flags_ = flags;
-    raw_lba_ = static_cast<u32>(lba);
-    raw_off_ = raw_len_ = 0;
-    cur_lba_ = static_cast<u32>(lba + count - 1);
+    sector_lba_ = static_cast<u32>(lba);
+    sector_out_.clear();
+    sector_off_ = 0;
     power_ = 0xFF;
-    data_phase(true, count * per);
+    data_phase(true, total);
 }
 
 std::vector<u8> AtapiCdrom::mode_page(u8 page, unsigned control) const {
-    const bool changeable = control == 1;
+    const bool changeable = control == 1, defaults = control == 2;
     std::vector<u8> p;
     switch (page) {
         case 0x01:  // read error recovery
@@ -393,9 +447,11 @@ std::vector<u8> AtapiCdrom::mode_page(u8 page, unsigned control) const {
         case 0x0D:  // CD device parameters: inactivity timer, 60 S per M, 75 F per S
             p = {0x0D, 0x06, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x4B};
             break;
-        case 0x0E:  // CD audio control: immediate, ports 0 and 1 on channels 0 and 1 at full volume
+        case 0x0E:  // CD audio control: immediate; output ports 0 and 1's channels and volumes
+            if (changeable) return {0x0E, 0x0E, 0, 0, 0, 0, 0, 0, 0x0F, 0xFF, 0x0F, 0xFF, 0, 0, 0, 0};
             p = {0x0E, 0x0E, 0x04, 0, 0, 0, 0, 0, 0x01, 0xFF, 0x02, 0xFF, 0, 0, 0, 0};
-            break;
+            if (!defaults) p[8] = port_channels_[0], p[9] = port_volume_[0], p[10] = port_channels_[1], p[11] = port_volume_[1];
+            return p;
         case 0x2A: {  // capabilities and mechanical status
             p.assign(20, 0);
             p[0] = 0x2A;
@@ -412,7 +468,7 @@ std::vector<u8> AtapiCdrom::mode_page(u8 page, unsigned control) const {
         }
         default: return {};
     }
-    // Nothing here can be changed.
+    // Nothing else here can be changed.
     if (changeable) std::fill(p.begin() + 2, p.end(), 0);
     return p;
 }
@@ -446,44 +502,78 @@ void AtapiCdrom::mode_sense(bool ten) {
     reply(std::move(d), ten ? be16(&cdb_[7]) : cdb_[4]);
 }
 
+// MODE SELECT's parameter list (now in reply_): the CD audio control page's
+// channels and volumes are taken; nothing else can be changed.
+void AtapiCdrom::mode_select() {
+    const std::vector<u8>& d = reply_;
+    const bool ten = cdb_[0] == 0x55;
+    const std::size_t header = ten ? 8 : 4;
+    if (d.size() < header) return;
+    std::size_t p = header + (ten ? be16(&d[6]) : d[3]);  // past the block descriptors
+    while (p + 2 <= d.size()) {
+        const u8 code = d[p] & 0x3F, len = d[p + 1];
+        if (code == 0x0E && len >= 10 && p + 12 <= d.size()) {
+            port_channels_[0] = d[p + 8] & 0x0F;
+            port_volume_[0] = d[p + 9];
+            port_channels_[1] = d[p + 10] & 0x0F;
+            port_volume_[1] = d[p + 11];
+        }
+        p += 2u + len;
+    }
+}
+
 void AtapiCdrom::read_toc() {
     if (!need_media()) return;
     const bool msf = cdb_[1] & 0x02;
     unsigned format = cdb_[2] & 0x0F;
     if (format == 0) format = cdb_[9] >> 6;  // where SFF-8020 drives took it
     const u8 track = cdb_[6];
-    const u32 leadout = blocks();
+    const auto& tracks = image_->tracks();
+    const auto& sessions = image_->sessions();
+    const CdImage::Track& last = tracks.back();
     std::vector<u8> d(4, 0);
-    d[2] = 1, d[3] = 1;  // first and last track (or session)
+    auto entry = [&](u8 control, u8 number, u32 lba) {
+        const u8 e[8] = {0, static_cast<u8>(0x10 | control), number, 0, 0, 0, 0, 0};
+        d.insert(d.end(), e, e + 8);
+        put_addr(&d[d.size() - 4], lba, msf);
+    };
     switch (format) {
-        case 0:
-            if (track > 1 && track != 0xAA) return check_condition(kIllegalRequest, 0x24);
-            if (track <= 1) {
-                const u8 e[8] = {0, 0x14, 1, 0, 0, 0, 0, 0};
-                d.insert(d.end(), e, e + 8);
-                put_addr(&d[d.size() - 4], 0, msf);
-            }
-            {
-                const u8 e[8] = {0, 0x14, 0xAA, 0, 0, 0, 0, 0};
-                d.insert(d.end(), e, e + 8);
-                put_addr(&d[d.size() - 4], leadout, msf);
-            }
+        case 0:  // the tracks from `track` on, then the lead-out
+            d[2] = tracks.front().number, d[3] = last.number;
+            if (track > last.number && track != 0xAA) return check_condition(kIllegalRequest, 0x24);
+            for (const CdImage::Track& t : tracks)
+                if (t.number >= track && track != 0xAA) entry(t.control, t.number, t.start);
+            entry(last.control, 0xAA, image_->leadout());
             break;
         case 1: {  // session information: the first track of the last session
-            const u8 e[8] = {0, 0x14, 1, 0, 0, 0, 0, 0};
-            d.insert(d.end(), e, e + 8);
-            put_addr(&d[d.size() - 4], 0, msf);
+            const CdImage::Session& s = sessions.back();
+            d[2] = sessions.front().number, d[3] = s.number;
+            const CdImage::Track& t = tracks[s.first_track - tracks.front().number];
+            entry(t.control, t.number, t.start);
             break;
         }
-        case 2: {  // the raw TOC: points A0, A1, A2 and track 1
-            const Msf lo = to_msf(leadout), t1 = to_msf(0);
-            const u8 q[4][11] = {
-                {1, 0x14, 0, 0xA0, 0, 0, 0, 0, 1, 0x00, 0},  // first track, CD-ROM disc
-                {1, 0x14, 0, 0xA1, 0, 0, 0, 0, 1, 0, 0},     // last track
-                {1, 0x14, 0, 0xA2, 0, 0, 0, 0, lo.m, lo.s, lo.f},
-                {1, 0x14, 0, 0x01, 0, 0, 0, 0, t1.m, t1.s, t1.f},
-            };
-            for (const auto& e : q) d.insert(d.end(), e, e + 11);
+        case 2: {  // the raw TOC from session `track` on: points A0, A1, A2 and the tracks of each
+            d[2] = sessions.front().number, d[3] = sessions.back().number;
+            if (track > sessions.back().number) return check_condition(kIllegalRequest, 0x24);
+            const u8 disc_type = image_->xa() ? 0x20 : 0x00;  // CD-ROM XA, else CD-DA or CD-ROM
+            for (const CdImage::Session& s : sessions) {
+                if (s.number < track) continue;
+                const CdImage::Track& first = tracks[s.first_track - tracks.front().number];
+                const CdImage::Track& end = tracks[s.last_track - tracks.front().number];
+                auto point = [&](u8 control, u8 p, u8 pm, u8 ps, u8 pf) {
+                    const u8 e[11] = {s.number, static_cast<u8>(0x10 | control), 0, p, 0, 0, 0, 0, pm, ps, pf};
+                    d.insert(d.end(), e, e + 11);
+                };
+                point(first.control, 0xA0, first.number, disc_type, 0);
+                point(end.control, 0xA1, end.number, 0, 0);
+                const Msf lo = to_msf(s.leadout);
+                point(end.control, 0xA2, lo.m, lo.s, lo.f);
+                for (u8 n = s.first_track; n <= s.last_track; ++n) {
+                    const CdImage::Track& t = tracks[n - tracks.front().number];
+                    const Msf a = to_msf(t.start);
+                    point(t.control, n, a.m, a.s, a.f);
+                }
+            }
             break;
         }
         default: return check_condition(kIllegalRequest, 0x24);
@@ -497,13 +587,19 @@ void AtapiCdrom::read_subchannel() {
     const bool msf = cdb_[1] & 0x02, subq = cdb_[2] & 0x40;
     const u8 format = cdb_[3];
     std::vector<u8> d(4, 0);
-    d[1] = 0x15;  // no current audio status
+    d[1] = audio_status_;
+    // A play's end (or failure) is reported once.
+    if (audio_status_ == kPlayDone || audio_status_ == kPlayError) audio_status_ = kNoAudioStatus;
     if (subq) {
         switch (format) {
-            case 1: {  // current position
-                u8 e[12] = {0x01, 0x14, 1, 1};
-                put_addr(e + 4, cur_lba_, msf);
-                put_addr(e + 8, cur_lba_, msf);
+            case 1: {  // current position: absolute, and within its track
+                const u32 lba = audio_lba();
+                const CdImage::Track* t = image_->track_at(lba);
+                const u8 control = t ? t->control : 0x4;
+                u8 e[12] = {0x01, static_cast<u8>(0x10 | control), static_cast<u8>(t ? t->number : 1),
+                            static_cast<u8>(t && lba < t->start ? 0 : 1)};
+                put_addr(e + 4, lba, msf);
+                put_relative(e + 8, t ? static_cast<s64>(lba) - t->start : static_cast<s64>(lba), msf);
                 d.insert(d.end(), e, e + 12);
                 break;
             }
@@ -519,6 +615,87 @@ void AtapiCdrom::read_subchannel() {
     reply(std::move(d), be16(&cdb_[7]));
 }
 
+// --- Audio play ---------------------------------------------------------
+
+u64 AtapiCdrom::play_position() const {
+    if (audio_status_ != kPlaying) return play_from_;
+    const double played = static_cast<double>(sched_.now() - play_t0_) * kAudioRate / cpu_hz_;
+    return std::min<u64>(play_from_ + static_cast<u64>(played), u64{play_end_} * kSamplesPerSector);
+}
+
+u32 AtapiCdrom::audio_lba() const {
+    if (audio_status_ != kPlaying && audio_status_ != kPaused) return cur_lba_;
+    const u32 lba = static_cast<u32>(play_position() / kSamplesPerSector);
+    return play_end_ ? std::min(lba, play_end_ - 1) : lba;
+}
+
+// Plays from sector `from` up to (not including) `to`, as far as the audio
+// tracks go on from it: a data track or the gap between sessions ends it.
+void AtapiCdrom::play(u32 from, u32 to) {
+    for (u32 l = from; l < to;) {
+        const CdImage::Track* t = image_->track_at(l);
+        if (!t || t->type != CdImage::TrackType::Audio) {
+            to = l;
+            break;
+        }
+        l = t->end;
+    }
+    const bool was = audio_status_ == kPlaying;
+    play_from_ = u64{from} * kSamplesPerSector;
+    play_end_ = to;
+    play_t0_ = sched_.now();
+    audio_status_ = kPlaying;
+    cur_lba_ = from;
+    const double samples = static_cast<double>(u64{to} * kSamplesPerSector - play_from_);
+    play_timer_.schedule_in(static_cast<u64>(samples / kAudioRate * cpu_hz_) + 1);
+    if (!was && on_audio) on_audio(true);
+}
+
+void AtapiCdrom::stop_play(u8 status) {
+    if (audio_status_ != kPlaying && audio_status_ != kPaused) return;
+    const bool was = audio_status_ == kPlaying;
+    cur_lba_ = audio_lba();
+    play_from_ = play_position();
+    play_timer_.cancel();
+    audio_status_ = status;
+    if (was && on_audio) on_audio(false);
+}
+
+void AtapiCdrom::analog(s16* out, std::size_t count, double rate) {
+    std::fill(out, out + count * 2, s16{0});
+    if (audio_status_ != kPlaying || !image_ || count == 0) return;
+    const double now = static_cast<double>(sched_.now()), t0 = static_cast<double>(play_t0_);
+    const double cycles_per_frame = cpu_hz_ / rate, samples_per_cycle = kAudioRate / cpu_hz_;
+    const double end = static_cast<double>(u64{play_end_} * kSamplesPerSector);
+    // A sample of the disc (0 left, 1 right), through the two-sector cache.
+    auto sample = [this](u64 index, unsigned channel) -> int {
+        const u32 lba = static_cast<u32>(index / kSamplesPerSector);
+        const unsigned slot = lba & 1;
+        if (audio_cached_[slot] != lba) {
+            if (!image_->read_raw(lba, audio_cache_[slot].data())) audio_cache_[slot].fill(0);
+            audio_cached_[slot] = lba;
+        }
+        const u8* p = audio_cache_[slot].data() + (index % kSamplesPerSector) * 4 + channel * 2;
+        return static_cast<s16>(p[0] | (p[1] << 8));
+    };
+    for (std::size_t k = 0; k < count; ++k) {
+        const double t = now - static_cast<double>(count - k) * cycles_per_frame;
+        if (t < t0) continue;
+        const double pos = static_cast<double>(play_from_) + (t - t0) * samples_per_cycle;
+        if (pos + 1 >= end) break;
+        const u64 i = static_cast<u64>(pos);
+        const double frac = pos - static_cast<double>(i);
+        double ch[2];
+        for (unsigned c = 0; c < 2; ++c) ch[c] = sample(i, c) * (1 - frac) + sample(i + 1, c) * frac;
+        // Each output port: the channels it is given (both: their mean), at its volume.
+        for (unsigned port = 0; port < 2; ++port) {
+            const u8 sel = port_channels_[port] & 3;
+            const double v = sel == 3 ? (ch[0] + ch[1]) / 2 : sel == 1 ? ch[0] : sel == 2 ? ch[1] : 0.0;
+            out[k * 2 + port] = static_cast<s16>(std::lround(std::clamp(v * port_volume_[port] / 255.0, -32768.0, 32767.0)));
+        }
+    }
+}
+
 void AtapiCdrom::packet() {
     const u8 op = cdb_[0];
     // A pending unit attention ends the next command, except those that
@@ -528,6 +705,17 @@ void AtapiCdrom::packet() {
         unit_attention_ = 0;
         return check_condition(kUnitAttention, asc);
     }
+    // PLAY AUDIO's checks: the start on the disc and in an audio track.
+    auto start_play = [this](u64 from, u64 to) {
+        if (!need_media()) return;
+        if (to <= from) return good();  // nothing to play: not an error
+        if (from >= blocks()) return check_condition(kIllegalRequest, 0x21);
+        const CdImage::Track* t = image_->track_at(static_cast<u32>(from));
+        if (!t) return check_condition(kIllegalRequest, 0x21);
+        if (t->type != CdImage::TrackType::Audio) return check_condition(kIllegalRequest, 0x64);
+        play(static_cast<u32>(from), static_cast<u32>(std::min<u64>(to, blocks())));
+        good();
+    };
     switch (op) {
         case 0x00:  // TEST UNIT READY
             if (need_media()) good();
@@ -564,14 +752,15 @@ void AtapiCdrom::packet() {
         }
         case 0x1A: return mode_sense(false);
         case 0x5A: return mode_sense(true);
-        case 0x15: case 0x55: {  // MODE SELECT: nothing is changeable, the data is taken
-            src_ = Source::Discard;
+        case 0x15: case 0x55:  // MODE SELECT: the parameter list, then mode_select()
+            src_ = Source::Parameters;
+            reply_.clear();
             return data_phase(false, op == 0x15 ? cdb_[4] : be16(&cdb_[7]));
-        }
         case 0x1B: {  // START STOP UNIT
             const bool loej = cdb_[4] & 0x02, start = cdb_[4] & 0x01;
             if (loej && !start) {
                 if (prevent_) return check_condition(kIllegalRequest, 0x53, 0x02);  // removal prevented
+                stop_play(kNoAudioStatus);
                 media_ = false;
                 tray_open_ = true;
                 if (on_eject) on_eject();
@@ -581,6 +770,8 @@ void AtapiCdrom::packet() {
                     media_ = true;
                     unit_attention_ = 0x28;
                 }
+            } else if (!start) {
+                stop_play(kNoAudioStatus);  // the disc stops spinning
             }
             return good();
         }
@@ -599,6 +790,7 @@ void AtapiCdrom::packet() {
         case 0x2B:  // SEEK (10)
             if (!need_media()) return;
             if (be32(&cdb_[2]) >= blocks()) return check_condition(kIllegalRequest, 0x21);
+            stop_play(kNoAudioStatus);
             cur_lba_ = be32(&cdb_[2]);
             return good();
         case 0x43: return read_toc();
@@ -606,9 +798,10 @@ void AtapiCdrom::packet() {
         case 0x44: {  // READ HEADER
             if (!need_media()) return;
             const u32 lba = be32(&cdb_[2]);
-            if (lba >= blocks()) return check_condition(kIllegalRequest, 0x21);
+            const CdImage::Track* t = lba < blocks() ? image_->track_at(lba) : nullptr;
+            if (!t) return check_condition(kIllegalRequest, 0x21);
             std::vector<u8> d(8, 0);
-            d[0] = 0x01;  // mode 1
+            d[0] = t->type == CdImage::TrackType::Audio ? 0 : t->type == CdImage::TrackType::Mode2 ? 2 : 1;
             put_addr(&d[4], lba, cdb_[1] & 0x02);
             return reply(std::move(d), be16(&cdb_[7]));
         }
@@ -623,15 +816,63 @@ void AtapiCdrom::packet() {
         case 0xBD: {  // MECHANISM STATUS
             std::vector<u8> d(8, 0);
             d[1] = static_cast<u8>(tray_open_ ? 0x10 : 0);  // idle, door open or closed
-            d[2] = static_cast<u8>(cur_lba_ >> 16), d[3] = static_cast<u8>(cur_lba_ >> 8), d[4] = static_cast<u8>(cur_lba_);
+            const u32 lba = audio_lba();
+            d[2] = static_cast<u8>(lba >> 16), d[3] = static_cast<u8>(lba >> 8), d[4] = static_cast<u8>(lba);
             return reply(std::move(d), be16(&cdb_[8]));
         }
         case 0xBB: return good();  // SET CD SPEED
-        case 0x4E: return good();  // STOP PLAY/SCAN: nothing is playing
-        case 0x4B: return check_condition(kIllegalRequest, 0x2C);  // PAUSE/RESUME: command sequence error
-        case 0x45: case 0x47: case 0xA5:  // PLAY AUDIO: the track holds data
+        case 0x45: {  // PLAY AUDIO (10): from an LBA (all ones: where the head is) for a count
+            const u32 lba = be32(&cdb_[2]);
+            const u64 from = lba == 0xFFFFFFFFu ? audio_lba() : lba;
+            return start_play(from, from + be16(&cdb_[7]));
+        }
+        case 0xA5: {  // PLAY AUDIO (12)
+            const u32 lba = be32(&cdb_[2]);
+            const u64 from = lba == 0xFFFFFFFFu ? audio_lba() : lba;
+            return start_play(from, from + be32(&cdb_[6]));
+        }
+        case 0x47: {  // PLAY AUDIO MSF: from (all ones: where the head is) to an end
+            const bool here = cdb_[3] == 0xFF && cdb_[4] == 0xFF && cdb_[5] == 0xFF;
+            const u32 start = from_msf(&cdb_[3]), end = from_msf(&cdb_[6]);
+            if (!here && (start < 150 || end < start)) return check_condition(kIllegalRequest, 0x24);
+            if (end < 150) return check_condition(kIllegalRequest, 0x24);
+            return start_play(here ? audio_lba() : start - 150, end - 150);
+        }
+        case 0x48: {  // PLAY AUDIO TRACK/INDEX: index 0 is a track's pregap, 1 the rest of it
             if (!need_media()) return;
-            return check_condition(kIllegalRequest, 0x64);
+            const auto& tracks = image_->tracks();
+            const u8 first = tracks.front().number, last = tracks.back().number;
+            const u8 st = cdb_[4], si = cdb_[5];
+            const u8 et = std::min(cdb_[7], last), ei = cdb_[8];
+            if (st < first || st > last || et < st) return check_condition(kIllegalRequest, 0x24);
+            const CdImage::Track& s = tracks[st - first];
+            const CdImage::Track& e = tracks[et - first];
+            const u64 from = si == 0 ? static_cast<u64>(std::max<s64>(s.begin, 0)) : s.start;
+            const u64 to = ei == 0 ? e.start : e.end;
+            return start_play(from, to);
+        }
+        case 0x4B: {  // PAUSE/RESUME
+            if (audio_status_ != kPlaying && audio_status_ != kPaused)
+                return check_condition(kIllegalRequest, 0x2C);  // command sequence error
+            if (cdb_[8] & 0x01) {
+                if (audio_status_ == kPaused) {
+                    const u64 left = u64{play_end_} * kSamplesPerSector - play_from_;
+                    play_t0_ = sched_.now();
+                    audio_status_ = kPlaying;
+                    play_timer_.schedule_in(static_cast<u64>(static_cast<double>(left) / kAudioRate * cpu_hz_) + 1);
+                    if (on_audio) on_audio(true);
+                }
+            } else if (audio_status_ == kPlaying) {
+                play_from_ = play_position();
+                play_timer_.cancel();
+                audio_status_ = kPaused;
+                if (on_audio) on_audio(false);
+            }
+            return good();
+        }
+        case 0x4E:  // STOP PLAY/SCAN
+            stop_play(kNoAudioStatus);
+            return good();
         default:
             UV_LOG(Debug, "atapi", "packet command %02x not supported", op);
             return check_condition(kIllegalRequest, 0x20);  // invalid command operation code
@@ -639,9 +880,9 @@ void AtapiCdrom::packet() {
 }
 
 void AtapiCdrom::describe_more(std::string& out) const {
-    appendf(out, "    packet %02x (lba %u), sense %x/%02x/%02x, %s%s, last block read %u\n", cdb_[0],
+    appendf(out, "    packet %02x (lba %u), sense %x/%02x/%02x, %s%s, last block read %u, audio status %02x\n", cdb_[0],
             static_cast<unsigned>(cdb_[2] << 24 | cdb_[3] << 16 | cdb_[4] << 8 | cdb_[5]), sense_key_, asc_, ascq_,
-            media_ ? "medium in" : "no medium", tray_open_ ? ", tray open" : "", cur_lba_);
+            media_ ? "medium in" : "no medium", tray_open_ ? ", tray open" : "", cur_lba_, audio_status_);
 }
 
 }  // namespace uv

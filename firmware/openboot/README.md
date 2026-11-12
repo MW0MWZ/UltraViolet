@@ -359,6 +359,9 @@ The release's own files are unchanged, but for:
 
 OpenBoot is under Sun's licence, a BSD-style licence, given in full in
 [LICENSE](LICENSE), and UltraViolet's additions are under the same terms.
+Some of its files are also FirmWorks' (Mitch Bradley's Forth system, which
+OpenBoot is built on); LICENSE also gives the MIT licence FirmWorks
+released its own Open Firmware under, from the same code.
 This folder is not under UltraViolet's GPL.
 
 Sun, Ultra, Solaris and OpenBoot are trademarks of Oracle and/or its

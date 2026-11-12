@@ -197,6 +197,10 @@ Ultra5_10::Ultra5_10(const Options& options)
     audio_rec_dma_.set_irq_sink([this](bool a) { sabre_.set_interrupt(kInoAudioRecord, a); });
     // The codec's interrupt line reaches both of its channels.
     audio_.set_dma(&audio_play_dma_, &audio_rec_dma_);
+    // The CD-ROM drive's audio cable reaches the codec's AUX1 input (J5).
+    audio_.set_input(Cs4231::Input::Aux1,
+                     [this](s16* frames, std::size_t count, double rate) { cdrom_.analog(frames, count, rate); });
+    cdrom_.on_audio = [this](bool on) { audio_.set_input_live(Cs4231::Input::Aux1, on); };
     audio_.set_irq_sink([this](bool a) {
         audio_play_dma_.set_device_irq(a);
         audio_rec_dma_.set_device_irq(a);
@@ -480,7 +484,10 @@ bool Ultra5_10::insert_cdrom(const std::string& path) {
     cdrom_.insert(nullptr);
     cd_image_.close();
     if (path.empty()) return true;
-    if (!cd_image_.open(path, true)) return false;
+    if (!cd_image_.open(path)) {
+        UV_LOG(Warn, "ultra5_10", "%s", cd_image_.error().c_str());
+        return false;
+    }
     cdrom_.insert(&cd_image_);
     return true;
 }
@@ -618,6 +625,7 @@ void Ultra5_10::run(u64 instructions) {
                                                    cpu_.instructions() - cpu_.delay_steps() - cpu_.idle_instructions(),
                                                    false, cpu_.delay_cycles() + cpu_.idle_cycles()));
         }
+        if (opt_.yield_when && opt_.yield_when->load(std::memory_order_relaxed)) break;
     }
 }
 
