@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andy Taylor
 // The window's sound: the machine's audio output, and the keyboard's bell
-// and click, on the host's default playback device (SDL3).
+// and click, on the host's default playback device (SDL3); and, when asked
+// for, the host's default recording device as an input of the machine's.
 #pragma once
 
 #include <atomic>
@@ -29,6 +30,14 @@ public:
     // real time) is dropped.
     void play(const s16* frames, std::size_t count, unsigned rate);
 
+    // The host's default recording device, opened and closed (false: there
+    // is none, or it may not be used). record() gives what it heard, from
+    // the machine's thread: `count` stereo frames at `rate`, silence for
+    // what has not arrived; more than a tenth of a second waiting is dropped.
+    bool open_recording();
+    void close_recording();
+    void record(s16* frames, std::size_t count, double rate);
+
     void set_enabled(bool on) { enabled_ = on; }
     void set_volume(float volume);  // 0 to 1
 
@@ -44,8 +53,9 @@ private:
 
     SDL_AudioStream* guest_ = nullptr;  // the machine's audio
     SDL_AudioStream* keys_ = nullptr;   // bell and click, made as they are wanted
+    SDL_AudioStream* recording_ = nullptr;
     std::mutex mutex_;
-    unsigned rate_ = 0;
+    unsigned rate_ = 0, recording_rate_ = 0;
     std::atomic<bool> enabled_{true}, bell_{false}, ring_{false}, click_{false};
     // Made on SDL's audio thread
     unsigned ring_left_ = 0, click_left_ = 0, phase_ = 0;

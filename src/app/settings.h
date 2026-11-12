@@ -68,6 +68,9 @@ struct Settings {
     // click on the host, at a volume (percent).
     bool sound = true;
     unsigned volume = 80;
+    // The host's default recording device as one of the machine's audio
+    // inputs: "none", "line" (the line-in jack) or "microphone".
+    std::string audio_input = "none";
     std::string log = "warn";
 
     // The machine these settings describe (the PROM image, the network and

@@ -2,12 +2,18 @@ OpenBoot 4.23.0, as released by Sun Microsystems, Inc., and UltraViolet's
 additions to it.
 
 The OpenBoot source in this folder is Sun Microsystems' release of OpenBoot
-4.23.0 (2006). Each of its files that carries a licence carries the one
+4.23.0 (2006). Each of its files that carries a licence carries Sun's,
 below; the files of the release that carry only a copyright notice and
 "Use is subject to license terms" are part of the same release and are
 distributed under the same terms. Some files are also Copyright Bradley
 Forthware or FirmWorks (Mitch Bradley), whose Forth system OpenBoot is
-built on, as their notices say.
+built on, as their notices say. All but one of the files that carry only
+"Use is subject to license terms" are among them (the Forth kernel,
+library and meta-compiler in obp/fm, the SPARC assembler and
+disassembler, the generic PCI probe, parts of obp/os and obp/pkg, and the
+tokenizer's dictionary). FirmWorks released its own Open Firmware, which
+comes from the same code, in 2006 with its files under the MIT licence,
+also given below; most of these files, or their code, are in that release.
 
 UltraViolet's additions and changes (the host build in host/, build.sh,
 and the files that say so) are Copyright (C) 2026 Andy Taylor and are
@@ -50,3 +56,29 @@ SUN HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
 You acknowledge that this software is not designed, licensed or
 intended for use in the design, construction, operation or maintenance of
 any nuclear facility. 
+
+------------------------------------------------------------------------------
+
+FirmWorks' licence for its Open Firmware release (2006), as its files carry
+it:
+
+Copyright (c) 2006 FirmWorks
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

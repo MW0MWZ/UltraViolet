@@ -71,7 +71,7 @@ enum class Pick { PromDir, Nvram, NewNvram, Disk, NewDisk, AddDisc, InsertDisc, 
 
 constexpr SDL_DialogFileFilter kNvramFilters[] = {{"NVRAM images", "bin;nvram;nvr"}, {"All files", "*"}};
 constexpr SDL_DialogFileFilter kDiskFilters[] = {{"Disk images", "img;raw;dsk;hd;hdd"}, {"All files", "*"}};
-constexpr SDL_DialogFileFilter kDiscFilters[] = {{"CD-ROM images", "iso;img;bin;raw;cdr"}, {"All files", "*"}};
+constexpr SDL_DialogFileFilter kDiscFilters[] = {{"CD-ROM images", "iso;cue;img;bin;raw;cdr"}, {"All files", "*"}};
 constexpr SDL_DialogFileFilter kSettingsFilters[] = {{"Settings", "ini;conf;cfg"}, {"All files", "*"}};
 
 constexpr const char* kDiscLocked =
@@ -439,6 +439,7 @@ int Gui::run() {
         power_off();
         if (!options_.power_on && options_.settings_file.empty()) save_settings_to(settings_path_);
         session_.set_audio_output({});
+        session_.set_audio_input("none", {});
     }
     audio_.close();
     for (auto& t : terminal_windows_) t.reset();
@@ -574,6 +575,15 @@ void Gui::power_button() {
 void Gui::apply_sound() {
     audio_.set_enabled(session_.settings().sound);
     audio_.set_volume(static_cast<float>(session_.settings().volume) / 100.0f);
+    const std::string& jack = session_.settings().audio_input;
+    if (jack != "none" && audio_.open_recording()) {
+        session_.set_audio_input(jack, [this](s16* frames, std::size_t count, double rate) {
+            audio_.record(frames, count, rate);
+        });
+    } else {
+        session_.set_audio_input("none", {});
+        audio_.close_recording();
+    }
 }
 
 void Gui::eject() {
@@ -1777,6 +1787,15 @@ void Gui::draw_settings() {
             ImGui::SetNextItemWidth(-1);
             int volume = static_cast<int>(edit_.volume);
             if (ImGui::SliderInt("##volume", &volume, 0, 100, "%d%%")) edit_.volume = static_cast<unsigned>(volume);
+            ImGui::Spacing();
+            label("This computer's recording device");
+            ImGui::SetNextItemWidth(-1);
+            static const char* const kJacks[] = {"none", "line", "microphone"};
+            int jack = edit_.audio_input == "line" ? 1 : edit_.audio_input == "microphone" ? 2 : 0;
+            if (ImGui::Combo("##audio_input", &jack, "Not connected\0In the line-in jack\0In the microphone jack\0"))
+                edit_.audio_input = kJacks[jack];
+            ImGui::SetItemTooltip("What the system records from its line-in or microphone jack: this computer's\n"
+                                  "default recording device (the CD-ROM drive's audio is always connected)");
             ImGui::TextDisabled("Takes effect at once, without powering off.");
             ImGui::EndTabItem();
         }

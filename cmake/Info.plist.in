@@ -32,6 +32,8 @@
     <string>Copyright (C) 2026 Andy Taylor. GNU General Public License, version 2 or later.</string>
     <key>NSLocalNetworkUsageDescription</key>
     <string>The emulated Ultra 5/10's network reaches your local network (your router's name server and other machines) through user-mode networking.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>The emulated Ultra 5/10's line-in or microphone jack hears your computer's recording device, when you choose that in the Sound settings.</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
 </dict>

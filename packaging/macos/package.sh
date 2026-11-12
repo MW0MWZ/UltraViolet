@@ -23,6 +23,11 @@ codesign --verify --deep --strict $app
 cp README.md $s/
 cp LICENSE $s/LICENSE.txt
 cp third_party/imgui/LICENSE.txt $s/licenses/imgui.txt
+# The firmware built into the program: OpenBoot (Sun's licence and FirmWorks'), and the
+# Rage Pro and Creator3D FCode.
+cp firmware/openboot/LICENSE $s/licenses/openboot.txt
+cp firmware/rage/LICENSE $s/licenses/rage-fcode.txt
+cp firmware/creator3d/LICENSE $s/licenses/creator3d-fcode.txt
 # The Homebrew formulas the libraries come from, through their own imports.
 brew_libs() { otool -L "$1" | awk 'NR > 1 {print $1}' | grep "^$(brew --prefix)/" || true; }
 seen= todo=$(brew_libs $b/UltraViolet.app/Contents/MacOS/UltraViolet)

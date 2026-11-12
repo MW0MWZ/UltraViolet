@@ -3,6 +3,7 @@
 #include "app/host_audio.h"
 
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 #include "core/log.h"
@@ -40,6 +41,7 @@ bool HostAudio::open() {
 }
 
 void HostAudio::close() {
+    close_recording();
     std::lock_guard<std::mutex> lock(mutex_);
     if (guest_) SDL_DestroyAudioStream(guest_);
     if (keys_) SDL_DestroyAudioStream(keys_);
@@ -71,6 +73,57 @@ void HostAudio::play(const s16* frames, std::size_t count, unsigned rate) {
         SDL_PutAudioStreamData(guest_, lead.data(), static_cast<int>(lead.size() * sizeof(s16)));
     }
     SDL_PutAudioStreamData(guest_, frames, static_cast<int>(count * 2 * sizeof(s16)));
+}
+
+bool HostAudio::open_recording() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (recording_) return true;
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        UV_LOG(Warn, "audio", "no sound: %s", SDL_GetError());
+        return false;
+    }
+    const SDL_AudioSpec spec{SDL_AUDIO_S16, 2, 44100};
+    recording_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_RECORDING, &spec, nullptr, nullptr);
+    if (!recording_) {
+        UV_LOG(Warn, "audio", "no recording device: %s", SDL_GetError());
+        SDL_QuitSubSystem(SDL_INIT_AUDIO);
+        return false;
+    }
+    recording_rate_ = 44100;
+    SDL_ResumeAudioStreamDevice(recording_);
+    return true;
+}
+
+void HostAudio::close_recording() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!recording_) return;
+    SDL_DestroyAudioStream(recording_);
+    recording_ = nullptr;
+    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+}
+
+void HostAudio::record(s16* frames, std::size_t count, double rate) {
+    std::fill(frames, frames + count * 2, s16{0});
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!recording_ || count == 0) return;
+    const unsigned r = static_cast<unsigned>(std::lround(rate));
+    if (r != recording_rate_) {
+        // (the stream's output side: what is taken from it)
+        const SDL_AudioSpec spec{SDL_AUDIO_S16, 2, static_cast<int>(r)};
+        SDL_SetAudioStreamFormat(recording_, nullptr, &spec);
+        recording_rate_ = r;
+    }
+    const int frame_bytes = 2 * static_cast<int>(sizeof(s16));
+    const int want = static_cast<int>(count) * frame_bytes;
+    // Keep up with the device: what is more than a tenth of a second behind
+    // this block is dropped (a guest running slower than real time).
+    int excess = SDL_GetAudioStreamAvailable(recording_) - want - static_cast<int>(r / 10) * frame_bytes;
+    excess -= excess % frame_bytes;  // whole frames
+    if (excess > 0) {
+        std::vector<u8> drop(static_cast<std::size_t>(excess));
+        SDL_GetAudioStreamData(recording_, drop.data(), excess);
+    }
+    SDL_GetAudioStreamData(recording_, frames, want);
 }
 
 void SDLCALL HostAudio::tones(void* self, SDL_AudioStream* stream, int additional, int) {

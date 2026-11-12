@@ -200,6 +200,7 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
     else if (key == "sound") ok = parse_bool(v, s.sound);
     else if (key == "volume") ok = parse_number(v, n) && n >= 0 && n <= 100 && n == static_cast<unsigned>(n) &&
                                   (s.volume = static_cast<unsigned>(n), true);
+    else if (key == "audio_input") ok = (v == "none" || v == "line" || v == "microphone") && (s.audio_input = v, true);
     else if (key == "wheel_keys") ok = (v == "off" || v == "arrows" || v == "pages") && (s.wheel_keys = v, true);
     else if (key == "log") ok = (v == "trace" || v == "debug" || v == "info" || v == "warn" || v == "error" || v == "off") &&
                                (s.log = v, true);
@@ -281,7 +282,8 @@ bool save_settings(const std::string& path, const Settings& s, std::string& erro
         for (const auto& fw : s.forwards) f << "hostfwd=" << forward_text(fw) << "\n";
         f << "timing=" << timing_name(s.timing) << "\nturbo_at_boot=" << (s.turbo_at_boot ? 1 : 0) << "\nblock_cache=" << (s.block_cache ? 1 : 0)
           << "\njit=" << (s.jit ? 1 : 0) << "\njit_check=" << (s.jit_check ? 1 : 0) << "\nidle_skip=" << (s.idle_skip ? 1 : 0)  << "\nfast_disk=" << (s.fast_disk ? 1 : 0) << "\nflash_write_enable=" << (s.flash_write_enable ? 1 : 0) << "\nlog=" << s.log << "\nmouse_auto_capture=" << (s.mouse_auto_capture ? 1 : 0)
-          << "\nwheel_keys=" << s.wheel_keys << "\nsound=" << (s.sound ? 1 : 0) << "\nvolume=" << s.volume << "\n";
+          << "\nwheel_keys=" << s.wheel_keys << "\nsound=" << (s.sound ? 1 : 0) << "\nvolume=" << s.volume
+          << "\naudio_input=" << s.audio_input << "\n";
         if (!f) {
             error = "cannot write " + tmp;
             return false;

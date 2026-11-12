@@ -119,6 +119,7 @@ bool Session::power_on(std::string& error) {
     if (s.turbo_at_boot) turbo_ = true;
     if (turbo_ && turbo_available()) o.timing = Pacer::Mode::Max;
     o.host_clock.sleep_ns = [this](u64 ns) { host_sleep(ns); };
+    o.yield_when = &holds_;  // (a hold is had within a block of instructions)
     try {
         machine_ = std::make_unique<Ultra5_10>(o);
     } catch (const std::exception& e) {
@@ -141,6 +142,7 @@ bool Session::power_on(std::string& error) {
     }
     wire_serial();
     machine_->set_audio_sink(audio_out_);
+    wire_audio_input();
     return true;
 }
 
@@ -169,6 +171,17 @@ void Session::set_serial_output(std::function<void(unsigned, u8)> out) {
 void Session::set_audio_output(Cs4231::AudioSink out) {
     audio_out_ = std::move(out);
     if (machine_) machine_->set_audio_sink(audio_out_);
+}
+
+void Session::set_audio_input(const std::string& jack, Cs4231::InputSource in) {
+    audio_jack_ = jack;
+    audio_in_ = std::move(in);
+    if (machine_) wire_audio_input();
+}
+
+void Session::wire_audio_input() {
+    machine_->set_audio_input(Cs4231::Input::Line, audio_jack_ == "line" ? audio_in_ : Cs4231::InputSource{});
+    machine_->set_audio_input(Cs4231::Input::Mic, audio_jack_ == "microphone" ? audio_in_ : Cs4231::InputSource{});
 }
 
 void Session::wire_serial() {

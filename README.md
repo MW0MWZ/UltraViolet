@@ -43,8 +43,10 @@ installed from their own media.
   (Simba), the PCIO EBus with the flash PROM, the M48T59 NVRAM and clock,
   the SuperIO's keyboard and mouse UARTs and floppy controller, the
   SAB82532 serial ports, the CMD646 IDE controller with ATA disks and an
-  ATAPI CD-ROM drive, the on-board Happy Meal Ethernet, the on-board ATI
-  Rage Pro graphics with its drawing engine, the CS4231 audio codec, the
+  ATAPI CD-ROM drive (data and audio discs, which it plays to the codec as
+  a real one does through its audio cable), the on-board Happy Meal
+  Ethernet, the on-board ATI Rage Pro graphics with its drawing engine, the
+  CS4231 audio codec with its mixer and capture, the
   front-panel power button, and a Sun Type 5 keyboard and mouse. The
   screen comes up at the resolution chosen in the settings (`--resolution`:
   640 x 480 to 1600 x 1200 on the Rage Pro), on a monitor that answers DDC
@@ -73,8 +75,8 @@ installed from their own media.
   ports; or headless, with ttya on the terminal. It builds on Linux, macOS
   and Windows.
 
-Not done yet: the Creator3D's 3D operations, audio capture, audio CDs,
-and the Blade 100/150 and Blade 1000/2000 machines. See
+Not done yet: the Creator3D's 3D operations, and the Blade 100/150 and
+Blade 1000/2000 machines. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it is put together.
 
 ## Performance
@@ -133,9 +135,10 @@ read 8.5 s and tar 10.4 s; the other figures do not change.
 ## Downloads
 
 Ready-built programs are on the
-[releases page](https://github.com/MW0MWZ/UltraViolet/releases). None of them
-include firmware or operating system media: see
-[Firmware and media](#firmware-and-media).
+[releases page](https://github.com/MW0MWZ/UltraViolet/releases). They come
+with UltraViolet's own open source firmware built in, but no Sun firmware or
+operating system media: see [Firmware and media](#firmware-and-media). Each
+includes the licences of the firmware and libraries in it.
 
 - **Linux** (x86-64 and arm64): an AppImage, for Ubuntu 22.04, Debian 12 or
   any distribution as new. Make it executable (`chmod +x`) and run it.
@@ -257,13 +260,17 @@ to full screen. The Machine menu also has the front-panel power button, the
 Sun keys a PC keyboard lacks (Stop, Again, Props and the rest), powering on
 with keys held (Stop, Stop-D, Stop-F, Stop-N), and unplugging the keyboard.
 The machine's audio, and the keyboard's bell and clicks, play on the host
-(Settings, Sound). The serial ports have terminal windows (View menu), where
+(Settings, Sound); the host's recording device can be plugged into the
+machine's line-in or microphone jack there too (`--audio-in`). The serial ports have terminal windows (View menu), where
 Pause or Ctrl+Shift+B sends a BREAK. With `--console ttya` there is no
 keyboard, and OpenBoot and Solaris use ttya as the console (Ctrl+Alt+A then
 sends a BREAK). `--headless` runs without a window, ttya on the terminal
 (Ctrl-] then q quits; `~#` at the start of a line sends a BREAK). `--disk` is a raw image on the primary IDE channel
-(created at `--disk-size` megabytes if it does not exist); `--cdrom` is an
-ISO image in the CD-ROM drive (given more than once, a set of discs).
+(created at `--disk-size` megabytes if it does not exist); `--cdrom` is a
+CD image in the CD-ROM drive (given more than once, a set of discs): an ISO
+image, a raw image of 2352-byte sectors, or a CDRWIN cue sheet (`.cue`)
+with its BINARY or MOTOROLA files, for audio CDs, mixed-mode and
+multisession discs.
 `--help` lists the rest.
 
 The Ethernet is on user-mode networking by default when built with
@@ -297,7 +304,7 @@ default: open source, built from Sun's OpenBoot 4.23.0 release for the
 Ultra 5 and 10 ([firmware/openboot](firmware/openboot)). It is still being
 completed (Solaris 8, 9 and 10 boot with it, from their installation
 media and from disk; it has OpenBoot 3.x's selftests and diagnostic
-commands, but no power-on selftest yet); the Ultra 5/10's own Sun
+commands, and a power-on selftest); the Ultra 5/10's own Sun
 OpenBoot (3.31) is chosen under Settings (Flash PROM) or with `--prom
 supplied`. Sun's images and the operating systems are not included:
 [roms/README.md](roms/README.md) says which images UltraViolet expects,
@@ -329,7 +336,10 @@ The FCode in `firmware/creator3d` (the Creator3D's) and `firmware/rage`
 
 OpenBoot in `firmware/openboot` is Sun Microsystems' release of OpenBoot
 4.23.0 under Sun's BSD-style licence, with UltraViolet's additions under the
-same terms; see [its LICENSE](firmware/openboot/LICENSE).
+same terms. Some of its files are also FirmWorks' (Mitch Bradley's Forth
+system, which OpenBoot is built on), and most of those are in FirmWorks' own
+Open Firmware release under the MIT licence, which is given beside Sun's.
+See [its LICENSE](firmware/openboot/LICENSE).
 
 The logos, UltraViolet's (in `graphics`) and those of the two FCode
 programs (in `firmware/creator3d` and `firmware/rage`), are &copy; Andy
