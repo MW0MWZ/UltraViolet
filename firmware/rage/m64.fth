@@ -388,10 +388,10 @@ here est-modes - 5 /n * / constant #est-modes
 
 \ The node's description of the mode.
 : mode-properties  ( -- )
-   width encode-int " linebytes" property
-   8 encode-int " depth" property
-   height encode-int " height" property
    width encode-int " width" property
+   height encode-int " height" property
+   8 encode-int " depth" property
+   width encode-int " linebytes" property
 ;
 
 \ --- Setting a mode -------------------------------------------------------------
@@ -481,19 +481,21 @@ fload logo.fth
 
 \ Probe: the chip brought up from cold, its memory sized, the monitor's
 \ EDID read and its mode set, the CRTC left off till the screen is opened.
-\ The properties are made in the order the chip makes them.
+\ The properties are made in the order an Ultra 10's PROM makes the onboard
+\ Rage's (its .properties lists them newest first); edid's place among
+\ them (only with a monitor that answers) taken as first.
 map-chip
 chip-start
 size-memory
 fetch-edid
 default-mode to mode  set-mode
-" ISO8859-1" encode-string " character-set" property
-" display" device-type
-mode-properties
-vram-mib encode-int " fb-memory" property
-flags-property
-0 encode-int " aty,status" property
 edid-property
+0 encode-int " aty,status" property
+flags-property
+vram-mib encode-int " fb-memory" property
+mode-properties
+" display" device-type
+" ISO8859-1" encode-string " character-set" property
 unmap-chip
 memory-off
 

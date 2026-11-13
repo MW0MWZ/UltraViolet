@@ -13,7 +13,10 @@ library and meta-compiler in obp/fm, the SPARC assembler and
 disassembler, the generic PCI probe, parts of obp/os and obp/pkg, and the
 tokenizer's dictionary). FirmWorks released its own Open Firmware, which
 comes from the same code, in 2006 with its files under the MIT licence,
-also given below; most of these files, or their code, are in that release.
+also given below. About half of these files are largely in that release
+(the Forth kernel's and library's portable files, the meta-compiler, the
+symbolic debugger); the SPARC-specific ones (the assembler, disassembler
+and kernel code) and some others are not, as it has no SPARC port.
 
 UltraViolet's additions and changes (the host build in host/, build.sh,
 and the files that say so) are Copyright (C) 2026 Andy Taylor and are

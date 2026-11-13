@@ -98,9 +98,22 @@ With no EDID that names a mode, it comes from the monitor's sense lines:
 | 1, 3, 7 (none) | 1152 x 900 at 66 Hz |
 
 The node's `width`, `height`, `v_freq` and `monitor_mode` properties follow
-the mode in use. `edid_data` holds the 128 bytes as last read (zeros when
-no monitor answers), and `no_edid_blks` the number of blocks the EDID says
-it has (the block and its extensions), or 0 when none checks.
+the mode in use. `edid_data` holds the 128 bytes as last read (zeros until
+a monitor answers; a failed try leaves what it read), and `no_edid_blks`
+the number of blocks the EDID says it has (the block and its extensions),
+or 0 when none checks.
+
+### The node's methods
+
+Besides the display's own (`open`, `close`, `selftest` and the like), the
+node has the card's:
+
+| Method | Does |
+| --- | --- |
+| `ffb_do_edid ( -- )` | reads the monitor's EDID again (as at probe) and remakes `edid_data` and `no_edid_blks`; nothing printed. Only while the screen is open. |
+| `ffb_change_scrn_params ( mode #lines #columns window-left window-top screen-height hres vres -- )` | sets the console's geometry for a screen a client has set to another resolution: the text area as given, and the extent (`hres` x `vres`) of the console's whole-screen clears and inversions. Nothing is drawn or written to the card; the next open sets it all from the mode again. |
+| `.version_ffb ( -- )` | prints the FCode's version and copyright on one line. |
+| `disp-test ( -- 0 )` | the display's self-test (run by `selftest` and `test screen`): there is none to run, and it passes. |
 
 ## The logo
 

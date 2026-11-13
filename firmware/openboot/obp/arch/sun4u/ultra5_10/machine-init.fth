@@ -71,8 +71,6 @@ d# 66.000.000 constant pci-hz
       " SUNW," "temp pack >r  get-board-part# r@ $cat
       r> count encode-string " model" property
       banner-name$ encode-string " banner-name" property
-      \ (Energy Star's second version: Solaris's power management)
-      0 0 encode-bytes " energystar-v2" property
    device-end
 ;
 

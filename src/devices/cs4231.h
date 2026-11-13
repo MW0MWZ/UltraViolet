@@ -17,8 +17,9 @@
 // +20 dB), and writes it in the capture format through the capture channel
 // or the PIO data register. The analog inputs are what set_input() gives
 // them (on an Ultra 5/10: the CD-ROM drive on AUX1, the line-in and
-// microphone jacks); with nothing digital running, a live input is mixed
-// at 44.1 kHz. The base counters, the timer, underrun and overrun, and
+// microphone jacks). The output mixer, analog on the chip, runs at 44.1 kHz
+// (or the sample rate, if higher) while an analog input is heard, else at
+// the sample rate. The base counters, the timer, underrun and overrun, and
 // autocalibration follow the datasheet.
 #pragma once
 
@@ -75,7 +76,7 @@ public:
     // I18/I19): mute, gain (+12 dB down to -34.5 dB in 1.5 dB steps);
     // loopback (I13): enable, attenuation (bits 7:2, 1.5 dB steps).
     static constexpr u8 kMicGain = 0x20, kInputMute = 0x80, kLoopbackEnable = 0x01;
-    static constexpr double kAnalogRate = 44100;  // the mixer's rate with nothing digital running
+    static constexpr double kAnalogRate = 44100;  // the mixer's rate while an analog input is heard
 
     // The analog inputs, as the ADC's source select numbers the first three.
     enum class Input : unsigned { Line = 0, Aux1 = 1, Mic = 2, Aux2 = 3 };
@@ -127,7 +128,8 @@ private:
     void update_engine();  // starts or stops the frame clock as the registers say
     void tick();
     bool analog_heard() const;  // a live input the output mixer passes
-    void mix(unsigned frames, double rate);
+    bool loopback_heard() const;  // the loopback on with an input it hears
+    void mix(unsigned frames, double mixer, unsigned samples);
     void play(unsigned frames);
     void capture(unsigned frames);
     void count(u16& counter, u16 base, unsigned frames, u8 flag);
@@ -146,7 +148,8 @@ private:
     u16 play_count_ = 0, capture_count_ = 0;
     bool engine_on_ = false;
     u64 last_ = 0;           // the guest time frames were last moved to
-    double frame_debt_ = 0;  // part of a frame due but not yet moved
+    double frame_debt_ = 0;  // part of a mixer frame due but not yet moved
+    double digital_debt_ = 0;  // part of a sample period due
     std::array<s16, 2> last_frame_{};
     // IMA ADPCM state per channel, and a byte's second sample waiting
     struct Adpcm {
@@ -159,6 +162,8 @@ private:
     std::vector<u8> bytes_;        // scratch
     std::vector<s16> out_;         // the DAC's samples (stereo), then the output
     std::vector<double> adc_;      // what the ADC samples (stereo)
+    std::vector<double> analog_, mixed_;  // the analog inputs' sum, and the mixer's output
+    std::array<double, 2> adc_last_{};    // the ADC's last sample
     std::array<std::vector<s16>, 4> in_;  // each input's frames this block
     std::array<InputSource, 4> inputs_;
     std::array<bool, 4> live_{};

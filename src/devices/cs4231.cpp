@@ -123,6 +123,7 @@ void Cs4231::reset() {
     timer_.cancel();
     calibrate_.cancel();
     engine_on_ = false;
+    adc_last_ = {};
     update_irq();
 }
 
@@ -275,8 +276,9 @@ void Cs4231::write_indexed(unsigned i, u8 v) {
             update_irq();
             return;
         case kLeftAux1: case kRightAux1: case kLeftAux2: case kRightAux2: case kLeftLine: case kRightLine:
+        case kLeftInput: case kRightInput: case kLoopback:
             regs_[i] = v;
-            update_engine();  // a live input unmuted or muted
+            update_engine();  // a live input unmuted or muted, or looped back
             return;
         default: regs_[i] = v; return;
     }
@@ -300,122 +302,183 @@ void Cs4231::timer_restart() {
     timer_.schedule_in(static_cast<u64>(count / kTimerHz * cpu_hz_) + 1);
 }
 
+// Whether the loopback runs with something to loop: it freeruns at the
+// sample rate whether or not playback or capture is on.
+bool Cs4231::loopback_heard() const {
+    if (!(regs_[kLoopback] & kLoopbackEnable)) return false;
+    for (unsigned c = 0; c < 2; ++c) {
+        const unsigned source = regs_[c ? kRightInput : kLeftInput] >> 6;
+        if (source == 3 ? analog_heard() : live_[source]) return true;
+    }
+    return false;
+}
+
 void Cs4231::update_engine() {
-    const bool on = playing() || capturing() || analog_heard();
+    const bool on = playing() || capturing() || analog_heard() || loopback_heard();
     if (on == engine_on_) return;
     engine_on_ = on;
     if (on) {
         last_ = sched_.now();
-        frame_debt_ = 0;
+        frame_debt_ = digital_debt_ = 0;
         frame_timer_.schedule_in(1);
     } else {
         frame_timer_.cancel();
     }
 }
 
+// The codec runs two clocks: the sample rate (the DAC, the ADC and the
+// loopback, and the counters) and the output mixer's, which is analog on
+// the chip. The mixer is taken at the sample rate when no analog input is
+// heard, else at 44.1 kHz (or the sample rate, if higher), so an input is
+// not cut to half a low sample rate on its way to the output.
 void Cs4231::tick() {
     if (!engine_on_) return;
     const u64 now = sched_.now();
-    const bool digital = playing() || capturing();
-    const double rate = digital ? sample_rate(regs_[kPlayFormat]) : kAnalogRate;
-    const double due = static_cast<double>(now - last_) / cpu_hz_ * rate + frame_debt_;
+    const bool digital = playing() || capturing() || loopback_heard();
+    const double rate = sample_rate(regs_[kPlayFormat]);
+    const double mixer = analog_heard() ? std::max(kAnalogRate, digital ? rate : 0.0) : rate;
+    const double seconds = static_cast<double>(now - last_) / cpu_hz_;
     last_ = now;
+    const double due = seconds * mixer + frame_debt_;
     const unsigned frames = static_cast<unsigned>(due);
     frame_debt_ = due - frames;
-    if (frames) mix(frames, rate);
-    // The next block: a millisecond's frames, or fewer to reach a counter's
-    // end on time when its interrupt is enabled and not already raised.
+    unsigned samples = 0;
+    if (digital) {
+        const double d = seconds * rate + digital_debt_;
+        samples = static_cast<unsigned>(d);
+        digital_debt_ = d - samples;
+    }
+    if (frames || samples) mix(frames, mixer, samples);
+    // The next block: a millisecond's frames, or fewer samples to reach a
+    // counter's end on time when its interrupt is enabled and not already
+    // raised.
+    if (!digital) {
+        const unsigned next = std::max(1u, static_cast<unsigned>(mixer * kBlockSeconds));
+        frame_timer_.schedule_in(static_cast<u64>((next - frame_debt_) / mixer * cpu_hz_) + 1);
+        return;
+    }
     unsigned next = std::max(1u, static_cast<unsigned>(rate * kBlockSeconds));
     const bool watched = regs_[kPinControl] & kIen;
     if (playing() && watched && !(regs_[kAltStatus] & kPi)) next = std::min(next, play_count_ + 1u);
     if (capturing() && watched && !(regs_[kAltStatus] & kCi)) next = std::min(next, capture_count_ + 1u);
-    frame_timer_.schedule_in(static_cast<u64>((next - frame_debt_) / rate * cpu_hz_) + 1);
+    frame_timer_.schedule_in(static_cast<u64>((next - digital_debt_) / rate * cpu_hz_) + 1);
 }
 
-// One block of frames through the codec: the inputs and the DAC into the
-// output mixer, an input (or the mix) into the ADC.
-void Cs4231::mix(unsigned frames, double rate) {
+// One block through the codec: `frames` of the output mixer at `mixer` Hz
+// and, over the same time, `samples` sample periods of the DAC, the ADC
+// and the loopback. Each sample period spans a run of the mixer's frames:
+// the DAC's sample is held through it, and the ADC takes the mean of its
+// input over it. With the mixer's output as the ADC's source, the
+// loopback takes the ADC's previous sample.
+void Cs4231::mix(unsigned frames, double mixer, unsigned samples) {
     const std::size_t n = std::size_t{frames} * 2;
     // Each input's frames, fetched when first wanted.
     std::array<bool, 4> fetched{};
-    auto input = [&](Input which) -> const std::vector<s16>& {
-        const unsigned i = static_cast<unsigned>(which);
+    auto input = [&](unsigned i) -> const std::vector<s16>& {
         if (!fetched[i]) {
             fetched[i] = true;
             in_[i].assign(n, 0);
-            if (live_[i] && inputs_[i]) inputs_[i](in_[i].data(), frames, rate);
+            if (live_[i] && inputs_[i] && frames) inputs_[i](in_[i].data(), frames, mixer);
         }
         return in_[i];
     };
 
-    // The ADC: its source and gain per channel (the mixer's output, source
-    // 3, is filled in below).
-    const bool capture_on = capturing();
-    adc_.assign(n, 0.0);
-    bool adc_from_mix = false;
-    for (unsigned c = 0; c < 2; ++c) {
-        const u8 control = regs_[c ? kRightInput : kLeftInput];
-        const unsigned source = control >> 6;
-        if (source == 3) {
-            adc_from_mix = true;
-            continue;
-        }
-        if (!capture_on && !(regs_[kLoopback] & kLoopbackEnable)) continue;
-        double gain = db_steps(control & 0x0F);
-        if (source == static_cast<unsigned>(Input::Mic) && (control & kMicGain)) gain *= 10.0;  // +20 dB
-        const std::vector<s16>& x = input(static_cast<Input>(source));
-        for (unsigned f = 0; f < frames; ++f) adc_[f * 2 + c] = x[f * 2 + c] * gain;
-    }
-
-    // The DAC, with the ADC's loopback mixed in before its attenuation.
-    out_.assign(n, 0);
-    const bool dac_on = playing();
-    if (dac_on) play(frames);
-    std::vector<double> mixed(n, 0.0);
-    const u8 loop = regs_[kLoopback];
-    const double loop_gain = (loop & kLoopbackEnable) ? db_steps(-(loop >> 2)) : 0.0;
-    for (unsigned c = 0; c < 2; ++c) {
-        const u8 att = regs_[c ? kRightOut : kLeftOut];
-        if (att & 0x80) continue;  // muted
-        const double gain = db_steps(-(att & 0x3F));
-        const bool loop_this = loop_gain > 0 && (regs_[c ? kRightInput : kLeftInput] >> 6) != 3;
-        for (unsigned f = 0; f < frames; ++f) {
-            double v = dac_on ? out_[f * 2 + c] : 0.0;
-            if (loop_this) v += adc_[f * 2 + c] * loop_gain;
-            mixed[f * 2 + c] = v * gain;
-        }
-    }
     // The analog inputs the mixer passes: LINE, AUX1, AUX2.
+    analog_.assign(n, 0.0);
     static constexpr struct {
         Input in;
         unsigned left;
     } kMixed[] = {{Input::Line, kLeftLine}, {Input::Aux1, kLeftAux1}, {Input::Aux2, kLeftAux2}};
     for (const auto& m : kMixed) {
-        if (!live_[static_cast<unsigned>(m.in)]) continue;
+        const unsigned i = static_cast<unsigned>(m.in);
+        if (!live_[i]) continue;
         for (unsigned c = 0; c < 2; ++c) {
             const u8 control = regs_[m.left + c];
             if (control & kInputMute) continue;
             const double gain = db_steps(8 - (control & 0x1F));  // 01000: 0 dB
-            const std::vector<s16>& x = input(m.in);
-            for (unsigned f = 0; f < frames; ++f) mixed[f * 2 + c] += x[f * 2 + c] * gain;
+            const std::vector<s16>& x = input(i);
+            for (unsigned f = 0; f < frames; ++f) analog_[f * 2 + c] += x[f * 2 + c] * gain;
         }
     }
-    if (adc_from_mix)
-        for (unsigned c = 0; c < 2; ++c) {
-            const u8 control = regs_[c ? kRightInput : kLeftInput];
-            if ((control >> 6) != 3) continue;
-            const double gain = db_steps(control & 0x0F);
-            for (unsigned f = 0; f < frames; ++f) adc_[f * 2 + c] = mixed[f * 2 + c] * gain;
-        }
-    if (capture_on) capture(frames);
 
-    if (!sink_ || (!dac_on && !analog_heard())) return;
+    // The ADC's source and gain per channel.
+    std::array<unsigned, 2> source{};
+    std::array<double, 2> in_gain{};
+    for (unsigned c = 0; c < 2; ++c) {
+        const u8 control = regs_[c ? kRightInput : kLeftInput];
+        source[c] = control >> 6;
+        in_gain[c] = db_steps(control & 0x0F);
+        if (source[c] == static_cast<unsigned>(Input::Mic) && (control & kMicGain)) in_gain[c] *= 10.0;  // +20 dB
+        if (source[c] != 3 && samples) input(source[c]);
+    }
+    // The loopback: the ADC's data, attenuated, summed with the DAC's data
+    // (clipped at full scale) before the DAC's attenuation. A mono capture
+    // format loops its one channel (the left) into both.
+    const u8 loop = regs_[kLoopback];
+    const double loop_gain = (loop & kLoopbackEnable) ? db_steps(-(loop >> 2)) : 0.0;
+    const bool mono_capture = !(capture_format() & kStereo);
+    std::array<double, 2> out_gain{};
+    for (unsigned c = 0; c < 2; ++c) {
+        const u8 att = regs_[c ? kRightOut : kLeftOut];
+        out_gain[c] = (att & 0x80) ? 0.0 : db_steps(-(att & 0x3F));
+    }
+
+    const bool dac_on = playing(), capture_on = capturing();
+    out_.assign(std::size_t{samples} * 2, 0);
+    if (dac_on && samples) play(samples);
+    adc_.assign(std::size_t{samples} * 2, 0.0);
+    mixed_.assign(n, 0.0);
+    std::array<double, 2> held{};  // the DAC's output this sample period
+    for (unsigned k = 0, f = 0; k < samples || f < frames; ++k) {
+        // The mixer's frames this sample period spans (all of them when
+        // nothing digital runs).
+        const unsigned end = samples ? static_cast<unsigned>(u64{k + 1} * frames / samples) : frames;
+        if (k < samples) {
+            // The ADC's samples taken from the inputs over the span.
+            for (unsigned c = 0; c < 2; ++c) {
+                if (source[c] == 3) continue;
+                const std::vector<s16>& x = in_[source[c]];
+                if (end > f) {
+                    double sum = 0;
+                    for (unsigned g = f; g < end; ++g) sum += x[g * 2 + c];
+                    adc_last_[c] = sum / (end - f) * in_gain[c];
+                } else if (frames) {
+                    adc_last_[c] = x[std::min(f, frames - 1) * 2 + c] * in_gain[c];
+                }
+                adc_[k * 2 + c] = adc_last_[c];
+            }
+            for (unsigned c = 0; c < 2; ++c) {
+                double v = dac_on ? out_[k * 2 + c] : 0.0;
+                if (loop_gain > 0) v += adc_last_[mono_capture ? 0 : c] * loop_gain;
+                held[c] = std::clamp(v, -32768.0, 32767.0) * out_gain[c];
+            }
+        }
+        std::array<double, 2> sum{};
+        for (unsigned g = f; g < end; ++g)
+            for (unsigned c = 0; c < 2; ++c) {
+                const double m = held[c] + analog_[g * 2 + c];
+                mixed_[g * 2 + c] = m;
+                sum[c] += m;
+            }
+        if (k < samples)
+            for (unsigned c = 0; c < 2; ++c) {
+                if (source[c] != 3) continue;
+                if (end > f) adc_last_[c] = sum[c] / (end - f) * in_gain[c];
+                adc_[k * 2 + c] = adc_last_[c];
+            }
+        f = end;
+        if (!samples) break;
+    }
+    if (capture_on && samples) capture(samples);
+
+    if (!sink_ || !frames || (!dac_on && !analog_heard() && !loopback_heard())) return;
     // Nothing is heard with the speaker, line and headphone outputs all off.
     const bool heard = !(regs_[kMonoControl] & kMonoMute) || !(regs_[kPinControl] & kXctl0) ||
                        !(regs_[kPinControl] & kXctl1);
+    out_.resize(n);
     for (std::size_t i = 0; i < n; ++i)
-        out_[i] = heard ? static_cast<s16>(std::lround(std::clamp(mixed[i], -32768.0, 32767.0))) : s16{0};
-    sink_(out_.data(), frames, static_cast<unsigned>(std::lround(rate)));
+        out_[i] = heard ? static_cast<s16>(std::lround(std::clamp(mixed_[i], -32768.0, 32767.0))) : s16{0};
+    sink_(out_.data(), frames, static_cast<unsigned>(std::lround(mixer)));
 }
 
 // Counts `frames` sample periods off a counter: each time it passes zero,

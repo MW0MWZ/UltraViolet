@@ -168,13 +168,17 @@ headerless
 : en+x ( xdr,len x -- xdr',len' )  xlsplit swap >r en+ r> en+  ;
 
 : make-sabre-properties ( -- )
+   \ In the order an Ultra 10 makes them (its .properties lists them newest
+   \ first); "available" made empty here, set by make-sabre-available once
+   \ the bus is probed, so that the probe's "bus-range" comes after it.
    " pci" name
    " pci" device-type
-   " SUNW,sabre" model
-   " pci108e,a000" encode-string " pciclass,0" encode-string encode+
-   " compatible" property
    3 " #address-cells" integer-property
    2 " #size-cells" integer-property
+   " bus-parity-generated"	boolean-property
+   " pci108e,a000" encode-string " pciclass,0" encode-string encode+
+   " compatible" property
+   " SUNW,sabre" model
 
    0 0 encode-bytes
       sabre-pa.hi en+ 0 en+ 0 en+ h# 1.0000 en+
@@ -188,26 +192,23 @@ headerless
       h# 0300.0000 en+ 0 en+ 0 en+  sabre-pa mem-base + en+x  mem-size en+x
    " ranges" property
 
-   upa-portid " upa-portid" integer-property
    0 0 encode-bytes
       ign h# 30 + en+				\ PCI bus error
       ign h# 2e + en+				\ DMA uncorrectable error
       ign h# 2f + en+				\ DMA correctable error
       ign h# 25 + en+				\ Power button
    " interrupts" property
-   d# 66000000 " clock-frequency" integer-property
-
    " 66mhz-capable"		boolean-property
-   " bus-parity-generated"	boolean-property
+   upa-portid " upa-portid" integer-property
+   d# 66000000 " clock-frequency" integer-property
    " no-streaming-cache"	boolean-property
    " button-interrupt"		boolean-property
-   " latency-timer"		boolean-property
-
-   virtual-dma-base encode-int virtual-dma-size en+ " virtual-dma" property
-   1 " #virtual-dma-size-cells" integer-property
-   1 " #virtual-dma-addr-cells" integer-property
-
    sabre-regs encode-int  cfg-page0 en+  " address" property
+   " latency-timer"		boolean-property
+   1 " #virtual-dma-addr-cells" integer-property
+   1 " #virtual-dma-size-cells" integer-property
+   virtual-dma-base encode-int virtual-dma-size en+ " virtual-dma" property
+   0 0 encode-bytes " available" property
 ;
 
 \ Map-ins of the PCI spaces (for obp/dev/pci/map.fth)

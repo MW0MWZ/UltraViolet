@@ -71,6 +71,7 @@ Ultra5_10::Options Settings::options() const {
     o.nvram_path = nvram;
     o.disk_path = disk;
     o.cdrom_path = cdroms.empty() ? std::string() : cdroms.front();
+    o.floppy_path = floppy;
     o.mac = mac;
     o.timing = timing;
     o.fast_disk = fast_disk;
@@ -166,6 +167,7 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
     else if (key == "nvram") s.nvram = v;
     else if (key == "disk") s.disk = v;
     else if (key == "cdrom") s.cdroms.push_back(v);
+    else if (key == "floppy") s.floppy = v;
     else if (key == "ram_mb") ok = parse_number(v, n) && n >= 1 && n <= 1024 && n == static_cast<unsigned>(n) &&
                                   (s.ram_mb = static_cast<unsigned>(n), true);  // checked at power-on
     else if (key == "cpu_mhz") ok = parse_number(v, n) && n >= 10 && n <= 2000 && (s.cpu_mhz = n, true);
@@ -276,6 +278,7 @@ bool save_settings(const std::string& path, const Settings& s, std::string& erro
         f << "# UltraViolet settings\n";
         f << "prom=" << s.prom << "\nprom_dir=" << s.prom_dir << "\nnvram=" << s.nvram << "\ndisk=" << s.disk << "\n";
         for (const auto& c : s.cdroms) f << "cdrom=" << c << "\n";
+        f << "floppy=" << s.floppy << "\n";
         f << "ram_mb=" << s.ram_mb << "\ncpu_mhz=" << s.cpu_mhz << "\necache_kb=" << s.ecache_kb
           << "\nupa=" << s.upa << "\ncreator3d_fcode=" << s.creator3d_fcode << "\nresolution=" << s.resolution << "\nconsole=" << s.console << "\nkeyboard=" << s.keyboard << "\nmac=" << (s.mac ? mac_text(*s.mac) : "")
           << "\nnet=" << s.net << "\n";

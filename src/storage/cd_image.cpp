@@ -166,6 +166,7 @@ bool CdImage::open_cue(const std::string& path) {
     struct Sheet {
         Track t;
         long index0 = -1, index1 = -1, pregap = 0, postgap = 0;
+        std::vector<long> later;  // index 2 onward
     };
     std::vector<Sheet> sheet;
     int file = -1;
@@ -229,9 +230,12 @@ bool CdImage::open_cue(const std::string& path) {
             if (sheet.empty() || !(l >> n >> at)) return bad("bad INDEX");
             const long v = parse_msf(at);
             if (v < 0) return bad("bad time " + at);
-            if (n == 0) sheet.back().index0 = v;
-            else if (n == 1) sheet.back().index1 = v;
-            // (indexes above 1 divide a track for players; nothing here uses them)
+            Sheet& s = sheet.back();
+            if (n == 0) s.index0 = v;
+            else if (n == 1) s.index1 = v;
+            else if (n > 99 || n != s.later.size() + 2 || v <= (s.later.empty() ? s.index1 : s.later.back()))
+                return bad("index " + std::to_string(n) + " out of order");
+            else s.later.push_back(v);
         } else if (word == "PREGAP" || word == "POSTGAP") {
             std::string at;
             if (sheet.empty() || !(l >> at) || parse_msf(at) < 0) return bad("bad " + word);
@@ -306,6 +310,7 @@ bool CdImage::open_cue(const std::string& path) {
             t.first = cursor;
         }
         t.start = static_cast<u32>(t.first + in_file_pregap);
+        for (long v : s.later) t.indexes.push_back(static_cast<u32>(t.first + (v - first)));
         cursor = t.first + t.count + s.postgap;
         t.end = static_cast<u32>(std::max<s64>(cursor, t.start));
         if (t.end > 0x7FFFFFFF) return bad("the disc is too long");
@@ -354,8 +359,14 @@ bool CdImage::read_raw(u32 lba, u8* out) {
     }
     const u8 mode = t->type == TrackType::Mode2 ? 2 : 1;
     if (!held) {
-        // A gap not in the file: zero data (mode 2: form 1 subheaders of 0).
+        // A gap not in the file: a pregap's zero data in the track's mode
+        // (mode 2: form 1 subheaders of 0), a post-gap's mode 0 (ECMA-130:
+        // all zero after the header).
         std::memset(out, 0, kRawSector);
+        if (t->postgap(lba)) {
+            cd_sync_header(out, lba, 0);
+            return true;
+        }
         cd_sync_header(out, lba, mode);
         if (mode == 1) cd_mode1_ecc(out);
         return true;

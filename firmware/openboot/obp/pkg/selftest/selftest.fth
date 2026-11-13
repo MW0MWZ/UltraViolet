@@ -68,7 +68,9 @@ headers
 : test ( -- ) \ device-specifier
    false optional-arg$				( silent? path$ )
    ?dup if					( silent? path$ )
+[ifndef] Ultra5_10
       .testing					( silent? path$ )
+[then]
       (test-dev) drop				( )
    else						( silent? adr )
       2drop					( )

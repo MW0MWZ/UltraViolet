@@ -1,7 +1,7 @@
 \ Copyright (C) 2026 Andy Taylor. Distributed under the same terms as the
 \ OpenBoot release it is part of (see LICENSE).
 id: @(#)su.tok 1.0 26/11/07
-purpose: The SuperIO's UARTs: the keyboard and mouse ports (su)
+purpose: The SuperIO's UART for the mouse (su@14,3062f8)
 copyright: Copyright 2026 Andy Taylor
 
 \ The release's serial driver (dev/southbridge/isa-devices/serial) for the
@@ -20,9 +20,11 @@ my-address      constant tty-base
 
 : en+ ( xdr,len int -- xdr',len' ) encode-int encode+ ;
 
+\ (The mouse's port: its properties in an Ultra 10's order)
 my-space encode-int  tty-base en+  tty-size en+  " reg" property
-1 encode-int " interrupts" property
+0 0 " mouse" property
 0 0 " port-a-ignore-cd" property
+1 encode-int " interrupts" property
 
 : default-tty-mode     " 1200,8,n,1,-" ;
 defer default-ttya-mode

@@ -173,7 +173,13 @@ B in master-abort mode). `post.fth` takes its result, and the board descriptor
 (0002.3333.0200.001b after a passing run, as an Ultra 10's, also kept in
 the NVRAM at 1d58). The
 selftests (`test`, `test-all`) of the Rage Pro, the Ethernet and the
-floppy drive are in their drivers.
+floppy drive are in their drivers. As an Ultra 10's, `test` prints only
+the selftest's own lines, and on a failure a blank line and
+"*device* selftest failed. Return code = *n*"; the Ethernet's transceiver
+check needs a link (with `tpe-link-test?` true). The floppy drive is the
+one the digital output register selects with its motor on (drive 0); the
+driver's blocks are whole cylinders (18 KB, both heads' tracks, read and
+written in one multi-track command each), as the Ultra 10's are.
 
 They are built on the release's PCI, serial, keyboard and network code
 (`obp/dev/pci`, `obp/dev/serial`, `obp/dev/usb-devices/kbd`,
@@ -327,7 +333,12 @@ The release's own files are unchanged, but for:
   last, `assigned-addresses` made from them, and its command register
   cleared (its driver turns it on as it opens). Expansion ROMs keep no space.
   Devices' cache line size and latency timer are left as reset and made no
-  properties, and bridges get no `available`.
+  properties, and bridges get no `available`. A device's properties are
+  made in the order an Ultra 10's are (`.properties` lists them newest
+  first): those of its configuration header (vendor-id, device-id,
+  revision-id, subsystem-id, subsystem-vendor-id, min-grant, max-latency,
+  interrupts, class-code, devsel-speed, fast-back-to-back, 66mhz-capable)
+  before its driver's, but a bridge's and the EBus's after their drivers'.
 - `obp/os/bootprom/initdict.fth` and `obp/arch/sun4u/retained.fth`: a
   system may set the dictionary's growth step and the retained page's
   alignment (the Ultra 5/10's: a page, and 1 MiB).
@@ -347,6 +358,29 @@ The release's own files are unchanged, but for:
 - `obp/fm/kernel/fileio.fth`: an error at the end of a string being
   evaluated shows the string ("Evaluating: boot"); the line was looked for
   from one past its end, and shown empty.
+- `obp/os/bootprom/testdevt.fth` and `obp/dev/pci/knownprops.fth`: on the
+  Ultra 5/10, `.properties` shows values as an Ultra 10 shows them. The
+  integer properties it knows by name (with `#address-cells`,
+  `#size-cells`, `#interrupt-cells`, `upa-portid`, `scsi-initiator-id`,
+  `translations` six to a line and the interrupt maps a row to a line, but
+  not `cache-line-size` or `latency-timer`) are shown as integers; any
+  other value of eight bytes as two integers, one to a line; a single
+  printable string, with or without its null, as text; anything else,
+  composite strings and four-byte values included, as hex bytes, at most
+  16 and nothing after them. Its pager stops only between properties.
+- `obp/os/bootprom/finddev.fth`: on the Ultra 5/10 a search for a node by
+  unit address ends as an Ultra 10's does. Gone down into the children of
+  the nodes it did not find it among, it stops at `/openprom` or
+  `/packages` (support nodes with children and no `decode-unit`) with
+  "Package method not found" (`cd /memory@0,0`); searched for directly
+  (`/openprom/foo@0`), such a node, or a node whose `decode-unit` cannot
+  read the address (the root's with no port ID, `@,0`), is where it ends,
+  with no message.
+- On the Ultra 5/10 the data stack is emptied after an error at the ok
+  prompt, but for an undefined word, as an Ultra 10 empties it (the
+  release's interpreter, `obp/fm/kernel/ansio.fth`, keeps it; the
+  platform's `loadprom.fth` patches it, the kernel being built for every
+  system).
 
 ## Credits
 

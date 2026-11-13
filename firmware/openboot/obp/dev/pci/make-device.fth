@@ -117,9 +117,22 @@ fload ${BP}/dev/pci/fcode-rom.fth
    >r >r r@  1 byte-load  r> r> free-mem
 ;
 
+[ifdef] Ultra5_10
+\ An Ultra 10 makes a PCI-PCI bridge's and the EBus's own properties first
+\ and the configuration header's after them (a bridge's driver makes those
+\ itself where they come among its own, dev/pci-bridge/simba/simba.fth;
+\ made again here, in place); any other device's, the header's first.
+: ebus? ( -- flag )  vid,did h# 1000 = swap h# 108e = and  ;
+: header-last? ( -- flag )  bridge? ebus? or  ;
+[then]
+
 : populate-device-node  ( -- )
    pcie-capability-regs 0<> to pci-express?
+[ifdef] Ultra5_10
+   header-last? 0=  if  pci-make-function-properties  then
+[else]
    pci-make-function-properties
+[then]
 [ifdef] Ultra5_10
    \ Each device's temporary addresses from its bus's base; a bridge's own
    \ BARs (an APB has none) not probed.
@@ -138,7 +151,8 @@ fload ${BP}/dev/pci/fcode-rom.fth
       then					( flag )
    then						( flag )
 [ifdef] Ultra5_10
-   drop  bridge? 0=  if  final-assign  then
+   drop  header-last?  if  pci-make-function-properties  then
+   bridge? 0=  if  final-assign  then
 [else]
    make-assigned-property			( )
    

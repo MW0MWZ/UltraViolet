@@ -46,6 +46,7 @@ private:
         unsigned xcount = 0;        // bytes written to the XFIFO since the last XF
         std::deque<u8> sending;     // bytes being shifted out
         unsigned released = 0;      // bytes of the block offered by the last RPF/TCD/TIME not yet read
+        bool block = false;         // a block offered and not yet acknowledged by RMC (the next waits for it)
         u8 mode = 0, timr = 0, xon = 0x11, xoff = 0x13, tcr = 0, dafo = 0, rfc = 0;
         u8 ccr0 = 0, ccr1 = 0, ccr2 = 0, ccr3 = 0, ccr4 = 0, bgr = 0, tic = 0, mxn = 0, mxf = 0;
         u8 tsax = 0, tsar = 0, xccr = 0, rccr = 0, xbcl = 0, xbch = 0;

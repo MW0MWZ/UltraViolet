@@ -40,8 +40,14 @@ h# 10.0000 constant /upa-gfx-prom
 
 \ The UPA graphics' interrupt goes to the Sabre (its graphics mapping
 \ register, interrupt number 33), as the root's interrupt map says.
+\ (rootnexus.fth made the three in an Ultra 10's order; set in place here.)
 : make-root-interrupt-map ( -- )
-   " /pci@1f,0" find-package 0= if  exit  then		( sabre )
+   " /pci@1f,0" find-package 0= if
+      root-device
+         " interrupt-map" delete-property  " interrupt-map-mask" delete-property
+         " #interrupt-cells" delete-property
+      device-end  exit
+   then							( sabre )
    root-device
       h# 3c encode-int 0 encode-int encode+ 0 encode-int encode+
       rot encode-int encode+  h# 8000.0033 encode-int encode+

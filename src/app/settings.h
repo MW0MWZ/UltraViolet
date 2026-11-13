@@ -24,6 +24,7 @@ struct Settings {
     std::string prom_dir;  // folder of flash PROM images; empty: see prom_folder()
     std::string nvram, disk;
     std::vector<std::string> cdroms;  // a set of discs: the first in the drive at power-on
+    std::string floppy;               // the floppy disk in the drive (an image); empty: none
     unsigned ram_mb = 256;
     double cpu_mhz = 440;
     unsigned ecache_kb = 2048;

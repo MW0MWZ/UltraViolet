@@ -108,16 +108,9 @@ headerless
 
 fload ${BP}/arch/sun4u/config/console.fth
 
-\ The root's scsi-initiator-id property (arch/sun4u/config/scsi-id.fth's,
-\ the variable being here).
-: set-scsi-id-prop ( -- )
-   scsi-initiator-id " scsi-initiator-id"  integer-property
-;
-stand-init: Setting scsi-initiator-id
-   root-device
-      set-scsi-id-prop
-   device-end
-;
+\ No scsi-initiator-id property on the root (arch/sun4u/config/scsi-id.fth
+\ makes one): an Ultra 10's root has none; its PCI-PCI bridges carry it
+\ (dev/pci-bridge/simba/simba.fth).
 
 \ Install hook for fcode-debug?
 ' fcode-debug?  to (fcode-debug?)

@@ -101,9 +101,14 @@ h# 100  buffer: error-buffer
       "selftest" my-voc (search-wordlist) 0= if	( silent? )
          drop true has-no-selftest		( status throw-code )
       else					( silent? acf )
+[ifdef] Ultra5_10
+         \ (The Ultra 10's test names no device: only the selftest's own output)
+         nip                                    ( acf )
+[else]
          swap 0= if                             ( acf )
             error-buffer count .testing 2drop
          then                                   ( acf )
+[then]
          catch				      ( ?? throw-code | status throw=0 )
          mark-as-no-boot
       then					( status throw-code? )
@@ -223,6 +228,13 @@ h# 100  buffer: error-buffer
       true                                      ( fail )
    else                                         ( ?? status ) ( R: not-silent? )
       dup dup set-status-property  if           ( status )
+[ifdef] Ultra5_10
+         \ The Ultra 10's report, whichever way the test was asked for: a
+         \ blank line, then "<device> selftest failed. Return code = <n> ".
+         r> drop                                ( status )
+         cr error-buffer count type space
+         ." selftest failed. Return code = " dup push-decimal . pop-base cr
+[else]
          "  selftest failed, return code = "    ( status $adr,len )
 	 (save-string)                          ( status )
          dup save-signed                        ( status )
@@ -231,6 +243,7 @@ h# 100  buffer: error-buffer
          else                                   ( status )
             abort-selftest-msg                  ( ) 
          then                                   ( status )
+[then]
       else                                      ( status )    ( R: not-silent? )
          r> drop                                ( status )    ( R:  )
       then                                      ( status )

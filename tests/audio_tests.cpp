@@ -307,17 +307,64 @@ TEST(cs4231_mixes_a_live_input_with_nothing_digital_running) {
     const std::size_t had = r.heard.size();
     r.run_for(2e-3);
     CHECK_EQ(r.heard.size(), had);
-    // With the DAC playing at 8 kHz, the input is mixed at that rate on top of it.
+    // With the DAC playing at 8 kHz, the input is still mixed at 44.1 kHz,
+    // each of the DAC's samples held for the mixer's frames it spans.
     r.codec.set_input_live(Cs4231::Input::Aux1, true);
-    std::fill(r.mem.begin(), r.mem.begin() + 64, 0x90);  // 8-bit: +0x1000
+    for (unsigned i = 0; i < 64; ++i) r.mem[i] = (i & 1) ? 0x70 : 0x90;  // 8-bit: +0x1000, -0x1000
     r.dma(r.play, 8, 64);
     r.dma(r.play, 4, 0);
     r.dma(r.play, 0, EbusDma::kEnDma | EbusDma::kEnCnt);
     r.set(Cs4231::kInterface, Cs4231::kPen);
     r.heard.clear();
     r.run_for(2.1e-3);
-    CHECK_EQ(r.rate, 8000u);
-    CHECK(!r.heard.empty() && r.heard[0] == 8000 + 0x1000);
+    CHECK_EQ(r.rate, 44100u);
+    CHECK(r.heard.size() >= 2 * 88);
+    CHECK(r.heard[0] == 8000 + 0x1000);
+    unsigned run = 0, changes = 0;
+    for (std::size_t f = 0; f + 1 < r.heard.size() / 2; ++f) {
+        if (r.heard[(f + 1) * 2] != r.heard[f * 2]) {
+            CHECK(run >= 4 && run <= 6);  // 44100 / 8000 = 5.5 frames a sample
+            run = 0;
+            ++changes;
+        } else {
+            ++run;
+        }
+    }
+    CHECK(changes >= 14 && changes <= 17);  // 2.1 ms at 8 kHz
+}
+
+TEST(cs4231_loopback_is_summed_with_the_dac_and_clipped_a_mono_capture_looped_into_both) {
+    auto run = [](u8 capture_format) {
+        Rig r;
+        r.setup(static_cast<u8>(Cs4231::kLinear16Be << 5 | Cs4231::kStereo));
+        r.set(Cs4231::kCaptureFormat, capture_format, true);
+        r.out(Cs4231::kIndex, 0);
+        static Level line{20000, -5000};
+        r.codec.set_input(Cs4231::Input::Line, line.source());
+        r.codec.set_input_live(Cs4231::Input::Line, true);
+        r.set(Cs4231::kLeftLine, 0x88);  // muted in the mixer: only the loopback hears it
+        r.set(Cs4231::kRightLine, 0x88);
+        r.set(Cs4231::kLeftInput, 0x00);  // the ADC: the line, 0 dB
+        r.set(Cs4231::kRightInput, 0x00);
+        r.set(Cs4231::kLoopback, Cs4231::kLoopbackEnable);  // 0 dB
+        for (unsigned i = 0; i < 64; i += 4) r.mem[i] = 0x4E, r.mem[i + 1] = 0x20, r.mem[i + 2] = r.mem[i + 3] = 0;
+        r.dma(r.play, 8, 64);
+        r.dma(r.play, 4, 0);
+        r.dma(r.play, 0, EbusDma::kEnDma | EbusDma::kEnCnt);
+        r.set(Cs4231::kInterface, Cs4231::kPen);
+        r.run_for(1.1e-3);
+        CHECK_EQ(r.rate, 8000u);
+        CHECK(r.heard.size() >= 2);
+        return std::pair{r.heard[0], r.heard[1]};
+    };
+    // 20000 + 20000 clips at full scale; the right channel loops its own input.
+    auto [l, rr] = run(static_cast<u8>(Cs4231::kLinear16Be << 5 | Cs4231::kStereo));
+    CHECK_EQ(l, 32767);
+    CHECK_EQ(rr, -5000);
+    // A mono capture format: the left channel's data into both.
+    auto [ml, mr] = run(static_cast<u8>(Cs4231::kLinear16Be << 5));
+    CHECK_EQ(ml, 32767);
+    CHECK_EQ(mr, 20000);
 }
 
 TEST(cs4231_captures_the_selected_input_in_the_capture_format) {

@@ -33,7 +33,7 @@ src/mem/             physical address space: the 41-bit UltraSPARC IIi PA,
 src/cpu/ultrasparc/  UltraSPARC IIi: interpreter, MMU and ASIs, FPU and VIS,
                      disassembler
 src/devices/         PCI framework; Sabre, Simba, RIO EBus; M48T59, 16550,
-                     SAB82532, 82077 floppy controller, SuperIO configuration,
+                     SAB82532, 82077 floppy controller and drive, SuperIO configuration,
                      flash PROM; ATA channel and bus master, ATA disk, ATAPI
                      CD-ROM, CMD646
 src/storage/         disk and CD image files

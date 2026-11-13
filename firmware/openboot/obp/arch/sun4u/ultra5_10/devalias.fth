@@ -17,19 +17,20 @@ headerless
    " /pci@1f,0/pci@1,1/ide@3" "temp pack >r  r@ $cat  r> count  $devalias
 ;
 
+\ In the order an Ultra 10 makes them (its devalias lists them newest first).
 stand-init: Add devaliases
-   " ttya"	" se:a"				ebus-alias
-   " ttyb"	" se:b"				ebus-alias
+   " mouse"	" su@14,3062f8"			ebus-alias
    " keyboard"	" su@14,3083f8"			ebus-alias
    " keyboard!"	" su@14,3083f8:forcemode"	ebus-alias
-   " mouse"	" su@14,3062f8"			ebus-alias
+   " ttya"	" se:a"				ebus-alias
+   " ttyb"	" se:b"				ebus-alias
    " floppy"	" fdthree"			ebus-alias
    " ide"	" "				ide-alias
-   " disk"	" /disk@0,0"			ide-alias
    " disk0"	" /disk@0,0"			ide-alias
    " disk1"	" /disk@1,0"			ide-alias
    " disk2"	" /disk@2,0"			ide-alias
    " disk3"	" /disk@3,0"			ide-alias
+   " disk"	" /disk@0,0"			ide-alias
    " cdrom"	" /cdrom@2,0:f"			ide-alias
    " net"	" /pci@1f,0/pci@1,1/network@1,1" $devalias
 ;
