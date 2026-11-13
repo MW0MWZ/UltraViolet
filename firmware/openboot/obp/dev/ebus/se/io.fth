@@ -26,16 +26,14 @@ variable ttylock
    ubuf ubufsize + is endptr
 ;
 
-: bput	( key -- )
-   putptr endptr >= if  ubuf is putptr  then
-   putptr c! putptr 1+ is putptr
-;
+: unext  ( ptr -- ptr' )  1+ dup endptr >=  if  drop ubuf  then  ;
+: bput	( key -- )  putptr c!  putptr unext is putptr  ;
 : bputclr  ( -- )  getptr is putptr  ;
-: bget	( -- key )
-   getptr endptr >= if  ubuf is getptr  then
-   getptr c@ getptr 1+ is getptr
-;
+: bget	( -- key )  getptr c@  getptr unext is getptr  ;
 : ubuf-empty? 	( -- flag )  getptr putptr =  ;
+\ Full with one place free: characters wait in the receive FIFO (and on
+\ the line) until there is room, not overwriting those not yet read.
+: ubuf-full?  ( -- flag )  putptr unext getptr =  ;
 
 headerless
 : usea  ( -- )  uartbase to uart  ;
@@ -104,7 +102,7 @@ variable isr1-shadow
 
 : uread  ( -- )
    ttylock on
-   begin  (ukey?)  while  (ukey) bput  repeat
+   begin  ubuf-full? 0=  (ukey?) and  while  (ukey) bput  repeat
    ttylock off
 ;
 

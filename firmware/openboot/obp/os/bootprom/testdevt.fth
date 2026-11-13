@@ -39,6 +39,9 @@
 \ any nuclear facility. 
 \ 
 \ ========== Copyright Header End ============================================
+\ Adapted by Andy Taylor, 2026: on the Ultra 5/10 (Ultra5_10) .properties
+\ shows values as an Ultra 10's does, and its pager stops only between
+\ properties.
 id: @(#)testdevt.fth 2.43 05/02/03
 purpose:
 copyright: Copyright 2005 Sun Microsystems, Inc.  All Rights Reserved
@@ -128,7 +131,11 @@ previous
 
 : .ints  ( adr len #ints/line  -- exited? )
    >r begin  dup 0>  while	( adr len )
+[ifndef] Ultra5_10
+      \ (The Ultra 5/10's pager stops only between properties, as an
+      \ Ultra 10's: .properties's own exit?.)
       exit?  if  r> 3drop true  exit  then 	
+[then]
       to-display-column		( adr len )
       r@  0  do			( adr len  )  
          decode-int 8.x		( adr'len' ) 
@@ -162,6 +169,7 @@ previous
 
 : size+  ( #cells -- #cells+#size-cells )  parent-#size-cells +  ;
 
+[ifndef] Ultra5_10
 headers
 vocabulary known-int-properties
 also known-int-properties definitions
@@ -196,6 +204,75 @@ headerless
    h# 10 >  if ." ..."  then                 ( )
    false				     ( exited? )  
 ;
+
+[else]
+\ The Ultra 5/10's display: the integer properties known by name (these
+\ and the PCI ones of knownprops.fth), a row of cells to a line; any
+\ other value of two cells as two integers, one to a line; a single
+\ string of printable bytes (with or without a final null) as text,
+\ however short; anything else as hex bytes, at most 16 and nothing
+\ after them. Composite strings are bytes. A known property's rows end
+\ with its value, a short last row and all.
+
+: my-cells  ( default name$ -- n )  get-property 0=  if  get-encoded-int nip  then  ;
+
+headers
+vocabulary known-int-properties
+also known-int-properties definitions
+
+: available        ( -- n )  '#adr-cells @ size+  ;
+: reg              ( -- n )  '#adr-cells @ size+  ;
+: existing         ( -- n )  '#adr-cells @ size+  ;
+: ranges           ( -- n )  '#adr-cells @  #adr-cells + my-#size-cells +  ;
+: interrupt-map-mask  ( -- n )  #adr-cells  1 " #interrupt-cells" my-cells +  ;
+\ A unit's address and interrupt, the interrupt parent's phandle and its
+\ interrupt (no parent address, as these maps are built).
+: interrupt-map  ( adr len -- adr len n )
+   interrupt-map-mask >r                         ( adr len )  ( r: ai )
+   dup r@ 1+ /l * <  if  r> 1+ exit  then        ( adr len )
+   over r@ la+ /l decode-int nip nip             ( adr len phandle )
+   current-device >r  push-device
+   1 " #interrupt-cells" my-cells                ( adr len pi )
+   r> push-device  r> + 1+                       ( adr len n )
+;
+: translations     ( -- n )  6  ;
+
+alias address    1 ( -- n )
+alias interrupts 1 ( -- n )
+alias intr       2 ( -- n )
+alias clock-frequency 1 ( -- n )
+alias #address-cells 1 ( -- n )
+alias #size-cells 1 ( -- n )
+alias #interrupt-cells 1 ( -- n )
+alias upa-portid 1 ( -- n )
+alias scsi-initiator-id 1 ( -- n )
+
+previous definitions
+
+headerless
+\ Printable bytes, the last of them perhaps a null.
+: string?  ( adr len -- flag )
+   dup  if  2dup + 1- c@ 0=  if  1-  then  then  ( adr len' )
+   true -rot  bounds  ?do  i c@ char? and  loop
+;
+: display  ( anf prop-addr,len -- exited? )
+   rot  name>string			     ( adr,len  name,len )
+
+   ['] known-int-properties (search-wordlist)  if
+       execute .ints  exit
+   then                                      ( adr,len )
+
+   2dup string?  if                          ( adr,len )
+      to-display-column
+      dup  if  2dup + 1- c@ 0=  if  1-  then  then
+      type false exit
+   then                                      ( adr,len )
+
+   dup 2 /l * =  if  1 .ints exit  then      ( adr,len )
+
+   to-display-column  h# 10 min chdump  false  ( exited? )
+;
+[then]
 
 : .not-devtree ( -- )
    ." Not at a device tree node. Use 'dev <device-pathname>'."

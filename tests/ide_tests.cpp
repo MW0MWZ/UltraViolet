@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andy Taylor
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -560,8 +561,10 @@ TEST(atapi_cdrom_reads_a_disc_of_audio_and_data_tracks_in_two_sessions) {
     r.packet({0x43, 0, 2, 0, 0, 0, 0, 0, 200, 0});
     toc = r.read_all();
     CHECK_EQ(toc.size(), 4u + 11 * (3 + 3) + 11 * (3 + 1));
-    CHECK(toc[4] == 1 && toc[7] == 0xA0 && toc[12] == 1 && toc[13] == 0x20);  // first track 1, CD-ROM XA
-    CHECK(toc[4 + 11 * 6] == 2 && toc[7 + 11 * 6] == 0xA0 && toc[12 + 11 * 6] == 4);
+    // A0: the first track, and the disc type as the session's first track
+    // makes it (mode 1: CD-ROM; mode 2: CD-ROM XA).
+    CHECK(toc[4] == 1 && toc[7] == 0xA0 && toc[12] == 1 && toc[13] == 0x00);
+    CHECK(toc[4 + 11 * 6] == 2 && toc[7 + 11 * 6] == 0xA0 && toc[12 + 11 * 6] == 4 && toc[13 + 11 * 6] == 0x20);
     // READ (10): an audio sector, or one between the sessions, cannot be read.
     r.packet({0x28, 0, 0, 0, 0, 250, 0, 0, 1, 0});
     CHECK_EQ(r.reg(7) & 0x01, 0x01u);
@@ -589,11 +592,140 @@ TEST(atapi_cdrom_reads_a_disc_of_audio_and_data_tracks_in_two_sessions) {
     d = r.read_all();
     CHECK_EQ(d.size(), 2352u);
     CHECK(d[15] == 2 && d[18] == 0x08 && load_be<u32>(d.data() + 24) == 0xC000u);
-    // READ HEADER: the mode of each kind of sector.
+    // READ HEADER: a data sector's mode; an audio sector's address is refused, as READ's.
     r.packet({0x44, 0, 0, 0, 0x01, 0x04, 0, 0, 8, 0});
-    CHECK_EQ(r.read_all()[0], 0u);
+    CHECK_EQ(sense(), 0x64u);
     r.packet({0x44, 0, 0, 0, 0x2E, 0x31, 0, 0, 8, 0});
     CHECK_EQ(r.read_all()[0], 2u);
+    r.packet({0x44, 0, 0, 0, 0, 5, 0, 0, 8, 0});
+    CHECK_EQ(r.read_all()[0], 1u);
+    // A play must be audio to its end: from track 2 on past the first
+    // session's lead-out, refused (end of user area) at once.
+    r.packet({0x45, 0, 0, 0, 0, 250, 0, 0x01, 0x2C, 0});
+    CHECK_EQ(sense(), 0x63u);
+    CHECK_EQ(cd.audio_status(), AtapiCdrom::kNoAudioStatus);
+}
+
+namespace {
+
+// A data track with a post-gap, then an audio track divided by index 2:
+//   d.iso: 20 sectors of 2048 bytes (each beginning with its number);
+//   e.bin: 40 audio sectors, each sample its sector's number.
+// LBA 0-19 track 1, 20-24 its post-gap (mode 0), 25-64 track 2 (index 2 from 45).
+std::string make_postgap_disc() {
+    const auto dir = std::filesystem::temp_directory_path() / "uv-cue";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream f(dir / "d.iso", std::ios::binary | std::ios::trunc);
+        std::vector<u8> s(CdImage::kDataSector);
+        for (u32 n = 0; n < 20; ++n) {
+            store_be<u32>(s.data(), n);
+            f.write(reinterpret_cast<const char*>(s.data()), static_cast<std::streamsize>(s.size()));
+        }
+    }
+    {
+        std::ofstream f(dir / "e.bin", std::ios::binary | std::ios::trunc);
+        std::vector<u8> s(CdImage::kRawSector);
+        for (u32 n = 0; n < 40; ++n) {
+            for (unsigned i = 0; i < 1176; ++i) store_le<u16>(&s[i * 2], static_cast<u16>(n));
+            f.write(reinterpret_cast<const char*>(s.data()), static_cast<std::streamsize>(s.size()));
+        }
+    }
+    const auto cue = dir / "postgap.cue";
+    std::ofstream(cue) << "FILE \"d.iso\" BINARY\n"
+                          "  TRACK 01 MODE1/2048\n"
+                          "    INDEX 01 00:00:00\n"
+                          "    POSTGAP 00:00:05\n"
+                          "FILE \"e.bin\" BINARY\n"
+                          "  TRACK 02 AUDIO\n"
+                          "    INDEX 01 00:00:00\n"
+                          "    INDEX 02 00:00:20\n";
+    return cue.string();
+}
+
+// The Q sub-channel's CRC (x^16 + x^12 + x^5 + 1) over its first ten bytes.
+u16 q_crc(const u8* q) {
+    u16 crc = 0;
+    for (unsigned i = 0; i < 10; ++i) {
+        crc ^= static_cast<u16>(q[i] << 8);
+        for (unsigned b = 0; b < 8; ++b) crc = static_cast<u16>((crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1);
+    }
+    return crc;
+}
+
+}  // namespace
+
+TEST(atapi_cdrom_stops_reads_where_sff8020i_says_and_gives_sub_channel_data) {
+    CdImage img;
+    CHECK(img.open(make_postgap_disc()));
+    CHECK(img.tracks()[0].end == 25 && img.tracks()[1].start == 25 && img.tracks()[1].indexes.size() == 1);
+    CHECK_EQ(img.tracks()[1].index_at(44), 1u);
+    CHECK_EQ(img.tracks()[1].index_at(45), 2u);
+    Rig r;
+    AtapiCdrom cd(r.sched, 1e6);
+    r.ch.attach(0, &cd);
+    cd.insert(&img);
+    r.packet({0x03, 0, 0, 0, 18, 0});
+    r.read_all();
+    auto sense = [&] {
+        r.packet({0x03, 0, 0, 0, 18, 0});
+        return r.read_all();
+    };
+    // READ (10) across into the post-gap: the two sectors before it, then
+    // end of user area, naming the first sector not read.
+    r.packet({0x28, 0, 0, 0, 0, 18, 0, 0, 4, 0}, 2048);
+    std::vector<u8> d = r.read_all();
+    CHECK_EQ(d.size(), 4096u);
+    CHECK_EQ(load_be<u32>(d.data() + 2048), 19u);
+    CHECK_EQ(r.reg(7) & 0x01, 0x01u);
+    std::vector<u8> sn = sense();
+    CHECK(sn[0] == 0xF0 && sn[2] == 0x05 && sn[12] == 0x63 && load_be<u32>(&sn[3]) == 20);
+    // Beginning in the post-gap: refused outright. READ HEADER: mode 0 there.
+    r.packet({0x28, 0, 0, 0, 0, 21, 0, 0, 1, 0});
+    CHECK_EQ(sense()[12], 0x63u);
+    r.packet({0x44, 0, 0, 0, 0, 22, 0, 0, 8, 0});
+    CHECK_EQ(r.read_all()[0], 0u);
+    // READ CD of any type from the post-gap stops where the audio begins.
+    r.packet({0xBE, 0x00, 0, 0, 0, 23, 0, 0, 4, 0x10, 0});
+    d = r.read_all();
+    CHECK_EQ(d.size(), 2u * 2336);
+    CHECK_EQ(sense()[12], 0x63u);
+    // CD-DA with C2 error flags (none) and the formatted Q: index 1, then 2.
+    r.packet({0xBE, 0x04, 0, 0, 0, 44, 0, 0, 2, 0x12, 2});
+    d = r.read_all();
+    CHECK_EQ(d.size(), 2u * (2352 + 294 + 16));
+    CHECK_EQ(load_le<u16>(d.data()), 19u);
+    CHECK(std::all_of(d.begin() + 2352, d.begin() + 2352 + 294, [](u8 b) { return b == 0; }));
+    const u8* q = d.data() + 2352 + 294;
+    CHECK(q[0] == 0x01 && q[1] == 2 && q[2] == 1 && q[3] == 0 && q[4] == 0 && q[5] == 19);
+    CHECK(q[7] == 0 && q[8] == 2 && q[9] == 44 && q[15] == 0);  // 00:02:44: LBA 44
+    q += 2662;
+    CHECK(q[2] == 2 && q[5] == 20 && q[9] == 45);
+    // Raw P-W: P clear, Q a bit a byte, its CRC (inverted) checks.
+    r.packet({0xBE, 0x04, 0, 0, 0, 45, 0, 0, 1, 0x00, 1});
+    d = r.read_all();
+    CHECK_EQ(d.size(), 96u);
+    u8 raw[12] = {};
+    for (unsigned i = 0; i < 96; ++i) {
+        CHECK_EQ(d[i] & 0xBF, 0u);
+        raw[i / 8] = static_cast<u8>(raw[i / 8] | (((d[i] >> 6) & 1) << (7 - i % 8)));
+    }
+    CHECK(raw[0] == 0x01 && raw[1] == 0x02 && raw[2] == 0x02 && raw[5] == 0x20 && raw[9] == 0x45);  // BCD
+    CHECK_EQ(static_cast<u16>(~((raw[10] << 8) | raw[11])), q_crc(raw));
+    // R-W is not offered.
+    r.packet({0xBE, 0x04, 0, 0, 0, 45, 0, 0, 1, 0x10, 4});
+    CHECK_EQ(sense()[12], 0x24u);
+    // PLAY AUDIO TRACK/INDEX from track 2's index 2; REQUEST SENSE with no
+    // error gives the audio status; SET CD SPEED ends the play.
+    r.packet({0x48, 0, 0, 0, 2, 2, 0, 2, 2, 0});
+    CHECK_EQ(r.reg(7) & 0x01, 0x00u);
+    r.packet({0x42, 0, 0x40, 1, 0, 0, 0, 0, 16, 0});
+    d = r.read_all();
+    CHECK(d[1] == AtapiCdrom::kPlaying && d[7] == 2 && load_be<u32>(&d[8]) == 45);
+    sn = sense();
+    CHECK(sn[2] == 0 && sn[12] == 0 && sn[13] == AtapiCdrom::kPlaying);
+    r.packet({0xBB, 0, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0});
+    CHECK_EQ(cd.audio_status(), AtapiCdrom::kNoAudioStatus);
 }
 
 TEST(atapi_cdrom_plays_audio_to_its_analog_output) {

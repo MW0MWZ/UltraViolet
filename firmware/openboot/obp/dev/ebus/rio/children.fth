@@ -5,7 +5,8 @@ purpose: The EBus's devices
 copyright: Copyright 2026 Andy Taylor
 
 \ The Ultra 5/10's EBus devices, with the properties the machine's own
-\ firmware gives them (as Solaris and other systems find them). Those that
+\ firmware gives them (as Solaris and other systems find them), made in the
+\ order its are (its .properties lists them newest first). Those that
 \ OpenBoot itself drives (the serial ports, keyboard and mouse) have their
 \ drivers among the drop-ins (in /packages/SUNW,builtin-drivers), each
 \ loaded into its node.
@@ -56,9 +57,9 @@ copyright: Copyright 2026 Andy Taylor
    " 14,724000" child
       " power" name
       0 0 encode-bytes  h# 724000 4 reg+  " reg" property
-      0 0 encode-bytes  h# 724000 4 va+  " address" property
       1 interrupts-property
       " button" boolean-property
+      0 0 encode-bytes  h# 724000 4 va+  " address" property
    finish-device
 ;
 
@@ -79,9 +80,8 @@ copyright: Copyright 2026 Andy Taylor
 ;
 
 \ The SuperIO's UARTs: the keyboard, then the mouse
-: make-su ( unit$ prop$ driver$ -- )
-   2rot child
-      2swap boolean-property
+: make-su ( unit$ driver$ -- )
+   2swap child
       builtin-driver
    finish-device
 ;
@@ -130,8 +130,8 @@ copyright: Copyright 2026 Andy Taylor
 : make-flashprom ( -- )
    " 10,0" child
       " flashprom" name
-      " SUNW,370-3697" model
       h# 10 encode-int 0 en+ h# 10.0000 en+  " reg" property
+      " SUNW,370-3697" model
       " /openprom" find-package if
          " version" rot get-package-property 0= if  " version" property  then
       then
@@ -143,21 +143,21 @@ copyright: Copyright 2026 Andy Taylor
 : make-cs4231 ( -- )
    " 14,200000" child
       " SUNW,CS4231" name
-      " SUNW,CS4231h" model
       0 0 encode-bytes
          h# 200000 h# 100 reg+  h# 702000 h# 10 reg+
          h# 704000 h# 10 reg+  h# 722000 4 reg+
       " reg" property
-      1 encode-int 2 en+ " interrupts" property
       " eb2dma" encode-string " dma-model" property
+      1 encode-int 2 en+ " interrupts" property
       " cdrom" encode-string " aux1" property
       " none" encode-string " aux2" property
+      " SUNW,CS4231h" model
    finish-device
 ;
 
 : make-children ( -- )
    make-auxio  make-power  make-pll  make-se
-   " 14,3083f8" " keyboard" " ebus-su-kbd" make-su
-   " 14,3062f8" " mouse" " ebus-su" make-su
+   " 14,3083f8" " ebus-su-kbd" make-su
+   " 14,3062f8" " ebus-su" make-su
    make-ecpp  make-fdthree  make-eeprom  make-flashprom  make-cs4231
 ;

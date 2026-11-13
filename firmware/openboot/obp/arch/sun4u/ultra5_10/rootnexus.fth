@@ -25,11 +25,26 @@ variable upa-slave-xt	\ (kept: nothing here interrupts through it)
 ;
 headers
 
+\ The root's properties are made here in the order an Ultra 10's are (its
+\ .properties lists them newest first), so they list in the same order:
+\ those whose values come later (machine-init.fth, probeall.fth, the IDPROM,
+\ uniproc.fth) are made empty here and set in their place then.
 root-device
-   2 " #size-cells" integer-property
-   2 " #address-cells" integer-property
    " upa" " device_type" string-property
+   0 0 encode-bytes " banner-name" property
+   0 " clock-frequency" integer-property
+   0 0 encode-bytes " name" property
+   0 0 encode-bytes " model" property
+   2 " #size-cells" integer-property
    breakpoint-trap# h# 7f and " breakpoint-trap"  integer-property
+   2 " #address-cells" integer-property
+   1 " #interrupt-cells" integer-property
+   0 0 encode-bytes " interrupt-map-mask" property
+   0 0 encode-bytes " interrupt-map" property
+   0 0 encode-bytes " idprom" property
+   0 0 encode-bytes " reset-reason" property
+   \ (Energy Star's second version: Solaris's power management)
+   0 0 encode-bytes " energystar-v2" property
 
    : open  ( -- true )  true  ;
    : close  ( -- )  ;
@@ -63,8 +78,11 @@ root-device
    : dma-map-in ( vaddr size cache? -- devaddr )  " dma-map-in" iommu-method  ;
    : dma-map-out ( vaddr devaddr size -- )  " dma-map-out" iommu-method  ;
 
+   \ A unit address with no port ID (@,0) is an error, as an Ultra 10's
+   \ (a path's search then ends at the root, finddev.fth).
    : decode-unit   ( adr len -- pa.lo pa.hi )
-      ascii , left-parse-string  2swap parse-int  -rot parse-int  ( offset portid )
+      ascii , left-parse-string  dup 0=  abort" Bad unit address"
+      2swap parse-int  -rot parse-int			( offset portid )
       1 lshift h# 1c0 or  over d# 32 rshift or		( offset pa.hi )
       swap h# ffff.ffff and swap			( pa.lo pa.hi )
    ;
@@ -114,9 +132,4 @@ device-end \ root device
    ;
    : probe-line-close ( -- )  diag-probe?  if  close-probe-line  then  ;
    : probe-quietly ( ?? xt -- ?? )  quietly  ;
-device-end
-
-\ /openprom: an Ultra 10 has decode-complete there.
-" /openprom" find-device
-   0 0 " decode-complete" property
 device-end

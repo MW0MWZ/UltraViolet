@@ -9,12 +9,10 @@ copyright: Copyright 2026 Andy Taylor
 
 Fcode-version3
 
+\ Its properties in the order an Ultra 10 makes them (its .properties lists
+\ them newest first).
 " network"	encode-string " name"			property
-" network"	encode-string " device_type"		property
 " SUNW,hme"	encode-string " compatible"		property
-d# 48		encode-int    " address-bits"		property
-h# 4000		encode-int    " max-frame-size"		property
-1		encode-int    " interrupts"		property
 
 headerless
 
@@ -24,6 +22,11 @@ headerless
 my-address my-space 0 encode-reg
 my-address my-space h# 0200.0010 or h# 7020 encode-reg encode+
 " reg" property
+
+h# 4000		encode-int    " max-frame-size"		property
+d# 48		encode-int    " address-bits"		property
+1		encode-int    " interrupts"		property
+" network"	encode-string " device_type"		property
 
 fload ${BP}/dev/pci/config-access.fth
 h# c0 8 my-b@ or encode-int " hm-rev" property

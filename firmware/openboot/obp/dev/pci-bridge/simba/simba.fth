@@ -25,17 +25,24 @@ headerless
 
 fload ${BP}/dev/pci-bridge/dec21152/config.fth
 fload ${BP}/dev/pci/compatible.fth
-fload ${BP}/dev/pci-bridge/pcinode.fth
 
+\ The properties are made in the order an Ultra 10's are (its .properties
+\ lists them newest first): name, device_type, reg, #size-cells,
+\ #address-cells, model, clock-frequency, no-probe-list, slot-names, the
+\ interrupt map's three, the configuration header's (made here as the PCI
+\ probe makes them, which then sets them again in place), compatible,
+\ scsi-initiator-id, bus-range. name and device_type are made empty here
+\ and set by pcinode.fth, after reg.
+0 0 encode-bytes " name" property
+0 0 encode-bytes " device_type" property
 0 0 my-space  encode-phys  0 encode-int encode+  0 encode-int encode+
 " reg" property
 
-make-compatible-property
+fload ${BP}/dev/pci-bridge/pcinode.fth
 
 " SUNW,simba" model
-" 0" encode-string " no-probe-list" property
 d# 33000000 encode-int " clock-frequency" property
-7 encode-int " scsi-initiator-id" property
+" 0" encode-string " no-probe-list" property
 
 \ Function 1 is bus A, function 0 bus B.
 : bus-a? ( -- flag )  my-space 8 rshift 7 and 0<>  ;
@@ -128,6 +135,18 @@ h# e8 constant pio-afsr
    option$ 0= if  " 1,2,3,4"  then
 ;
 
+\ The scsi-initiator-id option, as an Ultra 10's bridges take it (7 if
+\ there is none). A number option's get-package-property gives its value,
+\ not an encoded string (an Ultra 10's does the same).
+: scsi-id ( -- n )
+   " scsi-initiator-id" " /options" find-package  if
+      get-package-property 0=  if  exit  then
+   else
+      2drop
+   then
+   7
+;
+
 \ Bus A's devices are on the board (no slots); bus B's are the slots
 \ (four on an Ultra 10, devices 1 to 4), named as the machine's own
 \ firmware names them.
@@ -151,6 +170,8 @@ h# e8 constant pio-afsr
 ;
 
 : make-interrupt-map ( -- )
+   1 encode-int " #interrupt-cells" property
+   h# fff800 encode-int 0 en+ 0 en+ 7 en+ " interrupt-map-mask" property
    0 0 encode-bytes
    bus-a?  if
       1 1 h# 21 int-map-entry  2 1 h# 0f int-map-entry  3 1 h# 20 int-map-entry
@@ -158,8 +179,6 @@ h# e8 constant pio-afsr
       5 1 do  5 1 do  j i  j 1- 4 * i 1- + h# 10 +  int-map-entry  loop  loop
    then
    " interrupt-map" property
-   h# fff800 encode-int 0 en+ 0 en+ 7 en+ " interrupt-map-mask" property
-   1 encode-int " #interrupt-cells" property
 ;
 
 \ The latency timer, on bus B's bridge only, as an Ultra 10's own
@@ -185,6 +204,7 @@ h# e8 constant pio-afsr
 \ The release's generic bridge: every device probed, no slot names, no
 \ interrupt map, the latency timer as reset, the space kept and the
 \ subordinate bus number brought down to the highest below.
+: scsi-id ( -- n )  7  ;
 : probe-list$ ( -- adr len )
    " 0,1,2,3,4,5,6,7,8,9,a,b,c,d,e,f,10,11,12,13,14,15,16,17,18,19,1a,1b,1c,1d,1e,1f"
 ;
@@ -199,6 +219,22 @@ h# e8 constant pio-afsr
 [then]
 
 \ ---------- The bridge ----------
+
+\ The configuration header's properties, as the PCI probe makes them for a
+\ bridge (dev/pci/device-props.fth), then compatible and scsi-initiator-id.
+: header-properties ( -- )
+   0 my-w@ encode-int " vendor-id" property
+   2 my-w@ encode-int " device-id" property
+   8 my-b@ encode-int " revision-id" property
+   8 my-l@ 8 rshift encode-int " class-code" property
+   6 my-w@					( status )
+   dup 9 rshift 3 and  encode-int  " devsel-speed"  property
+   dup 7 rshift 1 and  if  0 0 " fast-back-to-back"  property  then
+   dup 6 rshift 1 and  if  0 0 " udf-supported"      property  then
+       5 rshift 1 and  if  0 0 " 66mhz-capable"      property  then
+   make-compatible-property
+   scsi-id encode-int " scsi-initiator-id" property
+;
 
 : probe-children ( -- )  probe-list$ prober-xt execute  ;
 
@@ -216,14 +252,15 @@ h# e8 constant pio-afsr
    claim-pci-resource		( mem-lo io-lo dma-lo mem-hi io-hi dma-hi bus# )
    init-secondary-bus#				( mem-lo io-lo mem-hi io-hi )
    init-subordinate-bus#
+   slot-names
    make-interrupt-map
+   header-properties
    bus-a? 0= if  disable-children  then
    set-address-maps				( )
    init-apb
    board-latency
    clear-status-bits
    enable-mem,io&bus-mastr
-   slot-names
    probe-children
    clear-status-bits
    retain-pci-resource

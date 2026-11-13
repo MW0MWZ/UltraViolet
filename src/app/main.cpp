@@ -73,6 +73,7 @@ void usage() {
         "  --disk-size MB   create the disk image at this size if it does not exist\n"
         "  --cdrom FILE     CD image in the drive (secondary master); give it more than once\n"
         "                   for a set of discs (Ctrl+Alt+E in the window, or SIGUSR1, moves on)\n"
+        "  --floppy FILE    floppy disk image in the drive (1.44 MB or 720 KB)\n"
         "  --ram MB         memory size: 128, 256, 512 or 1024 (default 256)\n"
         "  --cpu-mhz MHZ    processor module by clock: 270, 300, 333, 360, 400 or 440\n"
         "                   (default 440); its E-cache goes with it\n"
@@ -338,7 +339,7 @@ int main(int argc, char** argv) {
             const char* flag;
             const char* key;
         } kValued[] = {{"--prom", "prom"},           {"--prom-dir", "prom_dir"},   {"--nvram", "nvram"},     {"--disk", "disk"},
-                       {"--cdrom", "cdrom"},         {"--mac", "mac"},         {"--net", "net"},
+                       {"--cdrom", "cdrom"},         {"--floppy", "floppy"},   {"--mac", "mac"},         {"--net", "net"},
                        {"--hostfwd", "hostfwd"},     {"--ram", "ram_mb"},      {"--cpu-mhz", "cpu_mhz"},
                        {"--ecache-kb", "ecache_kb"}, {"--console", "console"}, {"--keyboard", "keyboard"},
                        {"--timing", "timing"},       {"--log", "log"},         {"--upa", "upa"},

@@ -74,7 +74,7 @@ Ultra5_10::Ultra5_10(const Options& options)
       su_kbd_(sched_, kbd_line_, kSuperIoUartHz, options.cpu_hz),
       su_mouse_(sched_, mouse_line_, kSuperIoUartHz, options.cpu_hz),
       se_(sched_, ttya_, ttyb_, options.cpu_hz),
-      fdc_(sched_),
+      fdc_(sched_, options.cpu_hz),
       ide_(sched_, options.cpu_hz),
       hme_(sched_, options.cpu_hz),
       mach64_(sched_, options.cpu_hz),
@@ -165,7 +165,7 @@ Ultra5_10::Ultra5_10(const Options& options)
     ebus_.add(kEbusAudio, Cs4231::kSize, &audio_);
     block("audio-aux", kEbusAudioAux, 4);  // bit 0: the codec's power-down (polarity unknown)
     ebus_.add(kEbusFloppy, 8, &fdc_);
-    block("floppy-aux", kEbusFloppyAux, 4);  // bit 0: density sense
+    ebus_.add(kEbusFloppyAux, 4, &fdc_.aux(), false);  // the RIO's own 32-bit register
     // The parallel port in compatible mode, nothing connected (PC87332):
     // data, the status register (read-only; 0x7F as a real Ultra 10's), the
     // control register (bits 7:5 read 1).
@@ -191,6 +191,8 @@ Ultra5_10::Ultra5_10(const Options& options)
     // The floppy controller's interrupt reaches the system through its DMA
     // channel (INT_PEND, gated by INT_EN), as do the other EBus DMA devices'.
     fdc_.set_irq_sink([this](bool a) { fd_dma_.set_device_irq(a); });
+    fdc_.set_dma(&fd_dma_);
+    fdc_.set_exchange([this] { return (superio_.reg(3) & 0x10) != 0; });  // FCR: logical drive exchange
     fd_dma_.set_irq_sink([this](bool a) { sabre_.set_interrupt(kInoFloppy, a); });
     ecpp_dma_.set_irq_sink([this](bool a) { sabre_.set_interrupt(kInoParallel, a); });
     audio_play_dma_.set_irq_sink([this](bool a) { sabre_.set_interrupt(kInoAudioPlay, a); });
@@ -241,6 +243,8 @@ Ultra5_10::Ultra5_10(const Options& options)
     apply_fast_io();
     if (!opt_.cdrom_path.empty() && !insert_cdrom(opt_.cdrom_path))
         UV_LOG(Error, "ultra5_10", "cannot open CD image %s", opt_.cdrom_path.c_str());
+    if (std::string why; !opt_.floppy_path.empty() && !insert_floppy(opt_.floppy_path, why))
+        UV_LOG(Error, "ultra5_10", "%s", why.c_str());
 
     // NVRAM: the saved contents, or (none, or a blank image) a new one.
     if (opt_.nvram_path.empty() || !nvram_.load(opt_.nvram_path) || nvram_blank()) write_new_nvram();
@@ -492,6 +496,14 @@ bool Ultra5_10::insert_cdrom(const std::string& path) {
     return true;
 }
 
+bool Ultra5_10::insert_floppy(const std::string& path, std::string& error) {
+    if (path.empty()) {
+        fdc_.eject();
+        return true;
+    }
+    return fdc_.insert(path, error);
+}
+
 void Ultra5_10::update_prom_mapping() {
     if (prom_map_size_) {
         sabre_.map_mem_window(prom_pa_, prom_map_size_);
@@ -645,6 +657,7 @@ std::string Ultra5_10::describe() const {
     cpu_.describe(out, hz);
     sabre_.describe(out);
     ide_.describe(out);
+    out += fdc_.describe();
     return out;
 }
 

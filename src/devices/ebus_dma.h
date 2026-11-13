@@ -56,6 +56,9 @@ public:
     // moved. Reaching the end of the count sets TC.
     std::size_t to_memory(const u8* data, std::size_t length);
     std::size_t from_memory(u8* data, std::size_t length);
+    // The bytes the channel would move now in a direction (to its count's
+    // end, when counting; none when not enabled for it).
+    std::size_t available(bool to_memory) const { return grant(~std::size_t{0}, to_memory); }
 
     u32 csr() const;
 

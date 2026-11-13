@@ -104,6 +104,13 @@ public:
     bool next_disc();
     bool insert_disc(const std::string& path);
 
+    // The floppy drive: the disk in it (empty: none), putting one in (an
+    // image; false with the reason if the drive cannot take it) and taking
+    // it out (the drive's eject button: the system cannot lock it in).
+    std::string floppy() const { return machine_ ? machine_->floppy() : settings_.floppy; }
+    bool insert_floppy(const std::string& path, std::string& error);
+    void eject_floppy();
+
     // Runs `instructions` (the machine keeps guest time to the host's clock
     // as its timing says).
     void run(u64 instructions);

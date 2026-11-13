@@ -52,6 +52,9 @@ my-space encode-int 0 en+ 0 en+ 0 en+ 0 en+
    >r >r >r  h# 14 en+  r> en+  r> en+  sabre-phandle en+  r> en+
 ;
 
+\ (#interrupt-cells, the mask, then the map: an Ultra 10's order)
+1 " #interrupt-cells" integer-property
+h# 1f encode-int h# ff.ffff en+ 3 en+ " interrupt-map-mask" property
 0 0 encode-bytes
    h# 3043bc 1 h# 22 int-entry			\ ecpp
    h# 200000 1 h# 23 int-entry			\ SUNW,CS4231: capture
@@ -62,8 +65,6 @@ my-space encode-int 0 en+ 0 en+ 0 en+ 0 en+
    h# 3062f8 1 h# 2a int-entry			\ su: mouse
    h# 400000 1 h# 2b int-entry			\ se
 " interrupt-map" property
-h# 1f encode-int h# ff.ffff en+ 3 en+ " interrupt-map-mask" property
-1 " #interrupt-cells" integer-property
 
 external
 

@@ -8,7 +8,7 @@
 //     sector's;
 //   - a CDRWIN cue sheet (.cue) over BINARY (little-endian audio) or
 //     MOTOROLA (big-endian audio) files: tracks of AUDIO, MODE1/2048,
-//     MODE1/2352, MODE2/2336 or MODE2/2352, INDEX 00 and 01, PREGAP and
+//     MODE1/2352, MODE2/2336 or MODE2/2352, INDEX 00 to 99, PREGAP and
 //     POSTGAP (sectors not in the file), FLAGS (DCP, 4CH, PRE) and sessions
 //     (REM SESSION).
 // Addresses are logical block addresses: LBA 0 is track 1's index 1, at
@@ -51,6 +51,20 @@ public:
         u64 offset = 0;
         unsigned size = kRawSector;
         bool swap = false;  // audio held big-endian (MOTOROLA)
+        std::vector<u32> indexes;  // where index 2 and any after it begin
+
+        // The index a sector of the track is in: 0 in its pregap, 1 from its
+        // start, then 2 onward as the sheet divides it.
+        u8 index_at(u32 lba) const {
+            if (lba < start) return 0;
+            u8 n = 1;
+            for (u32 at : indexes)
+                if (lba >= at) ++n;
+            return n;
+        }
+        // Whether a sector is in the post-gap after the sectors held in a
+        // file (a data track's post-gap is mode 0).
+        bool postgap(u32 lba) const { return lba >= start && static_cast<s64>(lba) >= first + count; }
     };
     struct Session {
         u8 number = 1, first_track = 1, last_track = 1;
@@ -77,7 +91,8 @@ public:
     // A sector as on the disc: 2352 bytes of audio (16-bit little-endian
     // samples, left first), or a data sector with sync and header (and,
     // from 2048-byte images, mode 1's EDC and ECC computed). Gap sectors not
-    // held in a file read as silence or as zero data. False: no such
+    // held in a file read as silence or, in a data track, as zero data in
+    // the track's mode (a pregap) or mode 0 (a post-gap). False: no such
     // sector, or the file could not be read.
     bool read_raw(u32 lba, u8* out);
     // Data sectors' 2048 bytes of user data each: mode 1, or mode 2 form 1.

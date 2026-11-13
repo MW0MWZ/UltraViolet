@@ -7,7 +7,8 @@ copyright: Copyright 2026 Andy Taylor
 \ The controller runs as a PC's does (PC-AT mode). Its transfers are made
 \ here without DMA (its non-DMA mode: the data through its FIFO a byte at
 \ a time), of the 512-byte sectors of a 3.5" 1.44 MB disk (80 cylinders, 2
-\ heads, 18 sectors a track). The Ultra 5/10's drive ejects by hand. With
+\ heads, 18 sectors a track). As the Ultra 10's driver has them, the
+\ device's blocks are whole cylinders (18 KB, both heads' tracks). The Ultra 5/10's drive ejects by hand. With
 \ no drive answering, the node's status is "disabled", and the selftest,
 \ open and boot say so as an Ultra 10 does.
 
@@ -71,8 +72,11 @@ h# 20 constant ndm			\ in a non-DMA execution phase
    until  drop h# 80
 ;
 : seek-ok? ( st0 -- ok? )  h# f0 and h# 20 =  ;
-\ (Twice: a drive more than 79 steps out reaches track 0 the second time.)
+\ (The drive is selected only with its motor on: the controller gates
+\ each drive select with its motor bit. Twice: a drive more than 79 steps
+\ out reaches track 0 the second time.)
 : recalibrate ( -- ok? )
+   motor-on
    7 cmd! 0 cmd!  wait-seek seek-ok?  dup 0= if
       drop  7 cmd! 0 cmd!  wait-seek seek-ok?
    then
@@ -89,13 +93,14 @@ d# 80 constant #cylinders
 
 : chs ( block# -- sector0 head cyl )  #sectors /mod  #heads /mod  ;
 
-\ A sector's read or write command: the seek, then the command and its
-\ eight bytes (the sector's address, 512 bytes, the track's end at it).
+\ A read or write command from a sector: the seek, then the command and
+\ its eight bytes (the sector's address, 512 bytes, the track's end).
+0 value eot
 : sector-cmd ( block# cmd -- ok? )
    >r chs					( sector0 head cyl )
    2dup swap seek-to 0= if  3drop r> drop false exit  then
    r> cmd!  over 2 lshift cmd!  cmd! cmd!	( sector0 )
-   1+ dup cmd!  2 cmd!  cmd!  h# 1b cmd!  h# ff cmd!
+   1+ cmd!  2 cmd!  eot cmd!  h# 1b cmd!  h# ff cmd!
    true
 ;
 
@@ -104,11 +109,11 @@ d# 80 constant #cylinders
 : data-ready? ( -- flag )
    wait-rqm  msr@ ndm and 0<>  and
 ;
-: pio-read ( adr -- )
-   /sector 0 do  data-ready? 0= if  leave  then  fifo@ over i + c!  loop  drop
+: pio-read ( adr len -- )
+   0 ?do  data-ready? 0= if  leave  then  fifo@ over i + c!  loop  drop
 ;
-: pio-write ( adr -- )
-   /sector 0 do  data-ready? 0= if  leave  then  dup i + c@ fifo!  loop  drop
+: pio-write ( adr len -- )
+   0 ?do  data-ready? 0= if  leave  then  dup i + c@ fifo!  loop  drop
 ;
 \ Done: a normal end, or the end of the track reached (no terminal count
 \ ends a non-DMA transfer) with no other error.
@@ -116,23 +121,34 @@ d# 80 constant #cylinders
    st0 h# c0 and  ?dup 0= if  true exit  then
    h# 40 =  st 1+ c@ h# 80 = and  st 2+ c@ 0= and
 ;
+\ One sector (the track's end at it)
 : read-sector ( adr block# -- ok? )
-   h# 46 sector-cmd if  pio-read 7 results sector-ok?  else  drop false  then
+   dup #sectors mod 1+ to eot
+   h# 46 sector-cmd if  /sector pio-read 7 results sector-ok?  else  drop false  then
 ;
-: write-sector ( adr block# -- ok? )
-   h# 45 sector-cmd if  pio-write 7 results sector-ok?  else  drop false  then
+
+\ A cylinder: both heads' tracks in one multi-track command, as the
+\ Ultra 10's driver reads and writes them.
+#sectors #heads * constant /cylinder		\ sectors a cylinder: a block
+: read-cylinder ( adr cyl# -- ok? )
+   #sectors to eot
+   /cylinder * h# c6 sector-cmd if  /sector /cylinder * pio-read 7 results sector-ok?  else  drop false  then
+;
+: write-cylinder ( adr cyl# -- ok? )
+   #sectors to eot
+   /cylinder * h# c5 sector-cmd if  /sector /cylinder * pio-write 7 results sector-ok?  else  drop false  then
 ;
 
 0 instance value rw-xt
-\ (Each sector tried up to three times.)
-: rw-sector ( adr block# -- ok? )
+\ (Each cylinder tried up to three times.)
+: rw-cylinder ( adr cyl# -- ok? )
    3 0 do  2dup rw-xt execute if  2drop true unloop exit  then  loop
    2drop false
 ;
 : r/w-blocks ( adr block# #blocks -- #done )
    motor-on
    dup 0 ?do					( adr block# #blocks )
-      2 pick i /sector * +  2 pick i +  rw-sector 0= if
+      2 pick i /sector /cylinder * * +  2 pick i +  rw-cylinder 0= if
          drop i leave
       then
    loop  nip nip
@@ -179,15 +195,15 @@ external
 
 : dma-alloc ( n -- adr )  alloc-mem  ;
 : dma-free ( adr n -- )  free-mem  ;
-: block-size ( -- n )  /sector  ;
-: max-transfer ( -- n )  /sector #sectors *  ;
-: #blocks ( -- n )  #sectors #heads * #cylinders *  ;
+: block-size ( -- n )  /sector /cylinder *  ;
+: max-transfer ( -- n )  /sector /cylinder *  ;
+: #blocks ( -- n )  #cylinders  ;
 
 : read-blocks ( adr block# #blocks -- #read )
-   ['] read-sector to rw-xt  r/w-blocks
+   ['] read-cylinder to rw-xt  r/w-blocks
 ;
 : write-blocks ( adr block# #blocks -- #written )
-   ['] write-sector to rw-xt  r/w-blocks
+   ['] write-cylinder to rw-xt  r/w-blocks
 ;
 
 : close ( -- )
@@ -223,7 +239,7 @@ external
    recalibrate if
       motor-on
       /sector alloc-mem  dup 0 read-sector  swap /sector free-mem
-      if  0  else  ." Read failed.  The disk is unformatted or defective." cr -1  then
+      if  ." Test succeeded." cr 0  else  ." Read failed.  The disk is unformatted or defective." cr -1  then
    else
       .recalibrate-failed -1
    then

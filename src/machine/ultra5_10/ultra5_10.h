@@ -79,6 +79,7 @@ public:
         std::string disk_path;   // ATA disk image (primary master); empty: none
         u64 disk_create_bytes = 0;  // create the disk image at this size if it does not exist
         std::string cdrom_path;  // CD image in the drive (secondary master); empty: no disc
+        std::string floppy_path; // floppy disk image in the drive (1.44 MB or 720 KB); empty: none
         // The time of day at power-on, in seconds since 1970 (0: the host's
         // clock at start). The clock then advances with the processor's
         // cycles, so it agrees with TICK and the other timers.
@@ -157,6 +158,10 @@ public:
     // Changes the disc in the CD-ROM drive (empty path: no disc). False if
     // the image cannot be opened.
     bool insert_cdrom(const std::string& path);
+    // A floppy disk image into the drive (empty: out of it). False, with
+    // the reason in `error`, if the drive cannot take it.
+    bool insert_floppy(const std::string& path, std::string& error);
+    std::string floppy() const { return fdc_.disk_path(); }
 
     // Serial lines: ttya and ttyb (the SAB82532), and the keyboard and mouse
     // ports (SuperIO UARTs).
@@ -205,7 +210,10 @@ public:
     Cs4231& audio() { return audio_; }
     // Where the audio's playback goes (16-bit stereo frames at a rate).
     void set_audio_sink(Cs4231::AudioSink sink) { audio_.set_audio_sink(std::move(sink)); }
-    // What the line-in or microphone jack hears (none: nothing plugged in).
+    // What the line-in or microphone jack hears (none: nothing plugged in). A
+    // host recording device's full scale is the codec input's full scale (with
+    // the microphone's +20 dB on, a loud one clips, as a line-level source in
+    // a real microphone jack would).
     void set_audio_input(Cs4231::Input jack, Cs4231::InputSource source) {
         const bool live = static_cast<bool>(source);
         audio_.set_input(jack, std::move(source));

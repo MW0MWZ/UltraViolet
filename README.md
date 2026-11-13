@@ -41,7 +41,8 @@ installed from their own media.
   port (ttya) as its console. Modelled: the UltraSPARC IIi's PCI bus module
   (Sabre) with its IOMMU and interrupt mapping, the Advanced PCI Bridge
   (Simba), the PCIO EBus with the flash PROM, the M48T59 NVRAM and clock,
-  the SuperIO's keyboard and mouse UARTs and floppy controller, the
+  the SuperIO's keyboard and mouse UARTs, floppy controller and 3.5" floppy
+  drive, the
   SAB82532 serial ports, the CMD646 IDE controller with ATA disks and an
   ATAPI CD-ROM drive (data and audio discs, which it plays to the codec as
   a real one does through its audio cable), the on-board Happy Meal
@@ -270,7 +271,8 @@ sends a BREAK). `--headless` runs without a window, ttya on the terminal
 CD image in the CD-ROM drive (given more than once, a set of discs): an ISO
 image, a raw image of 2352-byte sectors, or a CDRWIN cue sheet (`.cue`)
 with its BINARY or MOTOROLA files, for audio CDs, mixed-mode and
-multisession discs.
+multisession discs. `--floppy` is a floppy disk image (1.44 MB or 720 KB) in
+the floppy drive; the Media menu changes it while the machine runs.
 `--help` lists the rest.
 
 The Ethernet is on user-mode networking by default when built with

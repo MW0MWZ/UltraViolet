@@ -110,8 +110,12 @@ d# 64 constant /test-frame
    swap /test-frame free-mem			( ok? )
    net-off
 ;
+\ The transceiver: it answers (its ID), and brings a link up, as an Ultra
+\ 10's check needs (it fails with no cable; with tpe-link-test? false the
+\ link is not asked for).
 : transceiver-test ( -- ok? )
-   phy-reset dup if  drop phy-id1@ dup 0<> swap h# ffff <> and  then
+   phy-reset dup if  drop phy-id1@ dup 0<> swap h# ffff <> and  then	( ok? )
+   dup if  drop  setup-transceiver link-test? 0= or  then
 ;
 
 : selftest ( -- 0 | error )

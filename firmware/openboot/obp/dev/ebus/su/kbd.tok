@@ -20,9 +20,11 @@ my-address      constant tty-base
 
 : en+ ( xdr,len int -- xdr',len' ) encode-int encode+ ;
 
-my-space encode-int  tty-base en+  tty-size en+  " reg" property
-1 encode-int " interrupts" property
+\ (Its properties in an Ultra 10's order)
+0 0 " keyboard" property
 0 0 " port-a-ignore-cd" property
+1 encode-int " interrupts" property
+my-space encode-int  tty-base en+  tty-size en+  " reg" property
 
 : default-tty-mode     " 1200,8,n,1,-" ;
 defer default-ttya-mode

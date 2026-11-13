@@ -37,6 +37,7 @@ void Sab82532::Channel::reset() {
     sending.clear();
     xcount = 0;
     released = 0;
+    block = false;
     tx_timer.cancel();
     rx_timer.cancel();
     mode = timr = tcr = dafo = rfc = 0;
@@ -114,8 +115,9 @@ void Sab82532::Channel::rx_tick() {
             if (per_char == 2) rx.push_back(0);  // status: no errors
             if ((rfc & kRfcTcde) && b == tcr) {
                 release_for_read(false);
-            } else if (rx.size() >= threshold() && released == 0) {
+            } else if (rx.size() >= threshold() && !block) {
                 released = threshold();
+                block = true;
                 isr0 |= kIsr0Rpf;
             }
             chip.update_irq();
@@ -125,11 +127,12 @@ void Sab82532::Channel::rx_tick() {
     }
     // The line has gone quiet: data below the threshold is offered after
     // the timeout.
-    if (!rx.empty() && released == 0) release_for_read(true);
+    if (!rx.empty() && !block) release_for_read(true);
 }
 
 void Sab82532::Channel::release_for_read(bool timeout) {
     released = static_cast<unsigned>(rx.size());
+    block = true;
     isr0 |= timeout ? kIsr0Time : kIsr0Tcd;
     chip.update_irq();
 }
@@ -150,15 +153,19 @@ void Sab82532::Channel::command(u8 cmd) {
     if (cmd & kCmdRres) {
         rx.clear();
         released = 0;
+        block = false;
     }
     if (cmd & kCmdRmc) {
         // Receive message complete: the block offered by the last RPF, TCD or
-        // TIME has been taken; whatever of it was not read is discarded.
+        // TIME has been taken; whatever of it was not read is discarded. Only
+        // then is the next block offered: bytes received since wait for it.
         const unsigned n = std::min<unsigned>(released, static_cast<unsigned>(rx.size()));
         rx.erase(rx.begin(), rx.begin() + n);
         released = 0;
+        block = false;
         if (rx.size() >= threshold()) {
             released = threshold();
+            block = true;
             isr0 |= kIsr0Rpf;
         }
         if (!rx_timer.active() && (line.rx_pending() || !rx.empty())) rx_timer.schedule_in(char_cycles());

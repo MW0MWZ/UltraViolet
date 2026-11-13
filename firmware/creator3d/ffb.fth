@@ -167,60 +167,89 @@ create name-buf /name allot
 
 \ --- The monitor's EDID, over DDC ---------------------------------------------
 
-\ The DAC's monitor port: SCL (bit 0) and SDA (bit 1), driven through one
-\ register and read back through another; open drain, a 1 letting the line
-\ go. Each change is held for a few DAC reads.
+\ The DAC's monitor port: SCL (bit 0) and SDA (bit 1), written through one
+\ register and sensed through another; open drain, a 1 letting the line
+\ go (pulled high), a 0 driving it low. Between transfers the card leaves
+\ SDA let go and SCL driven low (2).
 8001 constant mpdata
 8002 constant mpsense
-3 value lines
-: lines!  ( n -- )  dup to lines  mpdata dac!  4 0 do  mpsense dac@ drop  loop  ;
-: scl  ( flag -- )  if  lines 1 or  else  lines 1 invert and  then  lines!  ;
-: sda  ( flag -- )  if  lines 2 or  else  lines 2 invert and  then  lines!  ;
-: sda?  ( -- flag )  mpsense dac@ 2 and 0<>  ;
-: i2c-start  ( -- )  true sda  true scl  false sda  false scl  ;
-: i2c-stop  ( -- )  false sda  true scl  true sda  ;
-: bit-out  ( flag -- )  sda  true scl  false scl  ;
-: bit-in  ( -- flag )  true sda  true scl  sda?  false scl  ;
-\ A byte out, and whether it was acknowledged; a byte in, acknowledged
-\ unless it is the last.
-: byte-out  ( byte -- ack? )
-   8 0 do  dup 80 and bit-out  2*  loop  drop  bit-in 0=
+\ The bus's time unit: a few reads of the DAC's device ID. (A fixed count
+\ of reads, not timed against the clock: a short unit, well under the 40
+\ microseconds or so the card aims at, but the DDC transfers take no
+\ fixed rate, and a STOP's tail is a timed millisecond.)
+4 constant /delay
+: delay  ( -- )  /delay 0 do  dac-did dac@ drop  loop  ;
+: lines!  ( n -- )  delay  mpdata dac!  ;       \ a unit, then the lines
+: sensed  ( -- n )  mpsense dac@  ;
+\ Why a transfer failed: SCL held low (1), a byte not acknowledged (2), a
+\ block whose header or checksum is wrong (3); 0 none, -1 never read.
+1 constant scl-held
+2 constant no-ack
+3 constant bad-block
+-1 value edid-error
+\ After SCL is let go, up to 250 units for it to read high (a monitor may
+\ hold it low); then SCL is driven low, SDA left as it reads, and the
+\ transfer given up.
+: scl-wait  ( -- )
+   false  d# 250 0 do  delay  sensed 1 and if  drop true leave  then  loop
+   0= if  sensed 2 and mpdata dac!  scl-held throw  then
 ;
-: byte-in  ( last? -- byte )
-   0  8 0 do  2*  bit-in 1 and or  loop  swap bit-out
+: i2c-start  ( -- )  2 lines!  3 lines!  scl-wait  1 lines!  0 lines!  ;
+\ A STOP, and a millisecond's bus-free time after it.
+: i2c-stop  ( -- )  0 lines!  1 lines!  scl-wait  3 lines!  2 lines!  1 ms  ;
+: bit-out  ( flag -- )
+   if  2  else  0  then  dup lines!  dup 1+ lines!  scl-wait  lines!
 ;
-\ The bus freed (nine clocks with SDA let go, then a stop).
-: i2c-free  ( -- )  true sda  9 0 do  false scl  true scl  loop  i2c-stop  ;
+: bit-in  ( -- flag )
+   2 lines!  3 lines!  scl-wait  delay  sensed 2 and 0<>  2 mpdata dac!
+;
+\ A byte out, most significant bit first, given up unless the monitor
+\ acknowledges it; a byte in, acknowledged (the last one too).
+: byte-out  ( byte -- )
+   8 0 do  dup 80 and bit-out  2*  loop  drop
+   bit-in if  no-ack throw  then
+;
+: byte-in  ( -- byte )
+   0  8 0 do  2*  bit-in 1 and or  loop  false bit-out
+;
 
-\ The EDID's first block, from the memory at I2C address 50: its offset
-\ set to 0, then 128 bytes read. Three tries for one that checks: the
-\ header, and the bytes summing to 0. Kept as read (zero if nothing
-\ answered) as the node's edid_data; no_edid_blks counts the block and its
-\ extensions, 0 if none checks.
+\ The EDID's first block, from the memory at I2C address 50.
 d# 128 constant /edid
 create edid /edid allot
-: edid-read  ( -- answered? )
-   i2c-free
-   i2c-start  a0 byte-out dup if  drop 0 byte-out  then  i2c-stop
-   dup if
-      i2c-start  a1 byte-out and
-      dup if  /edid 0 do  i /edid 1- =  byte-in  edid i + c!  loop  then
-      i2c-stop
-   then
-;
 : edid-ok?  ( -- flag )
    0  /edid 0 do  edid i + c@ +  loop  ff and 0=
    edid c@ 0= and  edid 7 + c@ 0= and
    7 1 do  edid i + c@ ff = and  loop
 ;
-: fetch-edid  ( -- )
-   edid /edid erase
-   3 0 do  edid-read if  edid-ok? if  leave  then  then  loop
+\ One try: nine STOPs to free the bus, the memory's offset set to 0 (a
+\ transfer of its own), then 128 bytes read into the buffer and checked:
+\ the header, and the bytes summing to 0.
+: edid-block  ( -- )
+   9 0 do  i2c-stop  loop
+   i2c-start  a0 byte-out  0 byte-out  i2c-stop
+   i2c-start  a1 byte-out
+   /edid 0 do  byte-in  edid i + c!  loop
+   i2c-stop
+   edid-ok? 0= if  bad-block throw  then
 ;
-: edid-properties  ( -- )
-   edid-ok? if  edid 7e + c@ 1+  else  0  then  encode-int " no_edid_blks" property
+\ The monitor's EDID, as the node's no_edid_blks and edid_data: the bus
+\ set idle, then up to three tries for a block that checks. no_edid_blks
+\ counts the block and its extensions (byte 126), 0 if the last try
+\ failed; edid_data is the 128-byte buffer as it stands (zero until a
+\ monitor answers; a failed try leaves what it read). Nothing printed,
+\ nothing thrown. Only while the card is mapped (at probe, and while the
+\ screen is open); otherwise nothing is done.
+external
+: ffb_do_edid  ( -- )
+   dac -1 = if  exit  then
+   1 lines!  0 lines!  ['] i2c-stop catch drop
+   no-ack  3 0 do  drop  ['] edid-block catch  dup 0= if  leave  then  loop
+   to edid-error
+   edid-error if  0  else  edid 7e + c@ 1+ ff and  then
+   encode-int " no_edid_blks" property
    edid /edid encode-bytes " edid_data" property
 ;
+headers
 
 \ The card's mode of a width, height and rate (not stereo or interlaced).
 0 value want-w
@@ -285,7 +314,7 @@ here est-modes - 5 /n * / constant #est-modes
 \ The monitor's mode by its EDID: the first standard timing the card
 \ takes, else the first established one.
 : edid-mode  ( -- row | 0 )
-   edid-ok? 0= if  0 exit  then
+   edid-error if  0 exit  then
    0  8 0 do  i std-mode ?dup if  nip leave  then  loop
    ?dup 0= if  est-mode  then
 ;
@@ -401,11 +430,17 @@ here est-modes - 5 /n * / constant #est-modes
    console-state  3 fifo-wait  ppc-plain 200 fbc!  300 fbc!  258 fbc!
 ;
 
+\ The screen's extent as the console's whole-screen drawings take it (its
+\ clears, fills and inversions): the mode's at install, or as
+\ ffb_change_scrn_params sets it.
+0 value hres
+0 value vres
+
 : init-fbc  ( -- )
    fbc-console
    1 fifo-wait  fbc-ab-x-on 254 fbc!
    ffffff 0 colours
-   0 0 width height rectangle                   \ both buffers white, window ID 0
+   0 0 hres vres rectangle                      \ both buffers white, window ID 0
    fbc-idle
    1 fifo-wait  fbc-x-off 254 fbc!
 ;
@@ -451,8 +486,8 @@ here est-modes - 5 /n * / constant #est-modes
 : ffb-toggle-cursor  ( -- )
    column# cell-x line# line-y char-width char-height invert-rect  fbc-idle
 ;
-: ffb-erase-screen  ( -- )  0 0 width height back fill-rect  fbc-idle  ;
-: ffb-invert-screen  ( -- )  0 0 width height invert-rect  fbc-idle  ;
+: ffb-erase-screen  ( -- )  0 0 hres vres back fill-rect  fbc-idle  ;
+: ffb-invert-screen  ( -- )  0 0 hres vres invert-rect  fbc-idle  ;
 : ffb-blink-screen  ( -- )  ffb-invert-screen d# 20 ms ffb-invert-screen  ;
 \ Back from a client (X leaves the window mode, the frame buffer
 \ configuration, the window lookups, the palette and the FBC its own): the
@@ -462,7 +497,7 @@ here est-modes - 5 /n * / constant #est-modes
 : ffb-reset-screen  ( -- )
    set-window-mode  set-fbcfg  set-windows  set-palette  fbc-console
    1 fifo-wait  fbc-ab-x-only 254 fbc!
-   0 0 colours  0 0 width height rectangle  fbc-idle
+   0 0 colours  0 0 hres vres rectangle  fbc-idle
    1 fifo-wait  fbc-x-off 254 fbc!
 ;
 
@@ -572,6 +607,33 @@ here est-modes - 5 /n * / constant #est-modes
    prom 40000 " map-out" $call-parent
 ;
 
+\ The console's geometry, for a screen a client has set to another
+\ resolution: the extent of the console's whole-screen drawings, the
+\ terminal emulator's text area as given (nothing checked or worked out),
+\ and the mode's class (1 stereo, 2 high resolution, 3 interlaced, else
+\ 0). Nothing is drawn, written to the card or printed; the class has no
+\ use here (the card is set up from the mode at each install, which also
+\ sets the geometry from the mode again), and nor has geometry-set? (this
+\ console has no geometry of its own to put back when it scrolls).
+0 value scrn-class
+false value geometry-set?
+external
+: ffb_change_scrn_params
+   ( mode #lines #columns window-left window-top screen-height hres vres -- )
+   to vres  to hres
+   to screen-height  to window-top  to window-left  to #columns  to #lines
+   dup 1 4 within 0= if  drop 0  then  to scrn-class
+   true to geometry-set?
+;
+headers
+
+\ The FCode's identity, on one line, the cursor left after it.
+external
+: .version_ffb  ( -- )
+   " @(#)ffb.fth 0.6 26/11/13 " type  " Copyright (C) 2026 Andy Taylor" type
+;
+headers
+
 \ --- The node -----------------------------------------------------------------
 
 \ Its properties, made in the order the card makes them. The mode's are the
@@ -579,7 +641,7 @@ here est-modes - 5 /n * / constant #est-modes
 " SUNW,ffb" device-name
 " display" device-type
 map-card
-fetch-edid  edid-properties
+edid /edid erase  ffb_do_edid
 default-mode to mode  mode-properties
 \ The UPA port: the slot's address is 1c0.0000.0000 + port << 33.
 my-space 1c0 - 2/ encode-int " upa-portid" property
@@ -613,11 +675,12 @@ unmap-card
 
 : ffb-install  ( -- )
    map-card
-   fetch-edid  edid-properties
+   ffb_do_edid
    select-mode mode-properties
    my-self encode-int " ihandle" property
    map-fb8
    " ISO8859-1" encode-string " character-set" property
+   width to hres  height to vres
    set-timing  set-fbcfg  set-windows  set-palette  init-fbc
    \ The text area: fb8-install sizes it from the screen-#columns and
    \ screen-#rows options and centres it; the drawing is all ours. (It
@@ -640,10 +703,13 @@ unmap-card
 ;
 
 : ffb-remove  ( -- )  unmap-card  ;
+\ The display's self-test: the card has none to run, and passes.
 : ffb-selftest  ( -- 0 )  0  ;
 
 ' ffb-install is-install
 ' ffb-remove is-remove
+\ The node's disp-test (ffb-selftest) and selftest (the system's, which
+\ runs disp-test on the open screen).
 ' ffb-selftest is-selftest
 
 fcode-end

@@ -67,11 +67,12 @@ std::string folder_of(const std::string& path) {
 std::string default_settings_path() { return user_file("settings.ini"); }
 
 // What a file chooser was opened for.
-enum class Pick { PromDir, Nvram, NewNvram, Disk, NewDisk, AddDisc, InsertDisc, OpenSettings, SaveSettings };
+enum class Pick { PromDir, Nvram, NewNvram, Disk, NewDisk, AddDisc, InsertDisc, InsertFloppy, OpenSettings, SaveSettings };
 
 constexpr SDL_DialogFileFilter kNvramFilters[] = {{"NVRAM images", "bin;nvram;nvr"}, {"All files", "*"}};
 constexpr SDL_DialogFileFilter kDiskFilters[] = {{"Disk images", "img;raw;dsk;hd;hdd"}, {"All files", "*"}};
 constexpr SDL_DialogFileFilter kDiscFilters[] = {{"CD-ROM images", "iso;cue;img;bin;raw;cdr"}, {"All files", "*"}};
+constexpr SDL_DialogFileFilter kFloppyFilters[] = {{"Floppy disk images", "img;ima;flp;dsk;vfd"}, {"All files", "*"}};
 constexpr SDL_DialogFileFilter kSettingsFilters[] = {{"Settings", "ini;conf;cfg"}, {"All files", "*"}};
 
 constexpr const char* kDiscLocked =
@@ -1158,6 +1159,15 @@ std::vector<MenuEntry> Gui::menus() {
                         }, m != nullptr, in).tip(discs[i]));
     }
     media.push_back(E::separator());
+    media.push_back(E::heading("Floppy disk"));
+    const std::string floppy = session_.floppy();
+    media.push_back(E::item(floppy.empty() ? "(empty)" : file_name(floppy), nullptr, false).tip(floppy));
+    media.push_back(E::item("Insert Floppy...", [this] { choose(Pick::InsertFloppy, {}); }));
+    media.push_back(E::item("Eject Floppy", [this] {
+                        session_.eject_floppy();
+                        status("Floppy ejected");
+                    }, !floppy.empty()));
+    media.push_back(E::separator());
     media.push_back(E::heading("Hard disk (primary IDE master)"));
     const std::string& disk = session_.settings().disk;
     media.push_back(E::item(disk.empty() ? "(none)" : file_name(disk), nullptr, false));
@@ -1383,7 +1393,10 @@ bool Gui::accept_settings() {
         }
         s.forwards.push_back(f);
     }
-    if (session_.on()) s.cdroms = session_.discs();  // the drive's set is kept by the drive
+    if (session_.on()) {
+        s.cdroms = session_.discs();  // the drive's set is kept by the drive
+        s.floppy = session_.settings().floppy;  // (and the floppy in it by the Media menu)
+    }
     session_.set_settings(s);
     save_settings_to(settings_path_);
     apply_sound();
@@ -1953,6 +1966,7 @@ void Gui::choose(Pick what, const std::string& current) {
         case Pick::NewDisk: SDL_ShowSaveFileDialog(on_chosen, req, window_, kDiskFilters, 2, location); break;
         case Pick::AddDisc: SDL_ShowOpenFileDialog(on_chosen, req, window_, kDiscFilters, 2, location, true); break;
         case Pick::InsertDisc: SDL_ShowOpenFileDialog(on_chosen, req, window_, kDiscFilters, 2, location, false); break;
+        case Pick::InsertFloppy: SDL_ShowOpenFileDialog(on_chosen, req, window_, kFloppyFilters, 2, location, false); break;
         case Pick::OpenSettings:
             SDL_ShowOpenFileDialog(on_chosen, req, window_, kSettingsFilters, 2, location, false);
             break;
@@ -1987,6 +2001,11 @@ void Gui::apply_choice(const PickResult& r) {
             else message("No new disk was made:\n\n" + error + "\n\nUse Browse... to choose an existing one.");
             break;
         case Pick::AddDisc: edit_.cdroms.push_back(r.path); break;
+        case Pick::InsertFloppy: {
+            std::string why;
+            if (!session_.insert_floppy(r.path, why)) status(why.empty() ? "The floppy disk could not be opened" : why);
+            break;
+        }
         case Pick::InsertDisc:
             if (session_.disc_locked()) message(kDiscLocked);
             else if (!session_.insert_disc(r.path)) message("The disc could not be opened:\n\n" + r.path);

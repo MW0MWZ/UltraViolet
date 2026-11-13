@@ -70,6 +70,11 @@ fload ${BP}/arch/sun4u/ultra5_10/fastfill.fth
 
 fload ${BP}/arch/sun4u/arcbpsup.fth		\ S Arch-dependent breakpoint support
 fload ${BP}/arch/sun4u/reenter.fth		\ S Getting back to Forth from Unix
+\ /openprom: an Ultra 10 has decode-complete there, made before model and
+\ version as its are.
+" /openprom" find-device
+   0 0 " decode-complete" property
+device-end
 fload ${BP}/arch/sun/model.fth			\ /openprom model and version props.
 fload ${BP}/arch/sun4u/ultra5_10/msloop.fth	\ Delays of n milliseconds
 
@@ -162,6 +167,22 @@ fload ${BP}/pkg/dropins/loadpkg.fth
 device-end
 fload ${BP}/pkg/selftest/selftest.fth
 
+\ /chosen's properties in the order an Ultra 10 makes them (its .properties
+\ lists them newest first): stdout-#lines, bootpath, bootargs, memory, mmu,
+\ stdin, stdout. The release makes them as its files load (console.fth,
+\ clntmem.fth, bootparm.fth); those after stdout-#lines are made again here.
+" /chosen" find-device
+   " stdin" delete-property  " stdout" delete-property
+   " memory" delete-property  " mmu" delete-property
+   " bootpath" delete-property  " bootargs" delete-property
+device-end
+' path-buf	" bootpath"	chosen-string
+' args-buf	" bootargs"	chosen-string
+' memory-node	" memory"	chosen-variable
+' mmu-node	" mmu"		chosen-variable
+' stdin		" stdin"	chosen-variable
+' stdout	" stdout"	chosen-variable
+
 fload ${BP}/arch/sun4u/ultra5_10/probeall.fth
 fload ${BP}/dev/scsi/probescsi.fth      \ probe-scsi
 fload ${BP}/pkg/inet/watchnet.fth	\ watch-net
@@ -177,6 +198,13 @@ true value system-test-ok?
 fload ${BP}/arch/sun4u/startup.fth \ S misc. startup stuff
 ' .post-failure is pre-boot-hook		\ (post.fth): a failed POST's cause
 ' (.memory-speed) is .memory-speed	\ (memprobe.fth): the DRAMs' speed
+
+\ After an error at the ok prompt an Ultra 10 empties the data stack, but
+\ not after an undefined word's ("xyzzy ?"); the release's interpreter
+\ (fm/kernel/ansio.fth) keeps it after any.
+headerless
+: .error-clear ( error# -- )  dup d# -13 <> >r  .error  r>  if  clear  then  ;
+patch .error-clear .error (interact)
 
 
 headers

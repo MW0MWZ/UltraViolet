@@ -62,7 +62,10 @@ also known-int-properties definitions
 : 66mhz-capable        ( -- n )  1  ;
 : subsystem-id         ( -- n )  1  ;
 : subsystem-vendor-id  ( -- n )  1  ;
+[ifndef] Ultra5_10
+\ The Ultra 5/10 shows these two as other properties are shown.
 : cache-line-size      ( -- n )  1  ;
 : latency-timer        ( -- n )  1  ;
+[then]
 previous definitions
 

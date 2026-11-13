@@ -240,6 +240,19 @@ bool Session::insert_disc(const std::string& path) {
     return select_disc(static_cast<int>(it - settings_.cdroms.begin()));
 }
 
+bool Session::insert_floppy(const std::string& path, std::string& error) {
+    // (powered off: the disk goes in at the next power-on)
+    if (machine_ && !machine_->insert_floppy(path, error)) return false;
+    settings_.floppy = path;
+    return true;
+}
+
+void Session::eject_floppy() {
+    std::string unused;
+    if (machine_) machine_->insert_floppy({}, unused);
+    settings_.floppy.clear();
+}
+
 void Session::run(u64 instructions) {
     if (machine_ && !machine_->cpu().halted() && !machine_->switched_off()) machine_->run(instructions);
 }

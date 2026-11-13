@@ -697,8 +697,11 @@ void UltraSparc::impdep1(u32 insn) {
             if (!(pstate_ & pstate::PRIV)) return take_trap(tt::kPrivilegedOpcode);
             return;
         default:
-            // Unassigned opf values.
-            UV_LOG(Warn, "cpu", "unimplemented VIS opf %03x at %016llx", opf, static_cast<unsigned long long>(pc_));
+            // Not an UltraSPARC IIi instruction (VIS 2 and later, or unassigned): the IIi
+            // takes illegal_instruction. Guests rely on it: Linux emulates VIS 2 in its
+            // trap handler and OpenSSL probes for later VIS this way, so debug only.
+            UV_LOG(Debug, "cpu", "VIS opf %03x not on the IIi at %016llx: illegal instruction", opf,
+                   static_cast<unsigned long long>(pc_));
             return take_trap(tt::kIllegalInstruction);
     }
 }

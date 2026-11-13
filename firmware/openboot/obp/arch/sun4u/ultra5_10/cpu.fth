@@ -26,11 +26,15 @@ headerless
 : en+ ( xdr,len n -- xdr',len' )  encode-int encode+  ;
 
 : make-cpu-props ( -- )
+   \ In the order an Ultra 10 makes them (its .properties lists them newest
+   \ first). device_type is made empty before reg and set to "cpu" after it:
+   \ that value's hook (cpustruct.fth) reads reg.
    " SUNW,UltraSPARC-IIi" device-name
+   0 0 encode-bytes " device_type" property
    h# 1c0 mid 1 lshift or encode-int 0 en+ 0 en+ 8 en+ " reg" property
-   " cpu" device-type				\ (with reg made: its hook reads it)
-   mid " upa-portid" integer-property
+   " cpu" device-type
    cpu-clock-frequency " clock-frequency" integer-property
+   mid " upa-portid" integer-property
    h# 4000 " icache-size" integer-property
    h# 20 " icache-line-size" integer-property
    2 " icache-associativity" integer-property
@@ -43,9 +47,9 @@ headerless
    h# 40 " ecache-line-size" integer-property
    1 " ecache-associativity" integer-property
    9 " sparc-version" integer-property
-   ver@ d# 48 rshift h# ffff and " manufacturer#" integer-property
-   ver@ d# 32 rshift h# ffff and " implementation#" integer-property
    ver@ d# 24 rshift h# ff and " mask#" integer-property
+   ver@ d# 32 rshift h# ffff and " implementation#" integer-property
+   ver@ d# 48 rshift h# ffff and " manufacturer#" integer-property
 ;
 
 : make-cpu-node ( -- )

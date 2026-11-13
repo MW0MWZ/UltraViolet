@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -590,14 +592,21 @@ TEST(machine_ebus_audio_auxio_and_power_button_answer_where_openboot_puts_them) 
     CHECK(m.bus().write(ebus + 0x200000, u8{12}));
     CHECK(m.bus().read(ebus + 0x200004, b));
     CHECK_EQ(b, 0x8Au);
-    // The system LED's auxio register, and the floppy's and audio's
-    // auxiliary registers, read back what was written (the other auxio
-    // registers are fixed: ebus_registers_read_as_on_real_hardware_at_power_on).
-    for (u64 at : {0x726000ull, 0x720000ull, 0x722000ull}) {
+    // The system LED's auxio register and the audio's auxiliary register
+    // read back what was written (the other auxio registers are fixed:
+    // ebus_registers_read_as_on_real_hardware_at_power_on); the floppy's
+    // its density select (bit 1), with no disk to sense.
+    for (u64 at : {0x726000ull, 0x722000ull}) {
         u32 v = 0;
         CHECK(m.bus().write(ebus + at, byteswap(u32{0x01})));
         CHECK(m.bus().read(ebus + at, v));
         CHECK_EQ(byteswap(v), 0x01u);
+    }
+    {
+        u32 v = 0;
+        CHECK(m.bus().write(ebus + 0x720000, byteswap(u32{0x03})));
+        CHECK(m.bus().read(ebus + 0x720000, v));
+        CHECK_EQ(byteswap(v), 0x02020202u);
     }
     CHECK(m.system_led());
     m.reset();
@@ -880,7 +889,7 @@ TEST(sabre_iommu_tlb_loads_on_a_miss_and_is_used_until_flushed) {
     CHECK(m.sabre().dma_read(0xDF800000u, buf, 4));
     CHECK_EQ(load_be<u32>(buf), 0x11223344u);
     CHECK_EQ(m.sabre().reg(0xA580), (1u << 21) | 0x6FC00u);           // W, VA<31:13>
-    CHECK_EQ(m.sabre().reg(0xA600), (1u << 30) | (1u << 28) | 0x100u);  // V, C, PA<40:13>
+    CHECK_EQ(m.sabre().reg(0xA600), (1u << 30) | (1u << 29) | (1u << 28) | 0x100u);  // V, U, C, PA<40:13>
     // The TSB changed under it: the TLB's translation still holds.
     store_be<u64>(m.bus().host_write_ptr(tsb), 0x8000000000000012ull | 0x300000);
     CHECK(m.sabre().dma_read(0xDF800000u, buf, 4));
@@ -889,7 +898,35 @@ TEST(sabre_iommu_tlb_loads_on_a_miss_and_is_used_until_flushed) {
     b.write(r + 0x210, u64{0xDF800000u});
     CHECK(m.sabre().dma_read(0xDF800000u, buf, 4));
     CHECK_EQ(load_be<u32>(buf), 0x55667788u);
-    CHECK_EQ(m.sabre().reg(0xA608), (1u << 30) | (1u << 28) | 0x180u);  // the next entry
+    CHECK_EQ(m.sabre().reg(0xA600), (1u << 30) | (1u << 29) | (1u << 28) | 0x180u);  // the first invalid entry
+}
+
+// The IOM's pseudo-LRU (IIi manual 10.8): the first invalid entry, else the
+// first not used; with all 16 used, every Used bit but one (the most
+// recently used entry's) is cleared and the first not used replaced.
+TEST(sabre_iommu_tlb_replaces_by_the_used_bits) {
+    Ultra5_10 m(small_options());
+    auto& b = m.bus();
+    const u64 r = Sabre::kRegsBase, tsb = 0x10000;
+    u8 buf[4]{};
+    for (unsigned i = 0; i < 17; ++i)
+        store_be<u64>(m.bus().host_write_ptr(tsb + 8 * i), 0x8000000000000010ull | (0x200000 + 0x2000 * i));
+    b.write(r + 0x2028, u64{0xFF});
+    b.write(r + 0x208, u64{tsb});
+    b.write(r + 0x200, u64{1});
+    for (unsigned i = 0; i < 16; ++i) CHECK(m.sabre().dma_read(0xDF800000u + 0x2000 * i, buf, 4));
+    for (unsigned n = 0; n < 16; ++n) CHECK_EQ(m.sabre().reg(0xA600 + 8 * n) & (3u << 29), 3u << 29);
+    // Page 3 again (a hit), then a 17th page: entry 3 keeps its Used bit, entry 0 is replaced.
+    CHECK(m.sabre().dma_read(0xDF800000u + 0x2000 * 3, buf, 4));
+    CHECK(m.sabre().dma_read(0xDF800000u + 0x2000 * 16, buf, 4));
+    CHECK_EQ(m.sabre().reg(0xA600) & 0x1FFFFF, 0x110u);
+    CHECK_EQ(m.sabre().reg(0xA600) & (1u << 29), 1u << 29);
+    CHECK_EQ(m.sabre().reg(0xA600 + 8 * 3) & (1u << 29), 1u << 29);
+    for (unsigned n : {1u, 2u, 4u, 15u}) CHECK_EQ(m.sabre().reg(0xA600 + 8 * n) & (1u << 29), 0u);
+    // The next miss takes the first entry not used: 1.
+    store_be<u64>(m.bus().host_write_ptr(tsb + 8 * 17), 0x8000000000000010ull | 0x400000);
+    CHECK(m.sabre().dma_read(0xDF800000u + 0x2000 * 17, buf, 4));
+    CHECK_EQ(m.sabre().reg(0xA608) & 0x1FFFFF, 0x200u);
 }
 
 // IOMMU locking (IIi manual 19.3.2.1): with LRU_LCKEN set, a miss loads
@@ -906,7 +943,7 @@ TEST(sabre_iommu_lock_replaces_only_the_locked_entry) {
     b.write(r + 0x200, u64{(1u << 23) | (5u << 19) | 1});  // locked to entry 5
     for (unsigned i = 0; i < 3; ++i) CHECK(m.sabre().dma_read(0xDF800000u + 0x2000 * i, buf, 4));
     CHECK_EQ(m.sabre().reg(0xA580 + 8 * 5), 0x6FC02u);  // the last miss
-    CHECK_EQ(m.sabre().reg(0xA600 + 8 * 5), (1u << 30) | (1u << 28) | 0x102u);
+    CHECK_EQ(m.sabre().reg(0xA600 + 8 * 5), (1u << 30) | (1u << 29) | (1u << 28) | 0x102u);
     CHECK_EQ(m.sabre().reg(0xA600) & (1u << 30), 0u);  // entry 0 never loaded
 }
 
@@ -1233,6 +1270,46 @@ TEST(sab82532_xpr_comes_as_a_pool_frees_and_a_reset_gives_xpr_and_alls) {
     CHECK_EQ(out.size(), 40u);  // (the rest was cleared)
 }
 
+TEST(sab82532_offers_the_next_block_only_after_rmc) {
+    // A character arriving after a block has been read, before its RMC, is
+    // not part of that block: RMC keeps it, and offers it as the next.
+    Scheduler s;
+    u64 now = 0;
+    s.set_clock([&] { return now; });
+    SerialLine a, b;
+    Sab82532 se(s, a, b, Sab82532::kClockHz / 16.0);
+    u64 v = 0;
+    se.read(0x3B, 1, v);      // clear the reset XPR/ALLS
+    se.write(0x28, 1, 0x40);  // RFC: threshold 1
+    se.write(0x39, 1, 0x80);  // IPC: masked statuses visible
+    auto run = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            now += 11;
+            s.run_due(now);
+        }
+    };
+    a.receive('a');
+    se.poll_lines();
+    run(20);
+    se.read(0x3A, 1, v);
+    CHECK_EQ(v & 0x01, 0x01u);  // RPF
+    se.read(0x00, 1, v);
+    CHECK_EQ(v, u64{'a'});
+    a.receive('b');
+    se.poll_lines();
+    run(20);
+    se.write(0x20, 1, 0x80);  // CMDR: RMC for the block of 'a'
+    se.read(0x20, 1, v);
+    CHECK(v & 0x20);          // STAR.RFNE: 'b' is still there
+    se.read(0x3A, 1, v);
+    CHECK_EQ(v & 0x01, 0x01u);  // and offered (RPF)
+    se.read(0x00, 1, v);
+    CHECK_EQ(v, u64{'b'});
+    se.write(0x20, 1, 0x80);
+    se.read(0x20, 1, v);
+    CHECK(!(v & 0x20));
+}
+
 TEST(sab82532_masked_statuses_stay_hidden_and_stored_unless_ipc_vis) {
     Scheduler s;
     u64 now = 0;
@@ -1473,7 +1550,7 @@ TEST(fdc82077_reset_reports_four_drives_and_version) {
     Scheduler s;
     u64 now = 0;
     s.set_clock([&] { return now; });
-    Fdc82077 f(s);
+    Fdc82077 f(s, 1e6);
     bool irq = false;
     f.set_irq_sink([&](bool a) { irq = a; });
     auto rd = [&](unsigned r) {
@@ -1504,6 +1581,246 @@ TEST(fdc82077_reset_reports_four_drives_and_version) {
     CHECK_EQ(rd(3), 0x70u);
     f.write(3, 1, 0x03);
     CHECK_EQ(rd(3), 0x73u);
+}
+
+namespace {
+
+// A floppy rig: the controller at 1 MHz (a cycle a microsecond) with its
+// EBus DMA channel over a small memory, and a 1.44 MB image whose sectors
+// each begin with their block number.
+struct FloppyRig {
+    Scheduler s;
+    u64 now = 0;
+    Fdc82077 f{s, 1e6};
+    EbusDma dma{"fd"};
+    std::vector<u8> mem = std::vector<u8>(0x10000);
+    bool irq = false;
+    std::string path;
+    FloppyRig() {
+        s.set_clock([this] { return now; });
+        f.set_irq_sink([this](bool a) { irq = a; });
+        f.set_dma(&dma);
+        dma.set_dma_port([this](u32 a, u8* p, std::size_t n) { std::copy_n(mem.begin() + a, n, p); return true; },
+                         [this](u32 a, const u8* p, std::size_t n) { std::copy_n(p, n, mem.begin() + a); return true; });
+        path = (std::filesystem::temp_directory_path() / "uv-floppy.img").string();
+        std::ofstream o(path, std::ios::binary | std::ios::trunc);
+        std::vector<u8> sec(512);
+        for (u32 b = 0; b < 2880; ++b) {
+            store_be<u32>(sec.data(), b);
+            o.write(reinterpret_cast<const char*>(sec.data()), 512);
+        }
+    }
+    unsigned rd(unsigned r) {
+        u64 v = 0;
+        f.read(r, 1, v);
+        return static_cast<unsigned>(v);
+    }
+    void wr(unsigned r, u8 v) { f.write(r, 1, v); }
+    void run(u64 cycles) {
+        const u64 end = now + cycles;
+        while (s.next_event() <= end) {
+            now = std::max(now, s.next_event());
+            s.run_due(now);
+        }
+        now = end;
+    }
+    // Out of reset with the motor on, the four reset interrupts sensed; the
+    // step rate (SRT 13: 3 ms), and DMA or not.
+    void start(bool dma_mode) {
+        wr(2, 0x00);
+        wr(2, 0x1C);
+        run(2000);
+        for (int i = 0; i < 4; ++i) {
+            wr(5, 0x08);
+            rd(5), rd(5);
+        }
+        wr(5, 0x03), wr(5, 0xDF), wr(5, dma_mode ? 0x02 : 0x03);
+        wr(7, 0x00);  // 500 kbit/s
+    }
+    void command(std::initializer_list<u8> bytes) {
+        for (u8 b : bytes) wr(5, b);
+    }
+    std::vector<unsigned> results() {
+        std::vector<unsigned> r;
+        while ((rd(4) & 0xD0) == 0xD0) r.push_back(rd(5));
+        return r;
+    }
+    // A seek's end, sensed: ST0 and the cylinder.
+    std::vector<unsigned> seek_end() {
+        run(400000);
+        CHECK(irq);
+        wr(5, 0x08);
+        return results();
+    }
+};
+
+}  // namespace
+
+// The drive, recalibrated and sought, with a disk: track 0, the seek's
+// end, ST3 (write protect off, track 0), and the disk change line cleared
+// by a step.
+TEST(fdc82077_aux_register_gives_density_select_and_sense) {
+    FloppyRig r;
+    Fdc82077::Aux& aux = r.f.aux();
+    u64 v = 0;
+    CHECK(aux.read(0, 4, v));
+    CHECK_EQ(v, 0u);  // no disk, medium density selected
+    std::string why;
+    CHECK(r.f.insert(r.path, why));
+    CHECK(aux.read(0, 4, v));
+    CHECK_EQ(v, 0x01010101u);  // a 1.44 MB disk senses high density
+    CHECK(aux.write(0, 4, 0x2));  // the PROM's big-endian write
+    CHECK(aux.read(3, 1, v));
+    CHECK_EQ(v, 3u);
+    CHECK(aux.write(0, 4, 0));
+    CHECK(aux.write(0, 4, 0x02000000));  // Solaris's little-endian write
+    CHECK(aux.read(0, 1, v));
+    CHECK_EQ(v, 3u);
+    r.f.reset();
+    CHECK(aux.read(0, 1, v));
+    CHECK_EQ(v, 1u);
+}
+
+TEST(fdc82077_drive_seeks_and_reports_its_disk) {
+    FloppyRig r;
+    std::string why;
+    CHECK(r.f.insert(r.path, why));
+    r.start(true);
+    CHECK_EQ(r.rd(7) & 0x80, 0x80u);  // a disk went in
+    r.command({0x07, 0x00});
+    std::vector<unsigned> s = r.seek_end();
+    CHECK(s.size() == 2 && s[0] == 0x20 && s[1] == 0);
+    r.command({0x04, 0x00});
+    CHECK_EQ(r.results()[0], 0x38u);  // 1, T0, 1
+    r.command({0x0F, 0x04, 10});
+    s = r.seek_end();
+    CHECK(s.size() == 2 && s[0] == 0x24 && s[1] == 10);
+    CHECK_EQ(r.rd(7) & 0x80, 0u);
+    r.command({0x04, 0x00});
+    CHECK_EQ(r.results()[0], 0x28u);
+    // The drive answers by the DOR's select, whatever drive a command
+    // names (Sun's OpenBoot recalibrates "drive 1" with drive 0 selected);
+    // with its motor off it is not selected, and finds no track 0.
+    r.command({0x07, 0x01});
+    s = r.seek_end();
+    CHECK(s.size() == 2 && s[0] == 0x21 && s[1] == 0);
+    r.wr(2, 0x0C);
+    r.command({0x0F, 0x00, 3});
+    r.seek_end();
+    r.command({0x07, 0x00});
+    s = r.seek_end();
+    CHECK(s.size() == 2 && s[0] == 0x70);
+    r.wr(2, 0x1C);
+    // A disk image of no floppy's size is refused.
+    const auto bad = std::filesystem::temp_directory_path() / "uv-floppy-bad.img";
+    std::ofstream(bad) << "short";
+    CHECK(!r.f.insert(bad.string(), why));
+    CHECK(why.find("1.44 MB") != std::string::npos);
+}
+
+// READ DATA through DMA: the channel's terminal count ends it normally
+// after the sectors it counted, with the next sector's address; without a
+// terminal count, the end of the track does (ET), the address the next
+// cylinder's first sector.
+TEST(fdc82077_reads_sectors_by_dma_to_its_terminal_count) {
+    FloppyRig r;
+    std::string why;
+    CHECK(r.f.insert(r.path, why));
+    r.start(true);
+    r.command({0x0F, 0x00, 1});
+    r.seek_end();
+    auto load = [&](u32 count) {
+        r.dma.write(0, 4, byteswap(EbusDma::kReset));
+        r.dma.write(0, 4, 0u);
+        r.dma.write(8, 4, byteswap(count));
+        r.dma.write(4, 4, byteswap(u32{0x1000}));
+        r.dma.write(0, 4, byteswap(EbusDma::kWrite | EbusDma::kEnDma | EbusDma::kEnCnt));
+    };
+    load(2 * 512);
+    r.command({0x46, 0x00, 1, 0, 3, 2, 18, 0x1B, 0xFF});  // cylinder 1, head 0, sectors 3 on
+    CHECK_EQ(r.rd(4) & 0x30, 0x10u);                       // busy, DMA
+    r.run(250000);                                         // under a revolution and a bit
+    std::vector<unsigned> res = r.results();
+    CHECK_EQ(res.size(), 7u);
+    CHECK(res[0] == 0x00 && res[1] == 0 && res[2] == 0);
+    CHECK(res[3] == 1 && res[4] == 0 && res[5] == 5 && res[6] == 2);  // next: sector 5
+    CHECK_EQ(load_be<u32>(&r.mem[0x1000]), 36u + 2);                  // cylinder 1 head 0 sector 3: block 38
+    CHECK_EQ(load_be<u32>(&r.mem[0x1200]), 39u);
+    // Head 1's last two sectors, with no terminal count first: the end of the track.
+    load(8 * 512);
+    r.command({0x46, 0x04, 1, 1, 17, 2, 18, 0x1B, 0xFF});
+    r.run(250000);
+    res = r.results();
+    CHECK(res[0] == 0x44 && res[1] == 0x80 && res[3] == 2 && res[4] == 1 && res[5] == 1);
+    CHECK_EQ(load_be<u32>(&r.mem[0x1000]), 36u + 18 + 16);
+    // At the wrong data rate no address mark is found.
+    r.wr(7, 0x02);
+    r.command({0x46, 0x00, 1, 0, 1, 2, 18, 0x1B, 0xFF});
+    r.run(500000);
+    res = r.results();
+    CHECK(res[0] == 0x40 && res[1] == 0x01);
+    // The wrong cylinder: no data, wrong cylinder.
+    r.wr(7, 0x00);
+    r.command({0x46, 0x00, 7, 0, 1, 2, 18, 0x1B, 0xFF});
+    r.run(500000);
+    res = r.results();
+    CHECK(res[0] == 0x40 && res[1] == 0x04 && res[2] == 0x10);
+}
+
+// Without DMA (non-DMA mode): a sector's bytes through the FIFO as the
+// controller asks (RQM, DIO, NDM); a write the same way; the end of the
+// track (EOT the sector) as our OpenBoot's driver expects it. A host too
+// slow to take the bytes overruns. A write-protected image is not writable.
+TEST(fdc82077_moves_sectors_through_the_fifo_without_dma) {
+    FloppyRig r;
+    std::string why;
+    CHECK(r.f.insert(r.path, why));
+    r.start(false);
+    auto read_sector = [&](u8 sector, std::vector<u8>& out) {
+        r.command({0x46, 0x00, 0, 0, sector, 2, sector, 0x1B, 0xFF});
+        out.clear();
+        for (int guard = 0; out.size() < 512 && guard < 200000; ++guard) {
+            const unsigned msr = r.rd(4);
+            if ((msr & 0xE0) == 0xE0) out.push_back(static_cast<u8>(r.rd(5)));
+            else if (!(msr & 0x20)) break;
+            else r.run(10);
+        }
+        return r.results();
+    };
+    std::vector<u8> d;
+    std::vector<unsigned> res = read_sector(5, d);
+    CHECK_EQ(d.size(), 512u);
+    CHECK_EQ(load_be<u32>(d.data()), 4u);
+    CHECK(res.size() == 7 && res[0] == 0x40 && res[1] == 0x80 && res[2] == 0);
+    // Write sector 6 of track 0 head 0, then read it back.
+    r.command({0x45, 0x00, 0, 0, 6, 2, 6, 0x1B, 0xFF});
+    unsigned given = 0;
+    for (int guard = 0; given < 512 && guard < 200000; ++guard) {
+        const unsigned msr = r.rd(4);
+        if ((msr & 0xE0) == 0xA0) r.wr(5, static_cast<u8>(0xA5 ^ given)), ++given;
+        else if (!(msr & 0x20)) break;
+        else r.run(10);
+    }
+    CHECK_EQ(given, 512u);
+    r.run(20000);
+    res = r.results();
+    CHECK(res.size() == 7 && res[0] == 0x40 && res[1] == 0x80);
+    res = read_sector(6, d);
+    CHECK(d.size() == 512 && d[0] == 0xA5 && d[1] == 0xA4);
+    // Too slow: nothing taken for a millisecond after the bytes begin.
+    r.command({0x46, 0x00, 0, 0, 7, 2, 7, 0x1B, 0xFF});
+    while (!(r.rd(4) & 0x80)) r.run(100);
+    r.run(1000);
+    res = r.results();
+    CHECK(res.size() == 7 && res[0] == 0x40 && res[1] == 0x10);
+    // With no disk the command waits until the host writes to the FIFO.
+    r.f.eject();
+    r.command({0x46, 0x00, 0, 0, 1, 2, 1, 0x1B, 0xFF});
+    r.run(1000000);
+    CHECK_EQ(r.rd(4) & 0x80, 0u);
+    r.wr(5, 0);
+    res = r.results();
+    CHECK(res.size() == 7 && res[0] == 0x40);
 }
 
 // The EBus devices' registers at ok on a real Ultra 10 (none of them written by

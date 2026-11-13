@@ -151,7 +151,7 @@ void Sabre::map_mem_window(u64 pa, u64 size) { bus_.map_device(pa, size, mem_win
 
 void Sabre::reset(bool power_on) {
     regs_.clear();
-    for (unsigned i = 0; i < 16; ++i) tlb_lru_[i] = static_cast<u8>(i);
+    tlb_last_ = 0;
     // Only a power-on reset initialises Mem_Control0/1 (IIi manual 18.2:
     // SOFT_POR, B_POR and the XIRs leave refresh running as it was).
     if (power_on) {
@@ -587,13 +587,32 @@ bool Sabre::translate(u32 dvma, bool write, u64& pa, unsigned& kind, u64& tte_pa
 // diagnostic accesses show them (tags at A580 + 8n: W 21, streaming 20,
 // 64K 19, VA<31:13> 18:0; data at A600 + 8n: V 30, cacheable 28, PA<40:13>
 // 27:0). A DMA address is looked up there first; a miss walks the TSB and
-// loads the translation into the least recently used entry, or, with the
-// control register's LRU_LCKEN (bit 23) set, into the entry LRU_LCKPTR
-// (22:19) names, the only one then replaced (19.3.2.1, "IOMMU locking").
-// Software flushes an entry when it changes the TSB under it.
+// loads the translation into the entry the IOM's pseudo-LRU picks (10.8):
+// the first not valid, else the first not used (the data's Used bit, 29,
+// set by each translation through an entry); with every entry used, all
+// but one Used bit are cleared and the first not used taken. Which Used
+// bit is kept the manual does not say: the most recently used entry's is
+// taken. With the control register's LRU_LCKEN (bit 23) set, the entry
+// LRU_LCKPTR (22:19) names is the only one replaced (19.3.2.1, "IOMMU
+// locking"). Software flushes an entry when it changes the TSB under it.
 void Sabre::tlb_used(unsigned n) {
-    auto it = std::find(tlb_lru_.begin(), tlb_lru_.end(), static_cast<u8>(n));
-    std::rotate(it, it + 1, tlb_lru_.end());
+    regs_[kIommuDataDiag + 8 * n] |= u64{1} << 29;
+    tlb_last_ = n;
+}
+
+unsigned Sabre::tlb_victim() {
+    if (iommu_ctl_ & (u64{1} << 23)) return static_cast<unsigned>(iommu_ctl_ >> 19) & 0xF;
+    auto data = [this](unsigned n) {
+        const auto d = regs_.find(kIommuDataDiag + 8 * n);
+        return d == regs_.end() ? u64{0} : d->second;
+    };
+    for (unsigned n = 0; n < 16; ++n)
+        if (!(data(n) & (u64{1} << 30))) return n;
+    for (unsigned n = 0; n < 16; ++n)
+        if (!(data(n) & (u64{1} << 29))) return n;
+    for (unsigned n = 0; n < 16; ++n)
+        if (n != tlb_last_) regs_[kIommuDataDiag + 8 * n] &= ~(u64{1} << 29);
+    return tlb_last_ == 0 ? 1 : 0;
 }
 
 bool Sabre::iommu_map(u32 dvma, bool write, u64& pa, unsigned& kind, u64& tte_pa) {
@@ -620,7 +639,7 @@ bool Sabre::iommu_map(u32 dvma, bool write, u64& pa, unsigned& kind, u64& tte_pa
     }
     u64 tte = 0;
     if (!translate(dvma, write, pa, kind, tte_pa, &tte)) return false;
-    const unsigned n = (iommu_ctl_ & (u64{1} << 23)) ? static_cast<unsigned>(iommu_ctl_ >> 19) & 0xF : tlb_lru_[0];
+    const unsigned n = tlb_victim();
     const bool big = (tte >> 61) & 1;
     regs_[kIommuTagDiag + 8 * n] = (tte & 2 ? u64{1} << 21 : 0) | (((tte >> 60) & 1) << 20) | (u64{big} << 19) |
                                    (big ? vpn & 0x7FFF8 : vpn);
