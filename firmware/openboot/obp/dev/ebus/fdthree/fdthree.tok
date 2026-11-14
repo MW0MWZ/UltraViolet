@@ -8,9 +8,11 @@ copyright: Copyright 2026 Andy Taylor
 \ here without DMA (its non-DMA mode: the data through its FIFO a byte at
 \ a time), of the 512-byte sectors of a 3.5" 1.44 MB disk (80 cylinders, 2
 \ heads, 18 sectors a track). As the Ultra 10's driver has them, the
-\ device's blocks are whole cylinders (18 KB, both heads' tracks). The Ultra 5/10's drive ejects by hand. With
-\ no drive answering, the node's status is "disabled", and the selftest,
-\ open and boot say so as an Ultra 10 does.
+\ device's blocks are the sectors, read and written one to a call, and
+\ the controller's results are judged as that driver judges them. The
+\ Ultra 5/10's drive ejects by hand. With no drive answering, the node's
+\ status is "disabled", and the selftest, open and boot say so as an Ultra
+\ 10 does.
 
 Fcode-version3
 
@@ -34,27 +36,36 @@ h# 80 constant rqm			\ main status: ready for a byte
 h# 20 constant ndm			\ in a non-DMA execution phase
 
 : timed-out? ( when -- flag )  get-msecs - 0<  ;
+\ (Time-limited, a second; an Ultra 10's driver counts polls of the main
+\ status register.)
 : wait-rqm ( -- ok? )
    get-msecs d# 1000 +  begin
       msr@ rqm and if  drop true exit  then
       dup timed-out?
    until  drop false
 ;
-: cmd! ( b -- )  wait-rqm drop  fifo!  ;
+: cmd! ( b -- )
+   wait-rqm 0= if  ." Floppy chip not ready for command" cr  abort  then
+   fifo!
+;
 
 \ A command's results: ST0 to ST2 and the sector's address, as many as it
 \ gives
 7 buffer: st
 : results ( n -- )  0 ?do  wait-rqm drop  fifo@ st i + c!  loop  ;
 : st0 ( -- b )  st c@  ;
+: st1 ( -- b )  st 1+ c@  ;
+: st-clear ( -- )  st 7 erase  ;
 
 \ Reset: drive 0 selected, its motor off; the four drives' interrupts
 \ sensed; the step rate, head times and non-DMA mode; 500 kbit/s.
+h# df constant specify0
+h# 03 constant specify1
 0 value motor?
 : fdc-reset ( -- )
    0 dor!  1 ms  h# 0c dor!  false to motor?  d# 10 ms
    4 0 do  8 cmd! 2 results  loop
-   3 cmd!  h# df cmd!  3 cmd!
+   3 cmd!  specify0 cmd!  specify1 cmd!
    0 ccr!
 ;
 : motor-on ( -- )  motor? 0= if  h# 1c dor!  d# 500 ms  true to motor?  then  ;
@@ -72,18 +83,45 @@ h# 20 constant ndm			\ in a non-DMA execution phase
    until  drop h# 80
 ;
 : seek-ok? ( st0 -- ok? )  h# f0 and h# 20 =  ;
-\ (The drive is selected only with its motor on: the controller gates
-\ each drive select with its motor bit. Twice: a drive more than 79 steps
-\ out reaches track 0 the second time.)
+\ One recalibrate: its ST0. (The drive is selected only with its motor
+\ on: the controller gates each drive select with its motor bit.)
+: recal ( -- st0 )  motor-on  7 cmd! 0 cmd!  wait-seek  ;
+\ Twice: a drive more than 79 steps out reaches track 0 the second time.
 : recalibrate ( -- ok? )
-   motor-on
-   7 cmd! 0 cmd!  wait-seek seek-ok?  dup 0= if
-      drop  7 cmd! 0 cmd!  wait-seek seek-ok?
-   then
+   recal seek-ok?  dup 0= if  drop  recal seek-ok?  then
 ;
 : seek-to ( cyl head -- ok? )
    h# f cmd!  2 lshift cmd!  dup cmd!  wait-seek seek-ok?	( cyl ok? )
    swap st 1+ c@ = and
+;
+\ The drive's status (ST3) with a head selected
+: drive-status ( head -- st3 )  4 cmd!  2 lshift cmd!  1 results  st0  ;
+
+\ The controller set up for use, as an Ultra 10's driver checks it, at
+\ open and in the selftest: reset, with no interrupt left to sense; the
+\ timings it was given read back; the drive recalibrated; a seek to track
+\ 2 and back, the track 0 signal off and on; and each head selectable.
+\ (Which commands make each check is not known; these are the ones that
+\ test what each message names.)
+: fdc-init ( -- ok? )
+   fdc-reset
+   sense h# 80 <> if  ." Floppy chip initialization failed." cr  false exit  then
+   h# 0e cmd!  d# 10 0 do  wait-rqm drop  fifo@  loop	( pcn0..3 s0 s1 x x x x )
+   2drop 2drop  specify1 =  swap specify0 =  and	( pcn0..3 ok? )
+   >r 2drop 2drop r>
+   0= if  ." Floppy chip registers read back incorrectly." cr  false exit  then
+   recalibrate drop  st0 h# 10 and if
+      ." Recalibrate failed.  The floppy drive is either missing," cr
+      ." improperly connected, or defective." cr
+      false exit
+   then
+   2 0 seek-to 0= if  ." Seek to track 2 failed." cr  false exit  then
+   0 drive-status h# 10 and if  ." Track 0 reported when on track 2." cr  false exit  then
+   0 0 seek-to 0= if  ." Seek to track 0 failed." cr  false exit  then
+   0 drive-status h# 10 and 0= if  ." Track 0 not reported." cr  false exit  then
+   0 drive-status 4 and if  ." Head select is 1; should be 0." cr  false exit  then
+   1 drive-status 4 and 0= if  ." Head select is 0; should be 1." cr  false exit  then
+   true
 ;
 
 d# 512 constant /sector
@@ -93,70 +131,56 @@ d# 80 constant #cylinders
 
 : chs ( block# -- sector0 head cyl )  #sectors /mod  #heads /mod  ;
 
-\ A read or write command from a sector: the seek, then the command and
-\ its eight bytes (the sector's address, 512 bytes, the track's end).
-0 value eot
+\ A read or write command for one sector: the seek, then the command and
+\ its eight bytes (the sector's address, 512 bytes, the track's end at
+\ the sector: the controller ends with "end of track", as an abnormal
+\ end).
 : sector-cmd ( block# cmd -- ok? )
    >r chs					( sector0 head cyl )
-   2dup swap seek-to 0= if  3drop r> drop false exit  then
+   2dup swap seek-to 0= if  3drop r> drop  st 1+ 6 erase  false exit  then
    r> cmd!  over 2 lshift cmd!  cmd! cmd!	( sector0 )
-   1+ cmd!  2 cmd!  eot cmd!  h# 1b cmd!  h# ff cmd!
+   1+ dup cmd!  2 cmd!  cmd!  h# 1b cmd!  h# ff cmd!
    true
 ;
 
 \ The execution phase: a byte each time the controller asks, while it is
-\ in the phase.
-: data-ready? ( -- flag )
-   wait-rqm  msr@ ndm and 0<>  and
+\ in the phase. No request within the time: the controller reset, and the
+\ first result byte FF (no diskette, as a rule).
+0 value writing?
+: pio ( adr len -- done? )
+   0 ?do
+      wait-rqm 0= if  drop false unloop exit  then
+      msr@ ndm and 0= if  leave  then
+      writing? if  dup i + c@ fifo!  else  fifo@ over i + c!  then
+   loop  drop true
 ;
-: pio-read ( adr len -- )
-   0 ?do  data-ready? 0= if  leave  then  fifo@ over i + c!  loop  drop
-;
-: pio-write ( adr len -- )
-   0 ?do  data-ready? 0= if  leave  then  dup i + c@ fifo!  loop  drop
-;
-\ Done: a normal end, or the end of the track reached (no terminal count
-\ ends a non-DMA transfer) with no other error.
-: sector-ok? ( -- ok? )
-   st0 h# c0 and  ?dup 0= if  true exit  then
-   h# 40 =  st 1+ c@ h# 80 = and  st 2+ c@ 0= and
-;
-\ One sector (the track's end at it)
-: read-sector ( adr block# -- ok? )
-   dup #sectors mod 1+ to eot
-   h# 46 sector-cmd if  /sector pio-read 7 results sector-ok?  else  drop false  then
+: timed-out ( -- )  fdc-reset  st-clear  h# ff st c!  ;
+
+\ As the Ultra 10's driver judges them: a read is good when it ended
+\ abnormally (as a non-DMA read ends, with no terminal count) or with an
+\ overrun; a write only when it ended normally.
+: read-ok? ( -- flag )  st0 h# c0 and h# 40 =  st1 h# 10 and 0<>  or  ;
+: write-ok? ( -- flag )  st0 h# c0 and 0=  ;
+
+: transfer ( adr block# -- ok? )
+   writing? if  h# 45  else  h# 46  then  sector-cmd 0= if  drop false exit  then
+   /sector pio 0= if  timed-out false exit  then
+   7 results
+   writing? if  write-ok?  else  read-ok?  then
 ;
 
-\ A cylinder: both heads' tracks in one multi-track command, as the
-\ Ultra 10's driver reads and writes them.
-#sectors #heads * constant /cylinder		\ sectors a cylinder: a block
-: read-cylinder ( adr cyl# -- ok? )
-   #sectors to eot
-   /cylinder * h# c6 sector-cmd if  /sector /cylinder * pio-read 7 results sector-ok?  else  drop false  then
-;
-: write-cylinder ( adr cyl# -- ok? )
-   #sectors to eot
-   /cylinder * h# c5 sector-cmd if  /sector /cylinder * pio-write 7 results sector-ok?  else  drop false  then
-;
-
-0 instance value rw-xt
-\ (Each cylinder tried up to three times.)
-: rw-cylinder ( adr cyl# -- ok? )
-   3 0 do  2dup rw-xt execute if  2drop true unloop exit  then  loop
-   2drop false
-;
-: r/w-blocks ( adr block# #blocks -- #done )
+\ One block, retried after a data error alone (ST1 20), up to 8 tries,
+\ with the drive recalibrated before each (up to 4 times, until ST0 shows
+\ no equipment check).
+: retry-recal ( -- )  4 0 do  recal h# 10 and 0= if  leave  then  loop  ;
+: rw-block ( adr block# -- ok? )
    motor-on
-   dup 0 ?do					( adr block# #blocks )
-      2 pick i /sector /cylinder * * +  2 pick i +  rw-cylinder 0= if
-         drop i leave
-      then
-   loop  nip nip
-;
-
-: .recalibrate-failed ( -- )
-   ." Recalibrate failed.  The floppy drive is either missing," cr
-   ." improperly connected, or defective." cr
+   0  begin					( adr block# tries )
+      >r 2dup transfer if  2drop r> drop true exit  then
+      st1 h# 20 <> if  2drop r> drop false exit  then
+      r> 1+  dup 8 >= if  3drop false exit  then
+      retry-recal
+   again
 ;
 
 \ At the probe, as an Ultra 10's own OpenBoot leaves the node: a drive
@@ -195,15 +219,18 @@ external
 
 : dma-alloc ( n -- adr )  alloc-mem  ;
 : dma-free ( adr n -- )  free-mem  ;
-: block-size ( -- n )  /sector /cylinder *  ;
-: max-transfer ( -- n )  /sector /cylinder *  ;
-: #blocks ( -- n )  #cylinders  ;
+: block-size ( -- n )  /sector  ;
+\ (One block a transfer, as read-blocks makes it.)
+: max-transfer ( -- n )  /sector  ;
+: #blocks ( -- n )  #sectors #heads * #cylinders *  ;
 
+\ As the Ultra 10's: one block whatever the count asked for, at byte
+\ block# * 512; 1 if it was transferred, else 0, and nothing shown.
 : read-blocks ( adr block# #blocks -- #read )
-   ['] read-cylinder to rw-xt  r/w-blocks
+   drop  false to writing?  rw-block  if 1 else 0 then
 ;
 : write-blocks ( adr block# #blocks -- #written )
-   ['] write-cylinder to rw-xt  r/w-blocks
+   drop  true to writing?  rw-block  if 1 else 0 then
 ;
 
 : close ( -- )
@@ -213,10 +240,11 @@ external
 ;
 
 : open ( -- ok? )
-   fdc-map fdc-reset
-   recalibrate 0= if  .recalibrate-failed cr  fdc-off false exit  then
-   init-deblocker 0= if  close false exit  then
-   init-label-package 0= if  close false exit  then
+   " reg" get-my-property if  ." Missing reg property on floppy" cr  false exit  then
+   2drop
+   fdc-map  fdc-init 0= if  fdc-off false exit  then
+   init-deblocker 0= if  ." Can't open deblocker package" cr  close false exit  then
+   init-label-package 0= if  ." Can't open disk label package" cr  close false exit  then
    true
 ;
 
@@ -231,17 +259,20 @@ external
 
 : reset ( -- )  fdc-off  ;
 
-\ The selftest: the drive found (recalibrated), and the disk's first
+\ The selftest: the controller set up and checked, and the disk's first
 \ sector read.
 : selftest ( -- 0 | -1 )
    ." Testing floppy disk system.  A formatted disk should be in the drive." cr
-   fdc-map fdc-reset
-   recalibrate if
-      motor-on
-      /sector alloc-mem  dup 0 read-sector  swap /sector free-mem
-      if  ." Test succeeded." cr 0  else  ." Read failed.  The disk is unformatted or defective." cr -1  then
+   fdc-map  fdc-init 0= if  fdc-off -1 exit  then
+   /sector alloc-mem  dup 0 false to writing?  rw-block  swap /sector free-mem
+   if
+      ." Test succeeded." cr 0
    else
-      .recalibrate-failed -1
+      st0 h# ff = if
+         ." No diskette, or incorrect format." cr
+      else
+         ." Can't read the first sector." cr
+      then  -1
    then
    fdc-off
 ;

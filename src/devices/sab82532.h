@@ -45,6 +45,7 @@ private:
         std::array<u8, 32> xfifo{};
         unsigned xcount = 0;        // bytes written to the XFIFO since the last XF
         std::deque<u8> sending;     // bytes being shifted out
+        std::deque<u8> looped;      // bytes sent in the test loop (MODE.TLP), on their way to the receiver
         unsigned released = 0;      // bytes of the block offered by the last RPF/TCD/TIME not yet read
         bool block = false;         // a block offered and not yet acknowledged by RMC (the next waits for it)
         u8 mode = 0, timr = 0, xon = 0x11, xoff = 0x13, tcr = 0, dafo = 0, rfc = 0;

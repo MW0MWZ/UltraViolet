@@ -15,32 +15,22 @@ void v9_ops(u64 *out);
 /* ---------------------------------------------------------------------
  * NVRAM: the M48T59's battery, and its scratch bytes: where an Ultra 10's
  * selftest tests them, 1d00-1d3f (in the selftest's own area past the
- * configuration variables), each saved and put back.
+ * configuration variables). Each test leaves them as an Ultra 10's does:
+ * sixteen words 00000000, 11111111 ... ffffffff.
  */
-#define NV_BASE	0x1d00
+#define NV_BASE	NV_SCRATCH
 #define NV_SIZE	0x40
 
-static u8 nv_saved[NV_SIZE];
-
-static void nv_save(void)
+static void nv_leave(void)
 {
 	u32 i;
 
-	for (i = 0; i < NV_SIZE; i++)
-		nv_saved[i] = nvram_ld8(NV_BASE + i);
-}
-
-static void nv_restore(void)
-{
-	u32 i;
-
-	for (i = 0; i < NV_SIZE; i++)
-		nvram_st8(NV_BASE + i, nv_saved[i]);
+	for (i = 0; i < NV_SIZE / 4; i++)
+		nvram_st(NV_BASE + 4 * i, 0x11111111U * i, 4);
 }
 
 void post_battery(void)
 {
-	post_suspect("NVRAM");
 	if (nvram_ld8(0x1ff0) & 0x10)
 		post_fail("Battery Low");
 }
@@ -49,13 +39,11 @@ void post_nv_addr(void)
 {
 	u32 i;
 
-	post_suspect("NVRAM");
-	nv_save();
 	for (i = 0; i < NV_SIZE; i++)
 		nvram_st8(NV_BASE + i, i);
 	for (i = 0; i < NV_SIZE && !post_failed(); i++)
 		post_compare_at(nvram_ld8(NV_BASE + i), i, NV_BASE + i, "Scratch address mismatch");
-	nv_restore();
+	nv_leave();
 }
 
 void post_nv_data(void)
@@ -63,15 +51,13 @@ void post_nv_data(void)
 	static const u8 pat[4] = { 0x00, 0xff, 0x55, 0xaa };
 	u32 i, p;
 
-	post_suspect("NVRAM");
-	nv_save();
 	for (i = 0; i < NV_SIZE && !post_failed(); i++)
 		for (p = 0; p < 4; p++) {
 			nvram_st8(NV_BASE + i, pat[p]);
 			post_compare_at(nvram_ld8(NV_BASE + i), pat[p], NV_BASE + i,
 					"Scratch data mismatch");
 		}
-	nv_restore();
+	nv_leave();
 }
 
 /* ---------------------------------------------------------------------
@@ -88,7 +74,6 @@ void post_dtlb_tags(void)
 	u64 out[2];
 	u32 i, p;
 
-	post_suspect("DMMU");
 	for (i = 0; i < 64 && !post_failed(); i++)
 		for (p = 0; p < 2; p++) {
 			dtlb_swap(i, pat[p], dtlb_entry(i, 1), out);
@@ -102,7 +87,6 @@ void post_dtlb_data(void)
 	u64 out[2];
 	u32 i, p;
 
-	post_suspect("DMMU");
 	for (i = 0; i < 64 && !post_failed(); i++)
 		for (p = 0; p < 2; p++) {
 			dtlb_swap(i, dtlb_entry(i, 0), pat[p] & TTE_MASK, out);
@@ -122,7 +106,6 @@ void post_dtlb_data(void)
 #define EC_TAG_MASK 0x3cfffULL	/* parity, state, tag */
 #define EC_TAG_INVALID 0x30000ULL
 
-void post_probe_ec(void) { }	/* (the size is known: post.c) */
 
 static u64 ec_value(u64 pattern, int addr, u32 offset)
 {
@@ -142,7 +125,6 @@ static void ec_data(u64 pattern, int addr, const char *msg)
 {
 	u32 off;
 
-	post_suspect("Ecache");
 	for (off = 0; off < ecache_size; off += 8)
 		asi_stx(EC_DATA + off, 0x76, ec_value(pattern, addr, off));
 	for (off = 0; off < ecache_size && !post_failed(); off += 8)
@@ -155,7 +137,6 @@ static void ec_tags(u64 pattern, int addr, const char *msg)
 	u32 off;
 	u64 v;
 
-	post_suspect("Ecache");
 	for (off = 0; off < ecache_size; off += 0x40) {
 		asi_stx(0, 0x4e, ec_value(pattern, addr, off));
 		asi_stx(EC_TAGS + off, 0x76, 0);
@@ -203,7 +184,6 @@ void post_v9(void)
 	u64 out[10];
 	u32 i;
 
-	post_suspect("CPU (Basic)");
 	v9_ops(out);
 	for (i = 0; i < 10; i++)
 		post_compare(out[i], want[i].value, want[i].msg);
@@ -217,7 +197,6 @@ void post_tick(void)
 	u64 out[3];
 	u32 p;
 
-	post_suspect("CPU (Basic)");
 	for (p = 0; p < 2; p++) {
 		tick_test(pat[p], out);
 		if (out[2] <= out[0])
@@ -230,7 +209,6 @@ void post_tick(void)
    false, not. */
 void post_soft_trap(void)
 {
-	post_suspect("CPU (Basic)");
 	post_compare(trap_run(do_ta), 0x171, "Trap not taken");
 	post_compare(trap_run(do_tn), 0, "Trap taken");
 }
@@ -244,7 +222,6 @@ void post_softint(void)
 {
 	u32 level, set, cleared;
 
-	post_suspect("CPU (Basic)");
 	for (level = 1; level < 14; level++) {
 		set = softint_setclr(1 << level, &cleared);
 		if (cleared & (1 << level))
@@ -276,31 +253,28 @@ static void mmu_reg(u64 va, u32 asi, u64 mask, const char *msg)
 	reg(va, asi, 0xaaaaaaaaaaaaaaaaULL & mask, msg);
 }
 
-void post_pctx(void) { post_suspect("DMMU"); mmu_reg(8, DMMU, 0x1fff, "Primary Context"); }
-void post_sctx(void) { post_suspect("DMMU"); mmu_reg(0x10, DMMU, 0x1fff, "Secondary Context"); }
-void post_dtsb(void) { post_suspect("DMMU"); mmu_reg(0x28, DMMU, ~0xff8ULL, "DMMU TSB"); }
-void post_itsb(void) { post_suspect("IMMU"); mmu_reg(0x28, IMMU, ~0xff8ULL, "IMMU TSB"); }
-void post_pawp(void) { post_suspect("DMMU"); mmu_reg(0x40, DMMU, 0x1fffffffff8ULL, "PA Watchpoint"); }
+void post_pctx(void) { mmu_reg(8, DMMU, 0x1fff, "Primary Context"); }
+void post_sctx(void) { mmu_reg(0x10, DMMU, 0x1fff, "Secondary Context"); }
+void post_dtsb(void) { mmu_reg(0x28, DMMU, ~0xff8ULL, "DMMU TSB"); }
+void post_itsb(void) { mmu_reg(0x28, IMMU, ~0xff8ULL, "IMMU TSB"); }
+void post_pawp(void) { mmu_reg(0x40, DMMU, 0x1fffffffff8ULL, "PA Watchpoint"); }
 
 /* Tag access: VA<63:13> (sign-extended from bit 43) and a context; the VA
    watchpoint: VA<43:3>, sign-extended. */
 void post_dtag(void)
 {
-	post_suspect("DMMU");
 	reg(0x30, DMMU, 0x0000055555554aaaULL, "DMMU Tag Access");
 	reg(0x30, DMMU, 0xfffffaaaaaaab555ULL, "DMMU Tag Access");
 }
 
 void post_itag(void)
 {
-	post_suspect("IMMU");
 	reg(0x30, IMMU, 0x0000055555554aaaULL, "IMMU Tag Access");
 	reg(0x30, IMMU, 0xfffffaaaaaaab555ULL, "IMMU Tag Access");
 }
 
 void post_vawp(void)
 {
-	post_suspect("DMMU");
 	reg(0x38, DMMU, 0x0000055555555550ULL, "VA Watchpoint");
 	reg(0x38, DMMU, 0xfffffaaaaaaaaaa8ULL, "VA Watchpoint");
 }
@@ -354,7 +328,6 @@ void post_dcache_ram(void)
 {
 	static const struct arr a = { 0x46, 8, 2048, ~0ULL };
 
-	post_suspect("Dcache");
 	arr_test(&a, "Dcache RAM address mismatch", "Dcache RAM data mismatch");
 	arr_clear(0x47, 0x20, 512);
 }
@@ -364,7 +337,6 @@ void post_dcache_tag(void)
 {
 	static const struct arr a = { 0x47, 0x20, 512, 0x3fffffffULL };
 
-	post_suspect("Dcache");
 	arr_test(&a, "Dcache tag address mismatch", "Dcache tag data mismatch");
 	arr_clear(0x47, 0x20, 512);
 }
@@ -376,7 +348,6 @@ void post_icache_ram(void)
 {
 	static const struct arr a = { 0x66, 8, 2048, ~0ULL };
 
-	post_suspect("Icache");
 	arr_test(&a, "Icache RAM address mismatch", "Icache RAM data mismatch");
 	arr_clear(0x67, 0x20, 512);
 }
@@ -385,7 +356,6 @@ void post_icache_tag(void)
 {
 	static const struct arr a = { 0x67, 0x20, 512, 0x1fffffff00ULL };
 
-	post_suspect("Icache");
 	arr_test(&a, "Icache tag address mismatch", "Icache tag data mismatch");
 	arr_clear(0x67, 0x20, 512);
 }
@@ -394,7 +364,6 @@ void post_icache_next(void)
 {
 	static const struct arr a = { 0x6f, 0x10, 1024, 0xffff00ULL };
 
-	post_suspect("Icache");
 	arr_test(&a, "Icache next address mismatch", "Icache next data mismatch");
 	arr_clear(0x67, 0x20, 512);
 }
@@ -405,7 +374,6 @@ void post_icache_predecode(void)
 {
 	u32 i, p, pat[3];
 
-	post_suspect("Icache");
 	for (i = 0; i < 1024 && !post_failed(); i++) {
 		pat[0] = 0x55aa;
 		pat[1] = 0xaa55;

@@ -16,10 +16,11 @@ headerless
 : xcall-resume-cpu ( cpu# -- failed? )  drop true  ;
 : xcall-get-pc ( cpu# -- pc failed? )  drop 0 true  ;
 
-\ The Sabre's reset control: POR (bit 31) set by a power-on reset, SOFT_POR
-\ (bit 30) by reset-all. Read once, at its first use, and kept: the start
-\ clears the register (below), and the reason is asked for after that
-\ (#power-cycles, POST, retained memory).
+\ The IIi's reset control: POR (bit 31) set by a power-on reset, SOFT_POR
+\ (bit 30) by reset-all, SOFT_XIR (29), B_POR (28) and B_XIR (27) by the
+\ software XIR and the buttons. Read once, at its first use, and kept: the
+\ start clears the register (below), and the reason is asked for after
+\ that (#power-cycles, POST, retained memory, the diagnostic report).
 h# 1fe.0000.f020 constant reset-status-pa
 -1 value reset-status
 : reset-status@ ( -- n )
@@ -28,14 +29,26 @@ h# 1fe.0000.f020 constant reset-status-pa
    then  reset-status
 ;
 : power-on-reset? ( -- flag )  reset-status@ h# 8000.0000 and 0<>  ;
-\ The root's reset-reason: a power-on, or one the Sabre's reset control
-\ made (SOFT_POR: reset-all)
 : soft-power-on-reset? ( -- flag )  reset-status@ h# 4000.0000 and 0<>  ;
+\ The five status bits as a number: B_XIR 1, B_POR 2, SOFT_XIR 4,
+\ SOFT_POR 8, POR 10.
+: reset-bits ( -- n )  reset-status@ d# 27 rshift h# 1f and  ;
+\ The root's reset-reason, as an Ultra 10 names it: one status bit alone
+\ names the reset; none, or more than one, is "???". A watchdog reset or a
+\ SIR leaves no bit. Made once, at the start, and never changed after.
+: reset-reason$ ( -- adr,len )
+   reset-bits  case
+      h# 01  of  " B-XIR"  endof
+      h# 02  of  " B-POR"  endof
+      h# 04  of  " S-XIR"  endof
+      h# 08  of  " S-POR"  endof
+      h# 10  of  " POR"    endof
+      ( default )  " ???" rot
+   endcase
+;
 stand-init: Reset reason
    root-device
-      power-on-reset? if  " POR"  else
-      soft-power-on-reset? if  " S-POR"  else  " RESET"  then  then
-      encode-string " reset-reason" property
+      reset-reason$ encode-string " reset-reason" property
    device-end
    \ The reset control's bits cleared, as an Ultra 10 does at each start:
    \ the value read written back (POR, B_POR and B_XIR clear when written

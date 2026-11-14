@@ -5,7 +5,8 @@
 //
 // BAR0 is a 16 MiB aperture onto the frame buffer: the lower 8 MiB with the
 // register blocks at its top (block 1 at 0x7FF800, block 0 at 0x7FFC00,
-// as BUS_CNTL enables them), the upper 8 MiB the same memory again; each
+// as BUS_CNTL enables them), the upper 8 MiB the same memory and registers
+// again (blocks at 0xFFF800, 0xFFFC00); each
 // half can swap the bytes within 16- or 32-bit units (MEM_CNTL), for
 // big-endian hosts. BAR1 is block 0's display and configuration registers
 // in I/O space, BAR2 a 4 KiB window with block 1 then block 0.
@@ -98,6 +99,9 @@ private:
     // at 0, block 0 at 0x400).
     u64 regs_read(u32 offset, unsigned size);
     void regs_write(u32 offset, unsigned size, u64 value);
+    // The same through the upper half's register window (its byte swap).
+    u64 upper_regs_read(u32 offset, unsigned size);
+    void upper_regs_write(u32 offset, unsigned size, u64 value);
     // The frame buffer through an aperture half (`upper`).
     u64 aperture_read(u32 offset, unsigned size, bool upper) const;
     void aperture_write(u32 offset, unsigned size, u64 value, bool upper);

@@ -39,6 +39,9 @@
 \ any nuclear facility. 
 \ 
 \ ========== Copyright Header End ============================================
+\ Adapted by Andy Taylor, 2026: on the Ultra 5/10 (Ultra5_10) the
+\ "translations" property lists the ranges highest virtual address first,
+\ as an Ultra 10's does.
 id: @(#)trans.fth 1.22 06/02/16
 purpose: 
 copyright: Copyright 2006 Sun Microsystems, Inc.  All Rights Reserved
@@ -121,6 +124,21 @@ variable trans-cur  0 trans-cur !
    then 
 ;
 
+[ifdef] Ultra5_10
+\ The walk gives the ranges lowest virtual address first; an Ultra 10
+\ lists them highest first.
+: swap-x  ( adr1 adr2 -- )  over x@ over x@  3 pick x!  swap x!  drop  ;
+: reverse-translations  ( xdr,len -- xdr,len )
+   2dup /trans-entry /                            ( xdr,len adr n )
+   dup 2/  0  ?do                                 ( xdr,len adr n )
+      over i /trans-entry * +                     ( xdr,len adr n a1 )
+      2 pick  2 pick i - 1-  /trans-entry * +     ( xdr,len adr n a1 a2 )
+      /trans-entry 0  do  2dup swap-x  /x + swap /x + swap  /x +loop
+      2drop                                       ( xdr,len adr n )
+   loop  2drop                                    ( xdr,len )
+;
+[then]
+
 \ called to generate "translations" property on-the-fly
 \ once client takes over the trap table there will be no additional
 \ mappings in the vpt so we return the last saved translations
@@ -136,6 +154,9 @@ variable trans-cur  0 trans-cur !
          over if					( xdr,len )
             drop 0					( xdr,0 )
             ['] save-all-translations vpt-walker	( xdr,len )
+[ifdef] Ultra5_10
+            reverse-translations			( xdr,len )
+[then]
             2dup last-translation-buffer		( xdr,len xdr,len last ) 
             2@ over swap erase				( xdr,len xdr,len buf )
             swap trans-max min				( xdr,len xdr buf len' )
@@ -149,6 +170,9 @@ variable trans-cur  0 trans-cur !
          over swap erase 0				( xdr,0 )
          0 trans-cur !
          ['] save-clip-translations vpt-walker		( xdr,len )
+[ifdef] Ultra5_10
+         reverse-translations				( xdr,len )
+[then]
          2dup last-translation-buffer 2!
       then
    then

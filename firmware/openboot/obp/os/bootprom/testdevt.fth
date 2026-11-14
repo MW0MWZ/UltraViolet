@@ -137,10 +137,21 @@ previous
       exit?  if  r> 3drop true  exit  then 	
 [then]
       to-display-column		( adr len )
+[ifdef] Ultra5_10
+      \ Every row is #ints/line integers, the last one too: as an Ultra
+      \ 10's, it reads on past the value's end into what follows it. (A
+      \ value is in the dictionary, followed by the property's header, or
+      \ made just above "here" with the dictionary mapped beyond; the
+      \ generated "translations" are whole rows.)
+      r@ 1 max  0  do		( adr len  )
+         decode-int 8.x		( adr'len' )
+      loop cr			( adr'len' )
+[else]
       r@  0  do			( adr len  )  
          decode-int 8.x		( adr'len' ) 
          dup 0=  ?leave		( adr'len' ) 
       loop cr			( adr'len' )
+[then]
    repeat			( adr'len' )
    r> 3drop false		( exited? )
 ;
@@ -207,33 +218,34 @@ headerless
 
 [else]
 \ The Ultra 5/10's display: the integer properties known by name (these
-\ and the PCI ones of knownprops.fth), a row of cells to a line; any
-\ other value of two cells as two integers, one to a line; a single
-\ string of printable bytes (with or without a final null) as text,
-\ however short; anything else as hex bytes, at most 16 and nothing
-\ after them. Composite strings are bytes. A known property's rows end
-\ with its value, a short last row and all.
+\ and the PCI ones of knownprops.fth) in rows of a number of integers
+\ each, by the property (the last row as long as the others, past the
+\ value's end); any other value of two cells as two integers, one to a
+\ line; a single string of printable bytes (with or without a final
+\ null) as text, however short; anything else as hex bytes, at most 16
+\ and nothing after them. Composite strings are bytes.
 
 : my-cells  ( default name$ -- n )  get-property 0=  if  get-encoded-int nip  then  ;
+
+\ The parent's #address-cells (2 if it has none).
+: parent-#adr-cells  ( -- n )
+   root-device?  if  '#adr-cells @  exit  then
+   current-device >r pop-device #adr-cells r> push-device
+;
 
 headers
 vocabulary known-int-properties
 also known-int-properties definitions
 
-: available        ( -- n )  '#adr-cells @ size+  ;
-: reg              ( -- n )  '#adr-cells @ size+  ;
-: existing         ( -- n )  '#adr-cells @ size+  ;
-: ranges           ( -- n )  '#adr-cells @  #adr-cells + my-#size-cells +  ;
+: available        ( -- n )  parent-#adr-cells size+  ;
+: reg              ( -- n )  parent-#adr-cells size+  ;
+: existing         ( -- n )  parent-#adr-cells size+  ;
+: ranges           ( -- n )  parent-#adr-cells  #adr-cells + my-#size-cells +  ;
 : interrupt-map-mask  ( -- n )  #adr-cells  1 " #interrupt-cells" my-cells +  ;
-\ A unit's address and interrupt, the interrupt parent's phandle and its
-\ interrupt (no parent address, as these maps are built).
-: interrupt-map  ( adr len -- adr len n )
-   interrupt-map-mask >r                         ( adr len )  ( r: ai )
-   dup r@ 1+ /l * <  if  r> 1+ exit  then        ( adr len )
-   over r@ la+ /l decode-int nip nip             ( adr len phandle )
-   current-device >r  push-device
-   1 " #interrupt-cells" my-cells                ( adr len pi )
-   r> push-device  r> + 1+                       ( adr len n )
+\ The node's own cells: a unit's address and interrupt, a phandle, and a
+\ mapped interrupt.
+: interrupt-map  ( -- n )
+   interrupt-map-mask 1+  1 " #mapped-interrupt-cells" my-cells +
 ;
 : translations     ( -- n )  6  ;
 
@@ -244,8 +256,14 @@ alias clock-frequency 1 ( -- n )
 alias #address-cells 1 ( -- n )
 alias #size-cells 1 ( -- n )
 alias #interrupt-cells 1 ( -- n )
+alias #mapped-interrupt-cells 1 ( -- n )
 alias upa-portid 1 ( -- n )
 alias scsi-initiator-id 1 ( -- n )
+alias burst-sizes 1 ( -- n )
+alias up-burst-sizes 1 ( -- n )
+alias slot-address-bits 1 ( -- n )
+alias breakpoint-trap 1 ( -- n )
+alias pulse-interrupts 1 ( -- n )
 
 previous definitions
 

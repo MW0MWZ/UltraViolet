@@ -69,7 +69,9 @@ overload: stand-init-io  ( -- )
 headers
 
 \ The reset this start is for, from the reset code (%i2): 0 power-on (and
-\ a soft power-on reset), 1 watchdog, 2 XIR, 3 SIR, 4 RED state.
+\ a soft power-on reset, and an XIR that found OpenBoot gone), 1 watchdog.
+\ (An XIR, a SIR or a RED state exception otherwise goes back into the
+\ OpenBoot running, at the XIR trap entry below.)
 nuser reset-kind
 \ The POST's result, from the reset code: its status (%i3), the address of
 \ its message in the PROM (%i4), the board descriptor (%l0), and whether

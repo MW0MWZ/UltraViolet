@@ -309,7 +309,8 @@ post_trap_fatal:
 	ldx	[%g1], %g2
 	add	%o1, %g2, %o1
 	mov	1, %o0
-	clr	%o2
+	set	post_board, %g1		/* (post_unexpected_trap's) */
+	ldx	[%g1], %o2
 	ba	post_return
 	nop
 

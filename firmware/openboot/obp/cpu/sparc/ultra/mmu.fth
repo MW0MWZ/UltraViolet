@@ -39,6 +39,9 @@
 \ any nuclear facility. 
 \ 
 \ ========== Copyright Header End ============================================
+\ Adapted by Andy Taylor, 2026: on the Ultra 5/10 (Ultra5_10) the walk of
+\ the page tables merges two ranges only where they are contiguous in both
+\ virtual and physical addresses with the same attributes ((vpt-pgmap)).
 id: @(#)mmu.fth 1.32 05/02/16
 purpose: 
 copyright: Copyright 2005 Sun Microsystems, Inc. All Rights Reserved
@@ -391,10 +394,19 @@ constant /prev-vpt-data
          else					( va size tte )
             prev-tte-valid? if			( va size tte )
                prev-vpt-data >r			( va size tte )
+[ifdef] Ultra5_10
+               \ Merged only where both the virtual and the physical
+               \ addresses carry on from the last range, with the same
+               \ attributes: its TTE plus its size is this one's.
+               2 pick  r@ >vpt-va x@ r@ >vpt-size x@ +  =	( va size tte f )
+               over  r@ >vpt-tte x@ r@ >vpt-size x@ +  =  and	( va size tte f )
+               if				( va size tte )
+[else]
                2 pick r@ >vpt-va x@ -		( va size tte n )
                over tte> drop			( va size tte n pa.lo )
                r@ >vpt-tte x@ tte> drop -	( va size tte n n )
                = if				( va size tte )
+[then]
                   \ merge sizes, because va and pa are contiguous.
                   drop nip			( size )
                   r> >vpt-size +!		( )

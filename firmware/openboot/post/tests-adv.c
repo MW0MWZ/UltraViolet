@@ -94,7 +94,6 @@ static void st(u32 va, u32 asi, u64 v) { asi_stx(va, asi, v); }
    a miss, 0 on a hit). */
 void post_dmmu_hit_miss(void)
 {
-	post_suspect("DMMU");
 	pages_unmapped();
 	mmus_on(LSU_DM);
 	post_compare(dtag_after(VA_MEM), VA_MEM, "DMMU miss");
@@ -105,7 +104,6 @@ void post_dmmu_hit_miss(void)
 /* A routine (retl; nop) in a page not yet run. */
 void post_immu_hit_miss(void)
 {
-	post_suspect("IMMU");
 	phys_st32(CODE_PA, 0x81c3e008);
 	phys_st32(CODE_PA + 4, 0x01000000);
 	pages_unmapped();
@@ -119,7 +117,6 @@ void post_immu_hit_miss(void)
    ASI (88). */
 void post_little(void)
 {
-	post_suspect("DMMU");
 	pages_unmapped();
 	mmus_on(LSU_DM);
 	st(VA_MEM, 0x80, 0x0102030405060708ULL);
@@ -133,11 +130,6 @@ void post_little(void)
    each size; and stored through each. */
 void post_iu_asi(void)
 {
-	u32 asi_ld32(u64 va, u32 asi);
-	u32 asi_ld16(u64 va, u32 asi);
-	u32 asi_ld8(u64 va, u32 asi);
-
-	post_suspect("CPU (Basic)");
 	pages_unmapped();
 	mmus_on(LSU_DM);
 	st(VA_MEM, 0x80, 0x0123456789abcdefULL);
@@ -167,7 +159,6 @@ void post_fpu_asi(void)
 {
 	u32 buf = (u32)fbuf;
 
-	post_suspect("FPU");
 	pages_unmapped();
 	mmus_on(LSU_DM);
 	st(VA_MEM, 0x80, 0x0123456789abcdefULL);
@@ -190,7 +181,6 @@ void post_ec_thrash(void)
 	const u64 base = 8 * MB;
 	u32 off, i;
 
-	post_suspect("Ecache");
 	for (off = 0; off < ecache_size && !post_failed(); off += 0x10040) {
 		for (i = 0; i < 4; i++)
 			asi_stx(base + (u64)i * ecache_size + off, 0x14,
@@ -225,16 +215,11 @@ static void sfsr_clear(void) { asi_stx(0x18, 0x58, 0); }
 #define APB_CONFIG(fn, reg) (0x1fe01000000ULL | 1 << 11 | (fn) << 8 | (reg))
 #define APB_MEM_MAP 0xdf
 
-u32 asi_ld8(u64 va, u32 asi);
-void asi_st8(u64 va, u32 asi, u32 v);
-u32 asi_ld16(u64 va, u32 asi);
-void asi_st16(u64 va, u32 asi, u32 v);
 
 void post_data_access(void)
 {
 	u32 map0, map1;
 
-	post_suspect("CPU (Basic)");
 	pages_unmapped();
 	mmus_on(LSU_DM);
 	acc_va = VA_MEM;
@@ -258,107 +243,149 @@ void post_data_access(void)
 }
 
 /* ---------------------------------------------------------------------
- * All Sabre IOMMU Error Reporting Tests: PIO reads the PCI bus ends in
- * an abort, with APB B's I/O and memory enabled and its memory map 8f
- * (PCI memory 0-7fff.ffff and e000.0000-ffff.ffff; APB A's map without
- * c000.0000 and e000.0000). A master abort: a read of c000.0000, which nothing
- * claims, the processor's AFSR PRIV and TO, the Sabre's received master
- * abort. A target abort: with APB B's bridge control in master-abort
- * mode (bit 5; with parity and SERR# reporting), a read of e000.1000,
- * which nothing behind it claims: APB B answers with a target abort
- * (it signalled one, status bit 11), the Sabre received one (bit 12) and
- * the processor's AFSR has PRIV and BERR. Each status is cleared by
- * writing 1, APB B's PIO AFSR (e8) too, and the bridge put back.
+ * All Sabre IOMMU Error Reporting Tests: a 32-bit PIO read that the PCI
+ * bus ends in an abort. A master abort: APB B's memory map 8f (PCI memory
+ * c000.0000-dfff.ffff not passed to its bus), a read of c001.0000. A
+ * target abort: APB B's bridge control 23 (parity and SERR# responses,
+ * master-abort mode), a read of e000.1000, which nothing behind APB B
+ * claims, so that APB B ends it in a target abort. Each must trap
+ * (data_access_error, 32) and leave exactly PRIV and TO (or BERR) in the
+ * processor's AFSR, the address in its AFAR, nothing in the Sabre's UE,
+ * CE or PCI AFSRs, its PCI control as set and its PCI status with the
+ * abort received; then the errors are cleared, as an Ultra 10's POST
+ * clears them.
  */
-#define PCI_ABORT	0x1ffe0001000ULL
-#define SABRE_STATUS	0x1fe01000006ULL
+#define SABRE_UE_AFSR	0x1fe00000030ULL
+#define SABRE_CE_AFSR	0x1fe00000040ULL
+#define SABRE_PCI_CTL	0x1fe00002000ULL
+#define SABRE_PCI_AFSR	0x1fe00002010ULL
+#define SABRE_CONFIG(r)	(0x1fe01000000ULL | (r))
+#define SABRE_STATUS	SABRE_CONFIG(0x06)
+#define PCI_CTL_SET	0x0000001c00200101ULL
+#define PCI_CTL_READ	0x0000001000200101ULL	/* (bits 35:34 clear when written) */
+#define PCI_AFSR_ERRS	0xff00000000000000ULL
 #define AFSR_PRIV	(1ULL << 31)
 #define AFSR_TO		(1ULL << 27)
 #define AFSR_BERR	(1ULL << 26)
-#define APB_COMMAND	0x04
+#define AFSR_CLEAR	0x1adf00000ULL		/* the error bits, written 1 */
+#define ESTATE_ERRS	0x1bULL			/* NCEEN, CEEN and the others */
 #define APB_STATUS	0x06
 #define APB_SEC_STATUS	0x1e
 #define APB_BRIDGE_CTL	0x3e
+#define APB_PIO_AFSR	0xe8
+#define PIO_MASTER	0x1ffc0010000ULL
+#define PIO_TARGET	0x1ffe0001000ULL
 
-static u32 apb_cmd, apb_ctl, apb_map0, apb_map1;
+static void estate_set(u64 v) { asi_stx(0, 0x4b, v); }
+static u64 afar_get(void) { return asi_ldx(0, 0x4d); }
 
-static void apb_set(void)
+/* The Sabre's error state clear, its PCI control and configuration
+   header set (each read back), the processor's error traps enabled. */
+static void sabre_err_setup(void)
 {
-	apb_cmd = asi_ld16(APB_CONFIG(1, APB_COMMAND), 0x1d);
-	apb_ctl = asi_ld8(APB_CONFIG(1, APB_BRIDGE_CTL), 0x1d);
-	apb_map0 = asi_ld8(APB_CONFIG(0, APB_MEM_MAP), 0x1d);
-	apb_map1 = asi_ld8(APB_CONFIG(1, APB_MEM_MAP), 0x1d);
-	asi_st16(APB_CONFIG(1, APB_COMMAND), 0x1d, apb_cmd | 0x147);
-	asi_st8(APB_CONFIG(0, APB_MEM_MAP), 0x1d, apb_map0 & ~0xc0);
-	asi_st8(APB_CONFIG(1, APB_MEM_MAP), 0x1d, 0x8f);
+	u32 r;
+
+	asi_stx(SABRE_UE_AFSR, 0x15, 0x6f00000000000000ULL);
+	asi_ldx(SABRE_UE_AFSR, 0x15);
+	asi_stx(SABRE_CE_AFSR, 0x15, 0xfc00000000000000ULL);
+	asi_ldx(SABRE_CE_AFSR, 0x15);
+	asi_stx(SABRE_PCI_AFSR, 0x15, PCI_AFSR_ERRS);
+	post_compare(asi_ldx(SABRE_PCI_AFSR, 0x15) & PCI_AFSR_ERRS, 0, "Sabre PCI AFSR");
+	asi_stx(SABRE_PCI_CTL, 0x15, PCI_CTL_SET);
+	/* (the mask the read back is compared under: a guess) */
+	post_compare(asi_ldx(SABRE_PCI_CTL, 0x15) & ~0xe00000000ULL, PCI_CTL_READ, "Sabre PCI Control");
+	asi_st16(SABRE_CONFIG(0x04), 0x1d, 0x0006);	/* memory, master */
+	asi_ld16(SABRE_CONFIG(0x04), 0x1d);
+	asi_st16(SABRE_STATUS, 0x1d, 0xfba0);
+	asi_ld16(SABRE_STATUS, 0x1d);
+	asi_ld32(SABRE_CONFIG(0x00), 0x1d);
+	asi_ld32(SABRE_CONFIG(0x08), 0x1d);
+	asi_st8(SABRE_CONFIG(0x0c), 0x1d, 0);
+	asi_ld8(SABRE_CONFIG(0x0c), 0x1d);
+	asi_st8(SABRE_CONFIG(0x0d), 0x1d, 0x40);
+	asi_ld8(SABRE_CONFIG(0x0d), 0x1d);
+	for (r = 0x10; r <= 0x24; r += 4) {
+		asi_st32(SABRE_CONFIG(r), 0x1d, 0);
+		asi_ld32(SABRE_CONFIG(r), 0x1d);
+	}
+	asi_st8(SABRE_CONFIG(0x40), 0x1d, 0);
+	asi_ld8(SABRE_CONFIG(0x40), 0x1d);
+	asi_st8(SABRE_CONFIG(0x41), 0x1d, 0);
+	asi_ld8(SABRE_CONFIG(0x41), 0x1d);
+	estate_set(ESTATE_ERRS);
 }
 
-static void apb_clear(void)
+static void sabre_err_clear(void)
 {
-	asi_stx(APB_CONFIG(1, 0xe8), 0x1d, ~0ULL);
+	estate_set(0);
+	asi_stx(0, 0x4c, AFSR_CLEAR);
+	asi_st16(SABRE_STATUS, 0x1d, 0xfba0);
+	asi_stx(APB_CONFIG(1, APB_PIO_AFSR), 0x1d, 0xff00000000000000ULL);
 	asi_st16(APB_CONFIG(1, APB_STATUS), 0x1d, 0xf900);
 	asi_st16(APB_CONFIG(1, APB_SEC_STATUS), 0x1d, 0xf900);
-	asi_st16(SABRE_STATUS, 0x1d, 0xf900);
 }
 
-static void apb_back(void)
-{
-	apb_clear();
-	asi_st8(APB_CONFIG(1, APB_BRIDGE_CTL), 0x1d, apb_ctl);
-	asi_st8(APB_CONFIG(0, APB_MEM_MAP), 0x1d, apb_map0);
-	asi_st8(APB_CONFIG(1, APB_MEM_MAP), 0x1d, apb_map1);
-	asi_st16(APB_CONFIG(1, APB_COMMAND), 0x1d, apb_cmd);
-}
-
-/* Init Sabre, and its error status clear: the UE and CE AFSRs, the PCI
-   AFSR and its PCI status. */
+/* Init Sabre: the IOMMU's TLB invalid, the error state set up. */
 void post_init_sabre_err(void)
 {
 	post_init_sabre();
-	asi_stx(0x1fe00000030ULL, 0x15, ~0ULL);
-	asi_stx(0x1fe00000040ULL, 0x15, ~0ULL);
-	asi_stx(0x1fe00002010ULL, 0x15, ~0ULL);
-	asi_st16(SABRE_STATUS, 0x1d, 0xf900);
-	afsr_clear();
+	sabre_err_setup();
 }
 
-static void pio_abort(u64 pa, u64 afsr, u32 sabre_bit, const char *msg)
+static u32 pio_pa_hi, pio_pa_lo;
+static void ldw_pio(void) { asi_ld32((u64)pio_pa_hi << 32 | pio_pa_lo, 0x15); }
+
+/* The AFAR as compared: 33 bits on an UltraSPARC-IIi of mask 1.x. */
+static u64 afar_mask(void)
 {
-	afsr_clear();
-	acc_pa = pa;
-	acc_asi = 0x15;
-	post_compare(trap_run(ldx_pa), 0x32, "Data access error not taken");
-	post_compare(afsr_get() & 0xffffffffULL, afsr, "Sabre AFSR");
-	post_compare(asi_ld16(SABRE_STATUS, 0x1d) & sabre_bit, sabre_bit, msg);
-	afsr_clear();
+	u64 ver = rd_ver();
+
+	return (ver >> 32 & 0xffff) == 0x12 && (ver >> 28 & 15) == 1 ? 0x1ffffffffULL : ~0ULL;
+}
+
+static void pio_abort(u64 pa, u64 afsr, u32 status)
+{
+	u64 m = afar_mask();
+
+	sabre_err_setup();
+	pio_pa_hi = (u32)(pa >> 32);
+	pio_pa_lo = (u32)pa;
+	if (trap_run(ldw_pio) != 0x32) {
+		post_fail("Didn't Generate Trap as Expected");
+		sabre_err_clear();
+		return;
+	}
+	post_compare(asi_ldx(0, 0x4c), afsr, "CPU AFSR");
+	asi_stx(0, 0x4c, AFSR_CLEAR);
+	post_compare(asi_ldx(0, 0x4c) & AFSR_CLEAR, 0, "CPU AFSR not cleared");
+	post_compare(afar_get() & m, pa & m, "CPU AFAR");
+	post_compare(asi_ldx(SABRE_UE_AFSR, 0x15) & 0x6f00000000000000ULL, 0, "Sabre UE AFSR");
+	post_compare(asi_ldx(SABRE_CE_AFSR, 0x15) & 0x6c00000000000000ULL, 0, "Sabre CE AFSR");
+	post_compare(asi_ldx(SABRE_PCI_CTL, 0x15) & ~(1ULL << 33), PCI_CTL_READ, "Sabre PCI Control");
+	post_compare(asi_ldx(SABRE_PCI_AFSR, 0x15) & PCI_AFSR_ERRS, 0, "Sabre PCI AFSR");
+	post_compare(asi_ld16(SABRE_STATUS, 0x1d), status, "Sabre PCI Status");
+	asi_st16(SABRE_STATUS, 0x1d, 0xfba0);
+	sabre_err_clear();
 }
 
 void post_pio_master_abort(void)
 {
-	post_suspect("Sabre IOMMU (Functional)");
-	apb_set();
-	apb_clear();
-	pio_abort(PCI_NOTHING, AFSR_PRIV | AFSR_TO, 0x2000, "Received master abort");
-	apb_back();
+	asi_st8(APB_CONFIG(1, APB_MEM_MAP), 0x1d, 0x8f);
+	pio_abort(PIO_MASTER, AFSR_PRIV | AFSR_TO, 0x22a0);
 }
 
 void post_pio_target_abort(void)
 {
-	post_suspect("Sabre IOMMU (Functional)");
-	apb_set();
 	asi_st8(APB_CONFIG(1, APB_BRIDGE_CTL), 0x1d, 0x23);
-	apb_clear();
-	pio_abort(PCI_ABORT, AFSR_PRIV | AFSR_BERR, 0x1000, "Received target abort");
-	post_compare(asi_ld16(APB_CONFIG(1, APB_STATUS), 0x1d) & 0x800, 0x800, "APB signalled target abort");
-	apb_back();
+	pio_abort(PIO_TARGET, AFSR_PRIV | AFSR_BERR, 0x12a0);
 }
 
 /* Loads and stores not on their size's boundary (mem_address_not_aligned,
    34). */
-static void ldw_acc(void) { u32 asi_ld32(u64, u32); asi_ld32(acc_va, acc_asi); }
-static void stw_acc(void) { void asi_st32(u64, u32, u32); asi_st32(acc_va, acc_asi, 0); }
-static void ldh_acc(void) { u32 asi_ld16(u64, u32); asi_ld16(acc_va, acc_asi); }
-static void sth_acc(void) { void asi_st16(u64, u32, u32); asi_st16(acc_va, acc_asi, 0); }
+static void ldw_acc(void) { asi_ld32(acc_va, acc_asi); }
+static void stw_acc(void) { asi_st32(acc_va, acc_asi, 0); }
+static void ldh_acc(void) { asi_ld16(acc_va, acc_asi); }
+static void sth_acc(void) { asi_st16(acc_va, acc_asi, 0); }
 
 static void align_one(void (*fn)(void), u32 offset)
 {
@@ -371,7 +398,6 @@ void post_align(void)
 {
 	u32 i;
 
-	post_suspect("CPU (Basic)");
 	pages_unmapped();
 	mmus_on(LSU_DM);
 	for (i = 1; i < 8; i++) {
@@ -392,7 +418,6 @@ void post_align(void)
    (data_access_exception, 30; the SFSR's privilege violation bit, 7). */
 void post_priv(void)
 {
-	post_suspect("DMMU");
 	pages_unmapped();
 	mmus_on(LSU_DM);
 	acc_va = VA_MEM;
@@ -407,7 +432,6 @@ void post_priv(void)
    Access then the page. */
 void post_protect(void)
 {
-	post_suspect("DMMU");
 	pages_unmapped();
 	mmus_on(LSU_DM);
 	acc_va = VA_RO;

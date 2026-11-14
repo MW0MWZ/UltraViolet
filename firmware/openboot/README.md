@@ -144,8 +144,23 @@ port ID as a UPA physical address's high cell) and the DMA methods
 (`dma-alloc`, `dma-map-in` and the rest), which are the PCI bus module's:
 all of an Ultra 10's DMA goes through its IOMMU. Mapping out a range that
 isn't mapped in gives a warning. `reset-all` says "Resetting ..."
-first, from the ok prompt or on a reboot. `watch-net` shows a bad packet
-('X') for each frame the Ethernet's MAC counts as an error (too long,
+first, from the ok prompt or on a reboot, and leaves "soft-rst" in the
+NVRAM for the reset code (at 0x10: "Software Power ON" in diagnostic
+mode, and no power-on counted). The root's `reset-reason` is made once,
+at the start, from the reset control's status bits as an Ultra 10 names
+them: `POR`, `S-POR` (`reset-all`), `B-POR`, `S-XIR` or `B-XIR` for one
+bit alone, `???` for none (a watchdog reset) or more than one; after a
+button XIR the memory is only touched, not cleared. The other resets are
+taken as an Ultra 10 takes them: a watchdog reset says "Watchdog Reset"
+and starts again from power-on; a SIR ("SIR Reset") or a RED state
+exception ("RED State Exception", then each trap level's TL, TT, TPC, TnPC
+and TSTATE) is followed by a software XIR, and an XIR, from the button or
+software, goes back to the ok prompt of the OpenBoot running ("Externally
+Initiated Reset", `reset-reason` unchanged) while its TLB entries are
+there, or starts again if they are gone. `watchdog-reboot?` is kept but,
+as on an Ultra 10, has no effect. A trap that ends at the ok prompt is
+shown by its name alone ("Memory Address not Aligned"). `watch-net` shows a
+bad packet ('X') for each frame the Ethernet's MAC counts as an error (too long,
 misaligned, bad CRC) or that overflowed its buffer.
 The keyboard works in every Type 5 layout (21-36): the release's tables
 by USB usage, and, for the layouts the release has none of, the Ultra 10's
@@ -169,17 +184,47 @@ IOMMU (reads and writes, TLB misses and hits, pass-through and the TLB's
 locking), made by the RIO EBus's parallel port DMA channel in its
 diagnostic mode; the RIO's PCI configuration headers (EBus and
 Ethernet); PIO reads ending in a master abort and in a target abort (APB
-B in master-abort mode). `post.fth` takes its result, and the board descriptor
-(0002.3333.0200.001b after a passing run, as an Ultra 10's, also kept in
-the NVRAM at 1d58). The
-selftests (`test`, `test-all`) of the Rage Pro, the Ethernet and the
-floppy drive are in their drivers. As an Ultra 10's, `test` prints only
-the selftest's own lines, and on a failure a blank line and
-"*device* selftest failed. Return code = *n*"; the Ethernet's transceiver
+B in master-abort mode). As an Ultra 10's, the first failure ends the run:
+each test names a suspect part, and its class updates the board
+descriptor (the processor module's bit 4 cleared and the test's sub-code
+in bits 4:0, the RIO's bit 25, the NVRAM's bit 49, or a memory
+miscompare's DIMM bit, from bit 32); the keyboard's LEDs show the run's
+heartbeat and the suspect. `post.fth` takes its result, and the board
+descriptor (0002.3333.0200.001b after a passing run, as an Ultra 10's,
+kept in the NVRAM at 1d58 with the POST's other working data, 1cd8-1e0f;
+OpenBoot then zeroes 1cd8-1cdf, the suspect code the POST left, as an
+Ultra 10's does). The selftests (`test`, `test-all`) of the Rage Pro, the
+Ethernet and the floppy drive are in their drivers. As an Ultra 10's,
+`test` prints only the selftest's own lines, and on a failure a blank line
+and "*device* selftest failed. Return code = *n*", and gives a device that
+passes no `status` property (`obp/pkg/selftest/test.fth`); the Ethernet's transceiver
 check needs a link (with `tpe-link-test?` true). The floppy drive is the
 one the digital output register selects with its motor on (drive 0); the
-driver's blocks are whole cylinders (18 KB, both heads' tracks, read and
-written in one multi-track command each), as the Ultra 10's are.
+driver's blocks are its 512-byte sectors, as the Ultra 10's are:
+`read-blocks` and `write-blocks` move one whatever the count asked for
+and return 1 or 0, with nothing shown, a read judged done when the
+controller ends it abnormally (a non-DMA read's end) or with an overrun,
+a write only when it ends normally; a data error alone is tried again,
+the drive recalibrated, up to eight times. Its open and selftest check
+the controller and drive (their reset, the timings read back, recalibrate,
+seeks to tracks 2 and 0, track 0's signal and the heads) with an Ultra
+10's messages.
+
+`obdiag` (`obdiag.fth`, `obd-pci.fth`, `obd-ebus.fth`, `obd-misc.fth`,
+`obdmenu.fth`) is the Ultra 10's diagnostics of its on-board I/O: the
+EBus's PCI header and DMA channels, the Ethernet (its registers and four
+loopbacks), the keyboard and mouse UARTs, the floppy drive, the parallel
+port, both serial ports at each speed, the NVRAM, the audio codec, the IDE
+controller and drives, and the Rage. With `mfg-mode` off it does nothing;
+with `on` (or a bft or sys mode) it shows the Ultra 10's numbered menu,
+with `menu-int` or `menu-ext` the sub-test menu, and a failure is reported
+in the Ultra 10's failure block (`###OBDIAG_MFG_START###` ... `MESSAGE=`).
+`mfg-mode` is read at the first `obdiag` of a session. After a power-on
+selftest that passed, a bft or sys `mfg-mode` runs the manufacturing script
+(`run-obd-scripts`) as the Ultra 10 does. The tests run in instances of
+the devices' nodes made without their drivers' open, so the drivers are as
+they were afterwards; the sub-test menu's Ethernet entries set the chip up
+first.
 
 They are built on the release's PCI, serial, keyboard and network code
 (`obp/dev/pci`, `obp/dev/serial`, `obp/dev/usb-devices/kbd`,
@@ -361,21 +406,33 @@ The release's own files are unchanged, but for:
 - `obp/os/bootprom/testdevt.fth` and `obp/dev/pci/knownprops.fth`: on the
   Ultra 5/10, `.properties` shows values as an Ultra 10 shows them. The
   integer properties it knows by name (with `#address-cells`,
-  `#size-cells`, `#interrupt-cells`, `upa-portid`, `scsi-initiator-id`,
+  `#size-cells`, `#interrupt-cells`, `#mapped-interrupt-cells`,
+  `upa-portid`, `scsi-initiator-id`, `burst-sizes`, `up-burst-sizes`,
+  `slot-address-bits`, `breakpoint-trap`, `pulse-interrupts`,
   `translations` six to a line and the interrupt maps a row to a line, but
-  not `cache-line-size` or `latency-timer`) are shown as integers; any
-  other value of eight bytes as two integers, one to a line; a single
-  printable string, with or without its null, as text; anything else,
-  composite strings and four-byte values included, as hex bytes, at most
-  16 and nothing after them. Its pager stops only between properties.
-- `obp/os/bootprom/finddev.fth`: on the Ultra 5/10 a search for a node by
-  unit address ends as an Ultra 10's does. Gone down into the children of
-  the nodes it did not find it among, it stops at `/openprom` or
-  `/packages` (support nodes with children and no `decode-unit`) with
-  "Package method not found" (`cd /memory@0,0`); searched for directly
-  (`/openprom/foo@0`), such a node, or a node whose `decode-unit` cannot
-  read the address (the root's with no port ID, `@,0`), is where it ends,
-  with no message.
+  not `cache-line-size` or `latency-timer`) are shown as integers, every
+  line as long as the others, the last one reading on past the value's
+  end; any other value of eight bytes as two integers, one to a line; a
+  single printable string, with or without its null, as text; anything
+  else, composite strings and four-byte values included, as hex bytes, at
+  most 16 and nothing after them. Its pager stops only between properties.
+- `obp/os/bootprom/finddev.fth`: on the Ultra 5/10 a path is searched for
+  as an Ultra 10 searches it. A unit address is read only by a node's own
+  `decode-unit` (the two-number default is not used), and only at a node
+  with children; a component is matched among the node's children by name
+  and the first cells of `reg`, then by name among those with no `reg`,
+  then in its whole subtree, depth first, the same at each node with
+  children. A node with no `decode-unit`, or one that cannot read the
+  address, is where the search ends, with no message, when the path names
+  it (`/openprom/foo@0` is `/openprom`, `/memory@,0` the root); met in the
+  subtree search it ends the search with "Package method not found"
+  (`cd /memory@0,0`, `cd /foo@0,0`). Support packages and devices are
+  treated alike.
+- `obp/arch/sun4u/trans.fth` and `obp/cpu/sparc/ultra/mmu.fth`: on the
+  Ultra 5/10 `translations` lists its ranges highest virtual address
+  first, and two ranges are one only where both their virtual and their
+  physical addresses carry on with the same attributes, as an Ultra 10
+  lists them.
 - On the Ultra 5/10 the data stack is emptied after an error at the ok
   prompt, but for an undefined word, as an Ultra 10 empties it (the
   release's interpreter, `obp/fm/kernel/ansio.fth`, keeps it; the

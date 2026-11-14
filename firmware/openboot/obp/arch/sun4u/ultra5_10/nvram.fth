@@ -129,11 +129,16 @@ stand-init: Attach the NVRAM and IDPROM
    ['] init-idprom catch drop
 ;
 
+\ The power-on selftest's first word in its area (1cd8-1cdf: the suspect
+\ code of the test it ran last) zeroed once OpenBoot starts, as an Ultra
+\ 10's OpenBoot leaves it.
+stand-init: Clear the selftest's suspect code
+   h# 1ce0 h# 1cd8 do  0 i nvram-c!  loop
+;
+
 \ (#power-cycles is counted by the reset code, at a hardware power-on.)
 
-\ After a watchdog reset or a RED state exception OpenBoot boots only
-\ with watchdog-reboot? true; otherwise it stops at the ok prompt.
-: error-reset? ( -- flag )  reset-kind @  dup 1 =  swap 4 =  or  ;
-chain: don't-boot? ( flag -- flag' )
-   error-reset? watchdog-reboot? 0= and or
-;
+\ watchdog-reboot? (0x5d2) is kept, but has no effect, as on an Ultra 10:
+\ a watchdog reset starts OpenBoot again from power-on, and an XIR, a SIR
+\ or a RED state exception goes back to the ok prompt of the OpenBoot
+\ running (reset.fth), so nothing reaches a watchdog path.

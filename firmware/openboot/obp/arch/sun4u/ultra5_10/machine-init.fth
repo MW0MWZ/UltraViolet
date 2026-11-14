@@ -13,11 +13,23 @@ h# 1fe.0000.f020 constant reset-control-pa
 h# 1ff.f172.4000 constant power-pa		\ EBus BAR1 + 72.4000
 h# 4000.0000 constant soft-por
 
-\ The Ultra 10 says so first ("Resetting ... ", then two line ends),
-\ from the ok prompt and on a reboot from the operating system alike.
+h# 1ff.f100.0010 constant soft-rst-pa		\ NVRAM 0x10-0x17
+
+\ As an Ultra 10's: "soft-rst" left in the NVRAM (at 0x10, which the reset
+\ code reads and clears at the next start: "Software Power ON" in
+\ diagnostic mode, and no power-on counted); "Resetting ... " and two line
+\ ends, from the ok prompt and on a reboot from the operating system
+\ alike; after 100 ms the reset control cleared and SOFT_POR set; then
+\ interrupts held off while the reset comes.
 chain: (reset-all
+   " soft-rst" 0  do  dup i + c@  soft-rst-pa i + bypass-asi spacec!  loop  drop
    ." Resetting ... " cr cr
+   d# 100 ms
+   0 reset-control-pa bypass-asi spacex!
    soft-por reset-control-pa bypass-asi spacex!
+   h# f pil!
+   \ (An Ultra 10 waits up to 10 seconds for it; what it does if none came
+   \ is not known, so this waits on.)
    begin again
 ;
 ' (reset-all is reset-all

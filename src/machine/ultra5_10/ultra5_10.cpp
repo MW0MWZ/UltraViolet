@@ -49,7 +49,7 @@ constexpr u64 kUpaSlot = 0x1FC00000000;
 
 constexpr double kPciHz = 66.0e6;      // the APB's primary bus clock, which its tick register counts
 constexpr double kSuperIoUartHz = 1843200.0;
-constexpr u32 kSuperIoWindow = 0x10000;  // its chip selects' ISA addresses (0x2000 floppy ... 0x8000 keyboard)
+constexpr u32 kSuperIoWindow = 0x10000;  // the SuperIO's EBus window (its ISA addresses repeat every 4 KiB)
 constexpr u8 kSuperIoSid = 0x90;       // SuperIO identification register value, as a real Ultra 5/10 reads
 constexpr u8 kMachineType = 0x80;      // IDPROM machine type: sun4u
 constexpr unsigned kNvramIdprom = 0x1FD8;  // the IDPROM in the NVRAM (the configuration below it)
@@ -153,9 +153,18 @@ Ultra5_10::Ultra5_10(const Options& options)
     // EBus devices
     ebus_.set_prom(&flash_, static_cast<u32>(std::max<std::size_t>(opt_.prom.size(), 1)));
     ebus_.add(kEbusNvram, M48t59::kSize, &nvram_);
-    ebus_.add(kEbusSuperIo + 0x15C, 2, &superio_);  // configuration ports at ISA 0x15C/0x15D
-    ebus_.add(kEbusKeyboard, 8, &su_kbd_);
-    ebus_.add(kEbusMouse, 8, &su_mouse_);
+    // The SuperIO sees only the low 12 address bits of its window: the
+    // device tree's addresses (floppy 0x3023F0, parallel 0x3043BC, mouse
+    // 0x3062F8, keyboard 0x3083F8) differ above them only, and each device
+    // answers at every 4 KiB step (an Ultra 10's POST reaches the keyboard
+    // UART at 0x3003F8, its PROM diagnostics at 0x3063F8).
+    auto superio = [this](u32 offset, u32 size, Device* device) {
+        for (u32 alias = 0; alias < kSuperIoWindow; alias += 0x1000)
+            ebus_.add(kEbusSuperIo + alias + (offset & 0xFFF), size, device);
+    };
+    superio(0x15C, 2, &superio_);  // configuration ports at ISA 0x15C/0x15D
+    superio(kEbusKeyboard, 8, &su_kbd_);
+    superio(kEbusMouse, 8, &su_mouse_);
     ebus_.add(kEbusSerial, 0x80, &se_);
     auto block = [this](const char* name, u32 offset, u32 size, u8 fill = 0) {
         blocks_.push_back(std::make_unique<RegisterBlock>(name, size, fill));
@@ -164,12 +173,11 @@ Ultra5_10::Ultra5_10(const Options& options)
     };
     ebus_.add(kEbusAudio, Cs4231::kSize, &audio_);
     block("audio-aux", kEbusAudioAux, 4);  // bit 0: the codec's power-down (polarity unknown)
-    ebus_.add(kEbusFloppy, 8, &fdc_);
+    superio(kEbusFloppy, 8, &fdc_);
     ebus_.add(kEbusFloppyAux, 4, &fdc_.aux(), false);  // the RIO's own 32-bit register
-    // The parallel port in compatible mode, nothing connected (PC87332):
-    // data, the status register (read-only; 0x7F as a real Ultra 10's), the
-    // control register (bits 7:5 read 1).
-    block("ecpp", kEbusParallel, 8)->fix({0x00, 0x7F, 0xE0}, {0xFF, 0x00, 0x1F});
+    superio(kEbusParallel, Ecpp::kSize, &ecpp_);
+    superio(kEbusParallel + Ecpp::kExtendedOffset, Ecpp::kExtendedSize, &ecpp_.extended());
+    ecpp_dma_.on_change = [this] { ecpp_.service(); };
     block("smartcard", kEbusSmartCard, 0x100);
     block("pll", kEbusPll, 0x100);
     ebus_.add(kEbusEcppDma, EbusDma::kSize, &ecpp_dma_, false);
@@ -301,6 +309,7 @@ void Ultra5_10::reset(bool power_on) {
     if (keyboard_) keyboard_->reset(), mouse_->reset();
     se_.reset();
     fdc_.reset();
+    ecpp_.reset();
     for (EbusDma* d : {&ecpp_dma_, &audio_play_dma_, &audio_rec_dma_, &fd_dma_}) d->reset();
     audio_.reset();
     if (ffb_) ffb_->reset();

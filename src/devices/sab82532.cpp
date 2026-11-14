@@ -18,6 +18,7 @@ constexpr double kBreakSeconds = 0.25;
 constexpr std::size_t kPool = 32;  // bytes in each of the XFIFO's two pools
 // RFC
 constexpr u8 kRfcRfdf = 0x10, kRfcTcde = 0x01;
+constexpr u8 kModeTlp = 0x01;  // MODE: test loop
 // Register offsets within a channel
 constexpr unsigned kStar = 0x20, kCmdr = 0x20, kMode = 0x22, kTimr = 0x23, kXon = 0x24, kXoff = 0x25,
                    kTcr = 0x26, kDafo = 0x27, kRfc = 0x28, kRbcl = 0x2A, kRbch = 0x2B, kCcr0 = 0x2C,
@@ -35,6 +36,7 @@ Sab82532::Channel::Channel(Sab82532& c, SerialLine& l)
 void Sab82532::Channel::reset() {
     rx.clear();
     sending.clear();
+    looped.clear();
     xcount = 0;
     released = 0;
     block = false;
@@ -77,7 +79,14 @@ void Sab82532::Channel::tx_tick() {
     if (sending.empty()) return;
     const u8 b = sending.front();
     sending.pop_front();
-    if (line.transmit) line.transmit(b);
+    // MODE.TLP, the test loop: TxD is joined to the channel's own RxD
+    // inside the chip, and nothing goes out on the line.
+    if (mode & kModeTlp) {
+        looped.push_back(b);
+        if (!rx_timer.active()) rx_timer.schedule_in(char_cycles());
+    } else if (line.transmit) {
+        line.transmit(b);
+    }
     if (tic_busy && tic_at-- == 0) tic_busy = false;  // (the TIC character has gone)
     if (!sending.empty()) {
         if (sending.size() == kPool) isr1 |= kIsr1Xpr;
@@ -98,7 +107,8 @@ void Sab82532::Channel::rx_tick() {
         rx_timer.schedule_in(char_cycles());
         return;
     }
-    if (line.rx_break()) {
+    const bool loop = mode & kModeTlp;  // (the line's RxD is not connected in the test loop)
+    if (!loop && line.rx_break()) {
         // A break: no character goes to the RFIFO; BRK, then BRKT when the
         // line returns to mark (a terminal's break lasts a quarter second).
         line.rx_take();
@@ -108,9 +118,15 @@ void Sab82532::Channel::rx_tick() {
         rx_timer.schedule_in(static_cast<u64>(kBreakSeconds * chip.cpu_hz_));
         return;
     }
-    if (line.rx_pending()) {
+    if (loop ? !looped.empty() : line.rx_pending()) {
         if (rx.size() + per_char <= 32) {
-            const u8 b = line.rx_take();
+            u8 b;
+            if (loop) {
+                b = looped.front();
+                looped.pop_front();
+            } else {
+                b = line.rx_take();
+            }
             rx.push_back(b);
             if (per_char == 2) rx.push_back(0);  // status: no errors
             if ((rfc & kRfcTcde) && b == tcr) {

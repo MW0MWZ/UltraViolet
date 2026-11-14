@@ -39,10 +39,11 @@
 \ any nuclear facility. 
 \ 
 \ ========== Copyright Header End ============================================
-\ Adapted by Andy Taylor, 2026: on the Ultra 5/10 (Ultra5_10) a search for
-\ a node by unit address ends as an Ultra 10's does where a support node
-\ has no decode-unit method or a decode-unit cannot read the address (see
-\ (find-node) and (find-child-node)).
+\ Adapted by Andy Taylor, 2026: on the Ultra 5/10 (Ultra5_10) a path is
+\ searched for as an Ultra 10 searches: a unit address is read only by the
+\ node's own decode-unit (no two-number default), at nodes with children,
+\ and what happens when there is none depends on where in the search it is
+\ needed (see (find-node) and (find-child-node)).
 id: @(#)finddev.fth 2.43 06/02/16
 purpose: 
 copyright: Copyright 2006 Sun Microsystems, Inc.  All Rights Reserved
@@ -105,6 +106,10 @@ headerless
 
 : exact-match?  ( name$ acf -- name$ acf flag )
    >r
+[ifdef] Ultra5_10
+   \ A component with neither a name nor a unit address matches nothing.
+   dup 0=  unit#-valid? 0=  and  if  r> false exit  then
+[then]
    dup  if                              ( name$ )       \ Name present
       name-match?  0=  if  r> false  exit  then
    then                                 ( name$ )
@@ -126,23 +131,57 @@ headers
 
 [ifdef] Ultra5_10
 headerless
-\ True while a search goes down into the children of the nodes it did not
-\ find a path's component among ((find-child-node)).
+\ The search as an Ultra 10's. For each component of the path, under the
+\ node P reached so far: if P has children and the component has a unit
+\ address, P's own decode-unit reads it; P's children are matched (by name
+\ and the first cells of "reg", then by name among those with no "reg");
+\ failing that, P's subtree is searched depth first, the same done at each
+\ node with children. A node with no decode-unit (or one that cannot read
+\ the address) is where the search ends, silently, when it is P itself
+\ (/openprom/foo@0 is /openprom, /memory@,0 the root); met in the subtree
+\ search, it ends the search with "Package method not found" (/memory@0,0,
+\ /foo@0,0). Support packages and devices are treated alike.
+
+\ True while the search is in the subtree below P ((find-child-node)).
 0 value descent?
-\ A support node (/openprom, /packages) with no decode-unit: an Ultra 10's
-\ search for a unit address ends there. (A device with none, a card's
-\ FCode without it, keeps the release's default, parse-2int.)
-: no-decode-unit? ( -- flag )
-   support-node? @  0=  if  false exit  then
+
+\ The current node's own decode-unit method: there is no default.
+: own-decode-unit  ( unit$ -- phys.lo .. phys.hi )
    " decode-unit" current-device setup-method$ (search-wordlist)  if
-      drop false
+      execute
    else
-      true
+      2drop  true abort" Package method not found"
    then
 ;
-headers
-[then]
 
+: (find-node)  ( unit$ name$ -- unit$ name$ )
+   \ A node with no children is not asked to read the unit address.
+   first-child  0= if  exit  then  pop-device
+
+   unit#-valid?  if                                ( unit$ name$ )
+      descent?  if
+         \ Errors end the search (an abort, or the method's own)
+         2over own-decode-unit                     ( unit$ name$ phys.. )
+      else
+         \ At P itself any failure leaves the search at P, silently
+         2over ['] own-decode-unit catch  if       ( unit$ name$ x x )
+            2drop  found throw
+         then                                      ( unit$ name$ phys.. )
+      then
+      unit# #adr-cells /n*  bounds  ?do  i !  /n +loop   ( unit$ name$ )
+   then
+
+   \ (search-level) will throw "found" to (find-device) if it succeeds
+   ['] exact-match?     (search-level)  drop             ( unit$ name$ )
+   ['] wildcard-match?  (search-level)  drop             ( unit$ name$ )
+;
+
+: (find-child-node)  ( unit$ name$ -- unit$ name$ ) recursive
+   true to descent?
+   first-child  begin while   (find-node) (find-child-node)  next-child repeat
+;
+headers
+[else]
 \ 1) Search direct children for an exact match
 \ 2) Search direct children for a wildcard match
 \ 3) Select each child node in turn and (recursively) repeat steps
@@ -154,27 +193,11 @@ headers
    \ and it doesn't matter if it has no decode-unit method
    first-child  0= if  exit  then
 
-[ifdef] Ultra5_10
-   \ Searched for directly, a support node with no decode-unit, or a node
-   \ whose decode-unit cannot read the unit address, is where an Ultra
-   \ 10's search ends, with no message: /openprom/foo@0 is /openprom,
-   \ /memory@,0 the root.
-   pop-device
-   descent? 0=  unit#-valid? and  no-decode-unit? and  if  found throw  then
-   first-child drop
-[then]
-
    \ Omit unit match test if no unit string or this is a support node
    support-node? @ 0=  pop-device  unit#-valid? and  if
-[ifdef] Ultra5_10
-      2over ['] (decode-unit) catch  if
-         descent?  if  not-found  else  found  then  throw
-      then
-[else]
       2over ['] (decode-unit) catch  if
          not-found throw
-      then
-[then]				( unit$ name$ phys.lo .. phys.hi )
+      then				( unit$ name$ phys.lo .. phys.hi )
       \ We can't use unit-bounds here
       unit# #adr-cells /n*  bounds  ?do  i !  /n +loop   ( unit$ name$ )
    then
@@ -184,25 +207,6 @@ headers
    ['] wildcard-match?  (search-level)  drop             ( unit$ name$ )
 ;
 
-[ifdef] Ultra5_10
-\ An Ultra 10, its search for a unit address gone down into the children
-\ of a node it did not find it among, stops at a support node that has
-\ children and no decode-unit (/openprom, /packages) with "Package method
-\ not found": /memory@0,0 (its unit address read as UPA port 0's, the
-\ processor's) and /foo@0,0 end so, /foo and /pci@1f,0/foo@1 with "Device
-\ not found".
-: ?decode-unit ( -- )
-   unit#-valid?  0=  if  exit  then
-   current-device >r  first-child  r> push-device  0=  if  exit  then
-   no-decode-unit?  abort" Package method not found"
-;
-: (find-child-node)  ( unit$ name$ -- unit$ name$ ) recursive
-   true to descent?
-   first-child  begin while
-      ?decode-unit  (find-node) (find-child-node)
-   next-child repeat
-;
-[else]
 : (find-child-node)  ( unit$ name$ -- unit$ name$ ) recursive
    first-child  begin while   (find-node) (find-child-node)  next-child repeat
 ;

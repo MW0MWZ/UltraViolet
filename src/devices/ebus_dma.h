@@ -61,6 +61,9 @@ public:
     std::size_t available(bool to_memory) const { return grant(~std::size_t{0}, to_memory); }
 
     u32 csr() const;
+    // Called after each register write (a device that moves data when the
+    // channel is ready, as the parallel port's FIFO does).
+    std::function<void()> on_change;
 
     // The channel's FIFO as its diagnostic window shows it: 16 entries of 8
     // bytes, the first 4 bytes of entry n at 4n, the other 4 at 0x100 + 4n.

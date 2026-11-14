@@ -80,13 +80,23 @@ bool EbusDma::write(u64 offset, unsigned size, u64 value) {
         if (m & v & (kTc | kIntPend)) tc_ = false;
         if (m & v & kErrPend) err_ = false;
         if (control_ & kReset) {
+            // Reset stops the channel: its enables, direction and diagnostic
+            // mode go with the transfer and the done state (Sun's POST resets
+            // the channel between its diagnostic bursts and then expects none
+            // of DIAG_EN, EN_DMA or WRITE; the device ID stays).
+            control_ &= ~(kDiagEn | kEnDma | kWrite);
             loaded_ = next_loaded_ = tc_ = err_ = false;
             diag_rd_done_ = diag_wr_done_ = false;
             count_ = next_count_ = 0;
         }
     }
     // The count first, then the address, which loads the transfer.
-    if (mask[kCount >> 2]) staged_count_ = ((staged_count_ & ~mask[2]) | (data[2] & mask[2])) & 0xFFFFFF;
+    if (mask[kCount >> 2]) {
+        staged_count_ = ((staged_count_ & ~mask[2]) | (data[2] & mask[2])) & 0xFFFFFF;
+        // With no transfer running the register reads back what was written
+        // (an Ultra 10's PROM diagnostics walk ones through bits 23:0).
+        if (!(loaded_ && (control_ & kEnDma))) count_ = staged_count_;
+    }
     if (mask[kAddr >> 2] && !(control_ & kReset)) {
         if (loaded_ && (control_ & kEnNext)) {
             next_addr_ = (next_addr_ & ~mask[1]) | (data[1] & mask[1]);
@@ -98,14 +108,19 @@ bool EbusDma::write(u64 offset, unsigned size, u64 value) {
             loaded_ = true;
         }
     }
-    if ((control_ & (kDiagEn | kEnDma)) == (kDiagEn | kEnDma) && loaded_ && !(control_ & kReset)) diag_transfer();
+    if ((control_ & kDiagEn) && loaded_ && !(control_ & kReset)) diag_transfer();
     update_irq();
+    if (on_change) on_change();
     return true;
 }
 
-// Diagnostic mode (DIAG_EN): with no device, the channel makes one burst
+// Diagnostic mode (DIAG_EN, with or without EN_DMA: an Ultra 10's PROM
+// diagnostics set DIAG_EN alone): with no device, the channel makes one burst
 // itself, a read from memory (or a write, with WRITE set), and shows it
-// done in DIAG_RD_DONE / DIAG_WR_DONE.
+// done in DIAG_RD_DONE / DIAG_WR_DONE. The burst is the whole FIFO, 128
+// bytes: a read replaces all 32 words of the window (000-03C and
+// 100-13C), a write sends all of them to memory. Only the address is
+// loaded; no count, burst size or interrupt is used.
 void EbusDma::diag_transfer() {
     if (control_ & kWrite) {
         if (!diag_wr_done_) {

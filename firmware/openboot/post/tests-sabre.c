@@ -91,7 +91,6 @@ void post_iommu_regs(void)
 	u64 ctl, tsb;
 	u32 p;
 
-	post_suspect("Sabre");
 	ctl = sx(IOMMU_CTL) & ~CTL_ERRS;
 	for (p = 0; p < 4; p++) {
 		sx_set(IOMMU_CTL, (ctl & ~0x70004ULL) | ctl_p[p]);
@@ -127,7 +126,6 @@ static void iommu_array(u32 base, u64 mask, const char *msg)
 
 void post_iommu_ram(void)
 {
-	post_suspect("Sabre");
 	iommu_de();
 	iommu_array(DATA_DIAG, DATA_MASK, "IOMMU RAM mismatch");
 	iommu_clear();
@@ -135,7 +133,6 @@ void post_iommu_ram(void)
 
 void post_iommu_cam(void)
 {
-	post_suspect("Sabre");
 	iommu_de();
 	iommu_array(TAG_DIAG, TAG_MASK, "IOMMU CAM mismatch");
 	iommu_clear();
@@ -158,7 +155,6 @@ void post_iommu_compare(void)
 {
 	u32 i;
 
-	post_suspect("Sabre");
 	iommu_de();
 	iommu_tags();
 	for (i = 0; i < 16; i++) {
@@ -172,7 +168,6 @@ void post_iommu_flush(void)
 {
 	u32 i, j;
 
-	post_suspect("Sabre");
 	iommu_de();
 	for (j = 0; j < 16; j++) {
 		iommu_tags();
@@ -194,17 +189,15 @@ void post_iommu_flush(void)
  */
 void post_pbm_config(void)
 {
-	post_suspect("Sabre");
 	post_compare(asi_ld32(CONFIG_PA, LITTLE), 0xa000108e, "Vendor/Device ID");
 	post_compare(asi_ld32(CONFIG_PA + 8, LITTLE) >> 8, 0x60000, "Class Code");
 }
 
-void post_pbm_ctl(void) { post_suspect("Sabre"); patterns(0x2000, 0x10003f018fULL, "PCI Control/Status"); }
-void post_pbm_diag(void) { post_suspect("Sabre"); patterns(0x2020, 0x4e, "PCI Diag"); }
+void post_pbm_ctl(void) { patterns(0x2000, 0x10003f018fULL, "PCI Control/Status"); }
+void post_pbm_diag(void) { patterns(0x2020, 0x4e, "PCI Diag"); }
 
 void post_sabre_io(void)
 {
-	post_suspect("Sabre");
 	patterns(0x2028, 0xff, "PCI Target Address Space");
 	patterns(0xa400, 0xffffe000ULL, "IOMMU Virtual Address Diag");
 }
@@ -233,7 +226,6 @@ void post_pio_decoder(void)
 {
 	u32 i, latency;
 
-	post_suspect("Sabre");
 	iommu_de();
 	latency = asi_ld8(CONFIG_PA + LATENCY, LITTLE);
 	asi_st8(CONFIG_PA + LATENCY, LITTLE, 0x10);
@@ -266,7 +258,6 @@ void post_byte_enable(void)
 {
 	u32 saved, i;
 
-	post_suspect("Sabre");
 	saved = asi_ld32(BE_PA, BYPASS);
 	be_reset();
 	for (i = 0; i < 4; i++)
@@ -313,7 +304,6 @@ void post_imap(void)
 {
 	u32 i;
 
-	post_suspect("Sabre");
 	for (i = 0; i < 8; i++)
 		imap_test(0xc00 + i * 8);
 	for (i = 0; i < 32; i++)
@@ -331,7 +321,6 @@ void post_iclr(void)
 	static const u32 states[3] = { 0, 3, 1 };
 	u32 i, s;
 
-	post_suspect("Sabre");
 	for (i = 0; i < 32; i++) {
 		if ((sx(0xc00 + (i >> 2) * 8) & 0x80000000ULL) || int_state(i))
 			continue;

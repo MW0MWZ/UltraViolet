@@ -37,6 +37,12 @@ void do_ta(void);
 void do_tn(void);
 u64 lsu_get(void);
 void lsu_set(u64 v);
+u32 asi_ld8(u64 va, u32 asi);
+u32 asi_ld16(u64 va, u32 asi);
+u32 asi_ld32(u64 va, u32 asi);
+void asi_st8(u64 va, u32 asi, u32 v);
+void asi_st16(u64 va, u32 asi, u32 v);
+void asi_st32(u64 va, u32 asi, u32 v);
 
 /* The result, for start.S to hand back. */
 extern const char *post_message;	/* the part suspected; 0 passed */
@@ -54,14 +60,32 @@ void post_putd(u32 n, int width, int zero);
 void post_putx(u64 n, int digits);
 void post_putx64(u64 n);		/* xxxxxxxx.xxxxxxxx */
 
-/* The NVRAM. */
+/* The NVRAM; wider values big-endian, a byte at a time. */
 static inline u8 nvram_ld8(u32 offset) { return phys_ld8(NVRAM_PA + offset); }
 static inline void nvram_st8(u32 offset, u32 v) { phys_st8(NVRAM_PA + offset, v); }
+void nvram_st(u32 offset, u64 v, int bytes);
+u64 nvram_ld(u32 offset, int bytes);
+
+/* The selftest's area of the NVRAM (past the configuration variables'
+   checksum, 1cd8-1e0f), as an Ultra 10's POST keeps it. */
+#define NV_SUSPECT	0x1cd8		/* 1: the running test's suspect code */
+#define NV_OPTIONS	0x1ce0		/* 8: the word the reset code passes */
+#define NV_ECACHE	0x1ce8		/* 4: the E-cache's size */
+#define NV_MEM_BASE	0x1cf0		/* 8: the POST's memory */
+#define NV_SCRATCH	0x1d00		/* 64: the NVRAM tests' bytes */
+#define NV_TEST		0x1d40		/* 8: the running test (its name) */
+#define NV_MALLOC	0x1d48		/* 8: the POST's memory allocation */
+#define NV_BOARD	0x1d58		/* 8: the board descriptor */
+#define NV_STACK	0x1d60		/* 8: the POST's stack */
+#define NV_EBUS		0x1d68		/* 4: the EBus's base address */
+#define NV_FLAGS	0x1db0		/* 2: test control (0: none) */
+#define NV_PASS		0x1db2		/* 1: 1 no failure, 0 a failure */
+#define NV_MHZ		0x1db4		/* 4: the processor's clock, MHz */
+#define NV_COLUMN	0x1de0		/* 1: characters since the line's start */
 
 /* The run (post.c). */
 extern int post_max;			/* diag-level max: every test */
 extern u32 ecache_size;
-void post_suspect(const char *part);
 int post_failed(void);
 void post_fail(const char *msg);
 void post_compare(u64 observed, u64 expected, const char *msg);
@@ -73,7 +97,6 @@ void post_nv_addr(void);
 void post_nv_data(void);
 void post_dtlb_tags(void);
 void post_dtlb_data(void);
-void post_probe_ec(void);
 void post_ec_ram_addr(void);
 void post_ec_tag_addr(void);
 void post_ec_ram(void);
@@ -118,6 +141,7 @@ void post_ecc_blk(void);
 
 /* tests-sabre.c */
 void post_init_sabre(void);
+void post_init_sabre_dma(void);
 void post_pio_decoder(void);
 void post_byte_enable(void);
 void post_imap(void);
