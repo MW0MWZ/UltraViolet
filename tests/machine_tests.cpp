@@ -11,6 +11,8 @@
 
 #include "core/endian.h"
 #include "devices/ebus_dma.h"
+#include "devices/ebus_misc.h"
+#include "devices/ecpp.h"
 #include "devices/fdc82077.h"
 #include "devices/m48t59.h"
 #include "devices/ns16550.h"
@@ -1500,6 +1502,67 @@ TEST(ebus_dma_diagnostic_read_fills_its_fifo) {
     CHECK(!(get(0) & EbusDma::kDiagRdDone));
 }
 
+// The diagnostic bursts as Sun's POST makes them: the channel reset and the
+// reset bit cleared from what the CSR reads, the address loaded (no count),
+// DIAG_EN and EN_DMA (and WRITE) added, the done bit polled for, the channel
+// reset; then none of DIAG_EN, EN_DMA, RESET or WRITE is left. A read
+// replaces all 32 window words; a write gives memory the window's 128 bytes.
+TEST(ebus_dma_diagnostic_bursts_as_the_post_makes_them) {
+    EbusDma dma("test-dma");
+    std::vector<u8> mem(512, 0x55);
+    dma.set_dma_port([&](u32 a, u8* d, std::size_t n) { std::copy_n(mem.begin() + a, n, d); return true; },
+                     [&](u32 a, const u8* d, std::size_t n) { std::copy_n(d, n, mem.begin() + a); return true; });
+    auto put = [&](unsigned reg, u32 v) { dma.write(reg, 4, byteswap(v)); };
+    auto get = [&](unsigned reg) {
+        u64 v = 0;
+        dma.read(reg, 4, v);
+        return byteswap(static_cast<u32>(v));
+    };
+    auto window = [&](unsigned off) {  // (32-bit little-endian, as the POST reads it)
+        u64 v = 0;
+        dma.fifo_window().read(off, 4, v);
+        return byteswap(static_cast<u32>(v));
+    };
+    auto burst = [&](u32 addr, bool to_memory) {
+        const u32 done = to_memory ? EbusDma::kDiagWrDone : EbusDma::kDiagRdDone;
+        put(0, EbusDma::kReset);
+        CHECK_EQ(get(0), EbusDma::kDevId | EbusDma::kReset);
+        put(0, get(0) & ~EbusDma::kReset);
+        const u32 c = get(0);
+        CHECK_EQ(c, EbusDma::kDevId);
+        put(4, addr);
+        put(0, c | EbusDma::kDiagEn | EbusDma::kEnDma | (to_memory ? EbusDma::kWrite : 0));
+        u32 csr = 0;
+        for (int i = 0; i < 50 && !(csr & done); ++i) csr = get(0);
+        CHECK(csr & done);
+        if (!to_memory) CHECK_EQ(csr, 0xC6100A00u);  // A_LOADED, DMA_ON, DIAG_EN, DIAG_RD_DONE, EN_DMA
+        put(0, EbusDma::kReset);
+        put(0, 0);
+        CHECK_EQ(get(0) & 0x00100380u, 0u);
+    };
+    for (unsigned off = 0; off < 0x40; off += 4) {
+        dma.fifo_window().write(off, 4, 0xFFFFFFFFu);
+        dma.fifo_window().write(0x100 + off, 4, 0xFFFFFFFFu);
+    }
+    burst(0x80, false);
+    for (unsigned off = 0; off < 0x40; off += 4) {
+        CHECK_EQ(window(off), 0x55555555u);
+        CHECK_EQ(window(0x100 + off), 0x55555555u);
+    }
+    std::fill(mem.begin(), mem.end(), 0xAA);
+    for (unsigned off = 0; off < 0x40; off += 4) {
+        dma.fifo_window().write(off, 4, 0x55555555u);
+        dma.fifo_window().write(0x100 + off, 4, 0x55555555u);
+    }
+    burst(0x100, true);
+    CHECK(std::all_of(mem.begin() + 0x100, mem.begin() + 0x180, [](u8 b) { return b == 0x55; }));
+    CHECK(mem[0xFF] == 0xAA && mem[0x180] == 0xAA);
+    // RESET written with the enables still stops the channel.
+    put(4, 0x80);
+    put(0, EbusDma::kReset | EbusDma::kDiagEn | EbusDma::kEnDma | EbusDma::kWrite);
+    CHECK_EQ(get(0), EbusDma::kDevId | EbusDma::kReset);
+}
+
 TEST(ebus_dma_chains_the_next_transfer_at_terminal_count) {
     EbusDma dma("test-dma");
     std::vector<u8> mem(64);
@@ -1990,4 +2053,120 @@ TEST(ultra5_10_new_nvram_is_a_sane_starting_point) {
     CHECK_EQ(ia[4], 0x20u);
     CHECK(!std::equal(ia + 5, ia + 8, ib + 5));
     CHECK(checksum_ok(a.nvram().data()));
+}
+
+// The SuperIO decodes only the low 12 bits of its window: each device
+// answers at every 4 KiB step (the keyboard UART at 0x3003F8 and 0x3063F8
+// as well as the device tree's 0x3083F8).
+TEST(superio_devices_answer_at_every_4k_step) {
+    Ultra5_10 m(small_options());
+    auto& b = m.bus();
+    constexpr u64 kEbus = 0x1FFF1000000ull;
+    auto rd8 = [&](u32 off) {
+        u8 v = 0;
+        CHECK(b.read(kEbus + off, v));
+        return unsigned{v};
+    };
+    for (u32 at : {0x3003FFu, 0x3063FFu, 0x3083FFu, 0x30F3FFu}) CHECK_EQ(rd8(at), 0x30u);  // keyboard scratch
+    CHECK(b.write(kEbus + 0x3063FF, u8{0x5A}));
+    CHECK_EQ(rd8(0x3083FF), 0x5Au);
+    CHECK_EQ(rd8(0x3003BD), 0x7Fu);  // parallel status
+    CHECK_EQ(rd8(0x306398), 0x76u);  // still undecoded
+}
+
+// The EBus DMA registers as an Ultra 10's PROM diagnostics walk them: the
+// byte count reads back what was written while no transfer runs; DIAG_EN
+// alone starts a diagnostic burst; the FIFO's contents outlive a channel
+// reset and go back to memory with WRITE.
+TEST(ebus_dma_count_reads_back_and_diag_en_alone_bursts) {
+    EbusDma dma("test-dma");
+    std::vector<u8> mem(1024);
+    for (std::size_t i = 0; i < 256; ++i) mem[i] = static_cast<u8>(i);
+    dma.set_dma_port([&](u32 a, u8* d, std::size_t n) { std::copy_n(mem.begin() + a, n, d); return true; },
+                     [&](u32 a, const u8* d, std::size_t n) { std::copy_n(d, n, mem.begin() + a); return true; });
+    auto put = [&](unsigned reg, u32 v) { dma.write(reg, 4, byteswap(v)); };
+    auto get = [&](unsigned reg) {
+        u64 v = 0;
+        dma.read(reg, 4, v);
+        return byteswap(static_cast<u32>(v));
+    };
+    put(4, 0x10);
+    for (unsigned bit = 0; bit < 24; ++bit) {
+        put(8, 1u << bit);
+        CHECK_EQ(get(8), 1u << bit);
+    }
+    put(0, EbusDma::kReset);
+    put(0, 0);
+    put(4, 0x40);
+    put(0, 0x001D0000);  // DIAG_EN, burst, DIS_CSR_DRN
+    CHECK(get(0) & EbusDma::kDiagRdDone);
+    put(0, EbusDma::kReset);
+    put(0, 0);
+    put(4, 0x200);
+    put(0, 0x001D0100);  // and WRITE
+    CHECK(get(0) & EbusDma::kDiagWrDone);
+    CHECK(std::equal(mem.begin() + 0x40, mem.begin() + 0xC0, mem.begin() + 0x200));
+}
+
+// The parallel port's ECP: its registers at base + 0x400 only with PCR bit
+// 2 set; in test mode (110) with DMA enabled the channel fills the FIFO
+// from memory, the test FIFO gives the bytes back in order, and the
+// channel's terminal count sets the service bit.
+TEST(ecpp_test_fifo_fills_by_dma) {
+    SuperIoConfig cfg(0x90);
+    EbusDma dma("ecpp-dma");
+    std::vector<u8> mem(256);
+    for (std::size_t i = 0; i < mem.size(); ++i) mem[i] = static_cast<u8>(i);
+    dma.set_dma_port([&](u32 a, u8* d, std::size_t n) { std::copy_n(mem.begin() + a, n, d); return true; },
+                     [&](u32 a, const u8* d, std::size_t n) { std::copy_n(d, n, mem.begin() + a); return true; });
+    Ecpp port(cfg, dma);
+    dma.on_change = [&] { port.service(); };
+    auto ext = [&](unsigned off) {
+        u64 v = 0;
+        port.extended().read(off, 1, v);
+        return v;
+    };
+    CHECK_EQ(ext(2), 0x76u);  // ECP off: not decoded
+    u64 v = 0;
+    cfg.read(0, 1, v);        // (the first index read: the chip's ID)
+    cfg.write(0, 1, 4);       // PCR: ECP enable
+    cfg.write(1, 1, 0x04);
+    cfg.write(1, 1, 0x04);
+    CHECK_EQ(ext(2), 0x15u);  // the ECR's reset value: empty
+    port.extended().write(2, 1, 0xD8);  // test mode, DMA enabled
+    auto put = [&](unsigned reg, u32 x) { dma.write(reg, 4, byteswap(x)); };
+    put(8, 16);
+    put(4, 0x20);
+    put(0, 0x00012200);  // EN_CNT, EN_DMA, memory to device
+    CHECK_EQ(ext(2) & 0x07, 0x06u);  // full, service set at terminal count
+    for (unsigned i = 0; i < 16; ++i) CHECK_EQ(ext(0), 0x20u + i);
+    CHECK_EQ(ext(2) & 0x03, 0x01u);  // empty
+    port.extended().write(2, 1, 0xF0);  // configuration mode
+    CHECK_EQ(ext(0), 0x10u);  // CNFGA
+}
+
+// MODE.TLP, the test loop: what the channel sends comes back to its own
+// receiver and nothing goes out on the line.
+TEST(sab82532_test_loop_returns_what_is_sent) {
+    Scheduler s;
+    u64 now = 0;
+    s.set_clock([&] { return now; });
+    SerialLine a, b;
+    std::string out;
+    b.transmit = [&](u8 c) { out.push_back(static_cast<char>(c)); };
+    Sab82532 se(s, a, b, Sab82532::kClockHz / 16.0);
+    u64 v = 0;
+    se.write(0x40 + 0x22, 1, 0x09);  // channel B MODE: RAC and TLP
+    se.write(0x40 + 0x28, 1, 0x40);  // RFC: a byte a block (threshold 1)
+    se.write(0x40 + 0x00, 1, 0xA5);
+    se.write(0x40 + 0x20, 1, 0x08);  // CMDR: XF
+    for (int i = 0; i < 40; ++i) {
+        now += 11;
+        s.run_due(now);
+    }
+    CHECK(out.empty());
+    se.read(0x40 + 0x3A, 1, v);  // ISR0 (IPC VIS clear: masked bits hidden)
+    se.write(0x40 + 0x3A, 1, 0x00);  // IMR0: all unmasked
+    se.read(0x40 + 0x00, 1, v);
+    CHECK_EQ(v, 0xA5u);
 }

@@ -111,12 +111,13 @@ h# 4000.0000 constant rx-overflow	\ (receive: the frame was longer than the buff
    until  drop false
 ;
 
-: wait-link ( mask -- up? )
-   get-msecs d# 5000 +  begin			( mask when )
+: wait-link-ms ( mask ms -- up? )
+   get-msecs +  begin				( mask when )
       over phy-sr@ and  2 pick = if  2drop true exit  then
       dup timed-out?
    until  2drop false
 ;
+: wait-link ( mask -- up? )  d# 5000 wait-link-ms  ;
 
 : an-result ( -- speed duplex )
    phy-anlpar@ phy-anar@ and				( common )
@@ -145,12 +146,29 @@ h# 4000.0000 constant rx-overflow	\ (receive: the frame was longer than the buff
    set-chosen-speed&duplex
 ;
 
+\ Auto-negotiation: three rounds, each restarting it and waiting for it
+\ to complete and then for the link; in diagnostic mode each wait that
+\ runs out is reported, as an Ultra 10 reports them.
+: .diag ( $ -- )  diagnostic-mode? if  type cr  else  2drop  then  ;
+: auto-link ( -- up? )
+   3 0 do
+      phycr.an-enable phycr.an-restart or phy-cr!
+      physr.an-complete d# 2000 wait-link-ms if
+         physr.link-up d# 2000 wait-link-ms if  true unloop exit  then
+      else
+         " Timeout waiting for AutoNegotiation Status to be updated. " .diag
+      then
+      " Timeout reading Link status. Check cable and try again. " .diag
+   loop
+   " AutoNegotiation Timeout. " .diag
+   " Check Cable or Contact your System Administrator. " .diag
+   false
+;
+
 : setup-transceiver ( -- up? )
    phy-reset 0= if  false exit  then
    user-speed auto-speed =  user-duplex auto-duplex = and if
-      abilities phy-anar!
-      phycr.an-enable phycr.an-restart or phy-cr!
-      physr.an-complete physr.link-up or wait-link	( up? )
+      abilities phy-anar!  auto-link			( up? )
       dup if  an-result set-chosen-speed&duplex  then
    else
       forced-link

@@ -34,6 +34,7 @@ src/cpu/ultrasparc/  UltraSPARC IIi: interpreter, MMU and ASIs, FPU and VIS,
                      disassembler
 src/devices/         PCI framework; Sabre, Simba, RIO EBus; M48T59, 16550,
                      SAB82532, 82077 floppy controller and drive, SuperIO configuration,
+                     parallel port (ECP),
                      flash PROM; ATA channel and bus master, ATA disk, ATAPI
                      CD-ROM, CMD646
 src/storage/         disk and CD image files
@@ -66,8 +67,10 @@ and the native macOS menu bar, in `src/app/`.
   through the Sabre's IOMMU, and its interrupt is INO 0x20.
 * **EBus:** BAR0 is the flash (the reset vector, 0x1FF.F000.0000, while BAR0
   is at its power-on 0xF000_0000); BAR1 holds the NVRAM (0x000000), audio
-  (0x200000), the SuperIO devices (configuration 0x300398, floppy 0x3023F0,
-  parallel 0x3043BC, mouse 0x3062F8, keyboard 0x3083F8), the serial ports
+  (0x200000), the SuperIO devices (configuration 0x30015C, floppy 0x3023F0,
+  parallel 0x3043BC and its ECP registers at +0x400, mouse 0x3062F8,
+  keyboard 0x3083F8; the SuperIO decodes only the low 12 address bits, so
+  each answers at every 4 KiB step of 0x300000-0x30FFFF), the serial ports
   (0x400000), the clock control (0x504000), DMA (0x700000), power
   (0x724000) and auxio (0x726000).
 * **Interrupts:** each device's interrupt number (INO) goes through the

@@ -26,10 +26,18 @@ copyright: Copyright 2026 Andy Taylor
 \      512 KiB (512 KiB, the image), RAMbase to membase + 448 KiB (64 KiB);
 \      the MMUs and caches on; the image entered at its power-on entry
 \      (ROMbase + 30) with %i0 = membase, %i1 = 1 MiB, %i2 = the reset
-\      (0 power-on, 1 watchdog, 2 XIR, 3 SIR, 4 RED state; kept in %y
-\      until then).
-\ The other resets (watchdog, XIR, SIR, RED) say which they were and start
-\ again as from power-on.
+\      (0 power-on, 1 watchdog; kept in %y until then).
+\ The other resets, as an Ultra 10 takes them:
+\   - watchdog: "Watchdog Reset" on ttya, then as from power-on;
+\   - SIR: "SIR Reset", then a software XIR (the reset control cleared,
+\     then SOFT_XIR set);
+\   - RED state exception: "RED State Exception" and each trap level's
+\     TL, TT, TPC, TnPC and TSTATE, then a software XIR;
+\   - XIR (the button, or a software XIR): the reset control cleared; if
+\     OpenBoot's locked TLB entries for its image are still there, back
+\     into it at its XIR trap entry (it reports the reset and gives the ok
+\     prompt, its state as it was); if not, "soft-rst" left in the NVRAM
+\     and on as from power-on.
 
 \ [define] VERBOSE-RESET
 
@@ -1288,12 +1296,14 @@ label post-return
    %o0  %o1  %g0  bypass-asi	stxa
    reset-control-pa  %o2  %o1  setx
    %g0  %o1  %g0  bypass-asi	stxa
-   %g0  1		%o0	sub
+   \ SOFT_POR alone, as an Ultra 10 resets after its POST (reset-reason
+   \ then S-POR).
+   h# 4000.0000  %o2	%o0	setx
    %o0  %o1  %g0  bypass-asi	stxa
    begin again  nop
 end-code
 
-\ The other resets: which it was, then on as from power-on.
+\ The watchdog reset: as from power-on.
 label other-reset
    init-processor		call
    nop
@@ -1306,14 +1316,128 @@ label other-reset
    nop
 end-code
 
+\ A software XIR: the reset control cleared, then SOFT_POR's neighbour,
+\ SOFT_XIR, set; the XIR comes at once.
+label soft-xir
+   reset-control-pa  %o2  %o1  setx
+   %g0  %o1  %g0  bypass-asi	stxa
+   h# 2000.0000  %o2	%o0	setx
+   %o0  %o1  %g0  bypass-asi	stxa
+   begin again  nop
+end-code
+
+\ The RED state exception's report: for each trap level from the current
+\ one down to 1, "TL=<tl> TT=<tt>" and "   TPC=<tpc> TnPC=<tnpc>
+\ TSTATE=<tstate>", each number in 16 hex digits; then a blank line.
+\ (%g6 the trap level; %o0-%o6 trashed.)
+label red-report
+   %g6				rdtl
+   begin
+      %g6  %g0		%g0	subcc
+   0<> while  nop
+      %g6  0			wrtl
+      print" "r"nTL="
+      puthex16			call
+      %g6			%o0	move
+      print"  TT="
+      %o0			rdtt
+      puthex16			call
+      nop
+      print" "r"n   TPC="
+      %o0			rdtpc
+      puthex16			call
+      nop
+      print"  TnPC="
+      %o0			rdtnpc
+      puthex16			call
+      nop
+      print"  TSTATE="
+      %o0			rdtstate
+      puthex16			call
+      nop
+      %g6  1		%g6	sub
+   repeat  nop
+   print" "r"n"r"n"
+   soft-xir		always	brif
+   nop
+end-code
+
+\ An XIR: the reset control cleared; then whether OpenBoot's locked
+\ entries for its image (monvirtbase, context 0, valid and locked) are in
+\ both TLBs (%g7: 1 the I-TLB's, 2 the D-TLB's).
+label xir-reset
+   reset-control-pa  %o2  %o1  setx
+   %g0  %o1  %g0  bypass-asi	stxa
+   monvirtbase		%o3	set
+   %g0  %g0		%g7	add
+   h# 200		%o0	set
+   begin
+      %o0  8		%o0	sub
+      %o0  %g0  h# 56	%o1	ldxa		\ I-TLB tag
+      %o1  %o3		%g0	subcc
+      0=  if  nop
+         %o0  %g0  h# 55  %o2	ldxa		\ its data
+         %o2  %g0		%g0	subcc
+         0<  if  nop
+            %o2  h# 40	%g0	andcc
+            0<>  if  nop
+               %g7  1	%g7	or
+            then
+         then
+      then
+      %o0  %g0		%g0	subcc
+   0= until  nop
+   h# 200		%o0	set
+   begin
+      %o0  8		%o0	sub
+      %o0  %g0  h# 5e	%o1	ldxa		\ D-TLB tag
+      %o1  %o3		%g0	subcc
+      0=  if  nop
+         %o0  %g0  h# 5d  %o2	ldxa		\ its data
+         %o2  %g0		%g0	subcc
+         0<  if  nop
+            %o2  h# 40	%g0	andcc
+            0<>  if  nop
+               %g7  2	%g7	or
+            then
+         then
+      then
+      %o0  %g0		%g0	subcc
+   0= until  nop
+   %g7  3		%g0	subcc
+   0<>  if  nop
+      \ Not there: "soft-rst" left, and on as from power-on.
+      nvram-pa h# 10 +  %o2  %o1  setx
+      soft-rst-magic  %o2	%o0	setx
+      %o0  %o1  %g0  bypass-asi	stxa
+      %g0  0			wry
+      power-on-reset	always	brif
+      nop
+   then
+   \ There: the MMUs on, and (by "done", which leaves RED state and goes
+   \ to the virtual address together) to OpenBoot's XIR trap entry
+   \ (ROMbase + 60).
+   %g0  h# c		%o0	add		\ IM, DM
+   %o0  %g0  %g0  h# 45		stxa
+   #Sync			membar
+   monvirtbase h# 60 +	%o0	set
+   %o0  0			wrtpc
+   %o0  0			wrtnpc
+   %g2				rdcwp
+   h# 1500		%o1	set		\ PSTATE: PEF, PRIV, AG
+   %o1  %g2		%o1	or
+   %o1  0			wrtstate
+   done
+end-code
+
 \ Where the reset vectors branch to.
 label reset-entries
 h# 20 .align
 0 L:  %g0 0 wry  power-on-reset always brif annul nop
 1 L:  %g0 1 wry  init-reset-pci call nop  init-reset-ttya call nop  print" "r"nWatchdog Reset"r"n"  other-reset always brif annul nop
-2 L:  %g0 2 wry  init-reset-pci call nop  init-reset-ttya call nop  print" "r"nExternally Initiated Reset"r"n"  other-reset always brif annul nop
-3 L:  %g0 3 wry  init-reset-pci call nop  init-reset-ttya call nop  print" "r"nSoftware Initiated Reset"r"n"  other-reset always brif annul nop
-4 L:  %g0 4 wry  init-reset-pci call nop  init-reset-ttya call nop  print" "r"nRED State Exception"r"n"  other-reset always brif annul nop
+2 L:  xir-reset always brif annul nop
+3 L:  init-reset-pci call nop  init-reset-ttya call nop  print" "r"nSIR Reset"r"n"  soft-xir always brif annul nop
+4 L:  init-reset-pci call nop  init-reset-ttya call nop  print" "r"nRED State Exception"r"n"  red-report always brif annul nop
 5 L:  post-return always brif annul nop
 end-code
 

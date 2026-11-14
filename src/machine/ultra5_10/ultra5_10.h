@@ -28,6 +28,7 @@
 #include "devices/cs4231.h"
 #include "devices/ebus_dma.h"
 #include "devices/ebus_misc.h"
+#include "devices/ecpp.h"
 #include "devices/fdc82077.h"
 #include "devices/hme.h"
 #include "devices/ffb.h"
@@ -263,6 +264,7 @@ private:
     Fdc82077 fdc_;
     // EBus DMA channels: parallel port, audio playback and capture, floppy.
     EbusDma ecpp_dma_{"ecpp-dma"}, audio_play_dma_{"audio-play-dma"}, audio_rec_dma_{"audio-rec-dma"}, fd_dma_{"fd-dma"};
+    Ecpp ecpp_{superio_, ecpp_dma_};  // the parallel port (through ecpp_dma_)
     Cmd646 ide_;
     Hme hme_;
     Mach64 mach64_;

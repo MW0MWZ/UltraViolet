@@ -634,3 +634,18 @@ TEST(mach64_engine_packed_24_bit_fills) {
     CHECK_EQ(e.m.vram()[9], 0u);
 }
 
+
+// The register blocks answer at the top of the upper (big-endian) half too
+// (block 0 at 0xFFFC00): an Ultra 10's PROM diagnostics walk ones and
+// zeros through SCRATCH_REG0 and 1 there with 32-bit accesses.
+TEST(mach64_registers_at_the_top_of_the_upper_half) {
+    Rig r;
+    const u32 upper = kBar0 + 0xFFFC00;
+    for (unsigned bit = 0; bit < 32; ++bit) {
+        r.wr(upper + 0x80, 1u << bit);
+        CHECK_EQ(r.rd(upper + 0x80), u64{1u << bit});
+    }
+    r.wr(upper + 0x84, 0xC0000000u);
+    CHECK_EQ(r.rd(upper + 0x84), 0xC0000000u);
+    CHECK_EQ(r.rd(kRegs + 0x84), 0xC0000000u);  // the same register through the lower window
+}

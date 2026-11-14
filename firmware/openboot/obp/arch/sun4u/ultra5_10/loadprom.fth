@@ -192,6 +192,11 @@ fload ${BP}/arch/sun4u/ultra5_10/diag.fth	\ .speed, probe-pci, ...
 fload builtin.fth
 
 fload ${BP}/arch/sun4u/ultra5_10/post.fth	\ system-tests, show-post-results
+fload ${BP}/arch/sun4u/ultra5_10/obdiag.fth	\ obdiag: its state and reports,
+fload ${BP}/arch/sun4u/ultra5_10/obd-pci.fth	\ its tests,
+fload ${BP}/arch/sun4u/ultra5_10/obd-ebus.fth
+fload ${BP}/arch/sun4u/ultra5_10/obd-misc.fth
+fload ${BP}/arch/sun4u/ultra5_10/obdmenu.fth	\ its menus and script
 
 true value system-test-ok?
 

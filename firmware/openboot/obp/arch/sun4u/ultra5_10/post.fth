@@ -43,14 +43,20 @@ headers
    then
 ;
 
-\ (startup's: the POST has run before OpenBoot.)
-: system-tests ( -- )  ;
+\ (startup's: the POST has run before OpenBoot. After a run that passed,
+\ obdiag's manufacturing script, if mfg-mode asks for one: obdmenu.fth.)
+headerless
+defer obd-scripts  ' noop is obd-scripts
+headers
+: system-tests ( -- )  post-ran? post-ok? and if  obd-scripts  then  ;
 
 : show-post-results ( -- )
    post-ran? 0= if  ." Power On Selftest not run on last reset" cr exit  then
    push-hex
    ." Status 0=Pass, Non-Zero=Fail (%o0): " post-status . cr
-   ." Message String               (%o1): " .post-message space cr
+   \ (A space after the message, none after an empty one: an Ultra 10's.)
+   ." Message String               (%o1): " .post-message
+   post-ret1 @ bypass-asi spacec@  if  space  then  cr
    ." Board Descriptor             (%o2): " post-ret2 @ . cr
    pop-base
 ;

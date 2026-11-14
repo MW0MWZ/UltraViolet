@@ -410,3 +410,40 @@ TEST(hme_mif_polling_reports_link_changes) {
     CHECK(!r.irq);
     CHECK_EQ(r.rd(0x0100) & (1u << 23), 0u);
 }
+
+// The PHY's loopbacks (BMCR loopback; LBREMR's 10BASE-T loopback or
+// LB[1:0]) return a frame from the transceiver without sending it; with
+// the RX configuration's keep-FCS bit the frame's length counts its FCS
+// (a 60-byte frame comes back as 64, as an Ultra 10's PROM diagnostics
+// expect).
+TEST(hme_phy_loopbacks_and_the_kept_fcs) {
+    Rig r;
+    r.init(kMac);
+    std::vector<u8> f = ip_frame(kMac, 60);
+    std::memcpy(r.mem.data() + 0x8000, f.data(), f.size());
+    u32 slot = 0;
+    auto send = [&] {
+        r.put_le(0x0804 + 8 * slot, 0x8000);
+        r.put_le(0x0800 + 8 * slot, 0x80000000u | 3u << 29 | 60);
+        ++slot;
+        r.wr(0x2000, 1);
+        r.run(5000);
+    };
+    r.wr(0x630C, 0x0141);  // enabled, promiscuous, keep FCS
+    r.mii_write(1, 0, 0x4000);  // BMCR loopback
+    send();
+    CHECK_EQ(r.wire->sent.size(), 0u);
+    CHECK_EQ((r.le(0x1000) >> 16) & 0x3FFF, 64u);
+    r.mii_write(1, 0, 0x2000);
+    r.mii_write(1, 24, 0x8100);  // LBREMR: the transceiver loopback
+    send();
+    CHECK_EQ(r.wire->sent.size(), 0u);
+    CHECK_EQ(r.le(0x1008) >> 31, 0u);
+    r.mii_write(1, 24, 0x0800);  // 10BASE-T loopback
+    send();
+    CHECK_EQ(r.le(0x1010) >> 31, 0u);
+    r.mii_write(1, 24, 0);
+    r.wr(0x630C, 0x0041);  // FCS stripped, loopbacks off: out on the wire
+    send();
+    CHECK_EQ(r.wire->sent.size(), 1u);
+}

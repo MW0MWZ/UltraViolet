@@ -39,6 +39,9 @@
 \ any nuclear facility. 
 \ 
 \ ========== Copyright Header End ============================================
+\ Adapted by Andy Taylor, 2026: on the Ultra 5/10 (Ultra5_10) a failed
+\ selftest is reported as an Ultra 10 reports it, as is a device with no
+\ selftest method, and a device that passes is given no "status" property.
 id: @(#)test.fth 1.11 03/04/04
 purpose: test, test-dev, test-all, obdiag definitions 
 copyright: Copyright 2000-2003 Sun Microsystems, Inc.  All Rights Reserved
@@ -65,6 +68,10 @@ create has-no-selftest  ( -- p$adr )	\  This location becomes the throw-code
 
 0 value tested-device		\ phandle of current device under test.
 h# 100  buffer: error-buffer
+[ifdef] Ultra5_10
+0 value no-selftest?		\ the message is the Ultra 10's "No selftest method"
+h# 100  buffer: path-buffer
+[then]
 
 : abort-selftest-msg ( -- )
    error-buffer count  set-abort-message -2 throw
@@ -147,7 +154,16 @@ h# 100  buffer: error-buffer
    \
    ['] ($call-selftest) catch ?dup  if		( 0 0 0 0 0 ?? catch? )
       dup has-no-selftest = if			( ?? no-selftest-throw-code )
+[ifdef] Ultra5_10
+         \ The Ultra 10's: "No selftest method for <path> ", the path as
+         \ given, alone on its line (no "Error: ").
+         drop  error-buffer count  tuck path-buffer swap move	( ?? len )
+         0 error-buffer c!  " No selftest method for " (save-string)
+         path-buffer swap (save-string)  "  " (save-string)	( ?? )
+         true to no-selftest?
+[else]
          count (save-string)	 		( ?? ) 
+[then]
       else					( ?? catch? )
          "  selftest terminated abnormally"	( ?? catch? str,len )
          (save-string)				( ?? catch? )
@@ -204,11 +220,14 @@ h# 100  buffer: error-buffer
          then                                           ( R: ih ph)
       then                                              ( R: ih ph)
    else                                                 ( R: ih ph)
+[ifndef] Ultra5_10
+      \ (An Ultra 10 makes no "status" for a device that passes.)
       "status" tested-device get-package-property  if   ( R: ih ph)
          set-okay-property                              ( R: ih ph)
       else                                              ( R: ih ph)
          2drop                                          ( R: ih ph)
       then                                              ( R: ih ph)
+[then]
    then                                                 ( R: ih ph)
    2r> push-device to my-self                           ( R: )
 ;
@@ -221,7 +240,15 @@ h# 100  buffer: error-buffer
    rot >r                                       ( dev$ )      ( R: not-silent? )
    r@ ['] stacked-$call-selftest catch -2 = if  ( ?? )
       r> if                                     ( ?? )        ( R:  )
+[ifdef] Ultra5_10
+         3drop  no-selftest?  if                ( )
+            ??cr abort-message type cr          ( )
+         else                                   ( )
+            abort-message .error-message        ( )
+         then                                   ( )
+[else]
          3drop abort-message .error-message     ( ?? )
+[then]
       else                                      ( ?? )
          -2 throw                               ( ?? )      
       then                                      ( ?? )
@@ -252,6 +279,7 @@ h# 100  buffer: error-buffer
 
 : (test-dev)  ( not-silent? name,len -- status )
    0 error-buffer c!				( not-silent? dev$ )
+[ifdef] Ultra5_10  false to no-selftest?  [then]
    2dup locate-device if			( not-silent? dev$ )
       " Device " (save-string) (save-string)	( not-silent? )
       "  not found" (save-string)		( not-silent? )

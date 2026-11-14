@@ -180,6 +180,12 @@ pm_next:
 3:	call	pm_mode
 	mov	%i2, %o0
 
+	/* No bank with its pair of DIMMs: nothing for the POST to run in. */
+	or	%i0, %i1, %g1
+	andcc	%g1, 1, %g0
+	be,pn	%icc, post_no_memory
+	nop
+
 	/* The memory used, 0 to 2 MiB: each word its own address, then its
 	   complement, read back (through no cache). */
 	set	RAM_TOP, %l0
@@ -259,6 +265,213 @@ pm_next:
 	ba	post_return
 	nop
 
+/*
+ * No memory: the report an Ultra 10's POST gives for it, made here, from
+ * the PROM, with no stack (leaf routines, the registers alone). The tests
+ * an Ultra 10 runs before its memory probe need none and are listed by it
+ * first; ours run from memory, so here there are none to list. Then back
+ * to the reset code as a failure, "No DIMM" the suspect.
+ */
+#define NM_TTYA_STAR	0x1fff1400020
+#define NM_TTYA_TIC	0x1fff1400035
+#define NM_KBD		0x1fff13003f8
+#define NM_NVRAM	0x1fff1000000
+
+	/* A character (in \r) on ttya, by the transmit-immediate register. */
+	.macro	nm_emit r
+	setx	NM_TTYA_STAR, %g3, %g2
+9:	lduba	[%g2] ASI_BYPASS, %g3
+	andcc	%g3, 8, %g0		/* TIC still executing */
+	bnz,pt	%icc, 9b
+	nop
+	setx	NM_TTYA_TIC, %g3, %g2
+	stba	\r, [%g2] ASI_BYPASS
+	.endm
+
+	/* A byte to the keyboard, once its transmitter is empty (as long a
+	   wait as the C's). */
+	.macro	nm_kbd byte
+	setx	NM_KBD + 5, %g3, %g2	/* its line status */
+	set	100000, %g4
+9:	lduba	[%g2] ASI_BYPASS, %g3
+	andcc	%g3, 0x20, %g0
+	bnz,pt	%icc, 8f
+	subcc	%g4, 1, %g4
+	bnz,pt	%icc, 9b
+	nop
+8:	setx	NM_KBD, %g3, %g2
+	mov	\byte, %g3
+	stba	%g3, [%g2] ASI_BYPASS
+	.endm
+
+	.macro	nm_puts str
+	set	\str - _start, %o0
+	call	nm_puts
+	add	%o0, %l4, %o0
+	.endm
+
+	.macro	nm_char c
+	mov	\c, %o1
+	nm_emit	%o1
+	.endm
+
+	/* A clock register (BCD) into \r. */
+	.macro	nm_clock offset, mask, r
+	setx	NM_NVRAM + \offset, %g3, %g2
+	lduba	[%g2] ASI_BYPASS, \r
+	and	\r, \mask, \r
+	.endm
+
+post_no_memory:
+	nm_kbd	0x0e			/* the group's heartbeat: Caps Lock */
+	nm_kbd	0x08
+	nm_puts	nm_banner
+	nm_puts	nm_probe
+	nm_kbd	0x0e			/* the suspect on the LEDs, a pause */
+	nm_kbd	0x0c
+	rd	%tick, %g4
+	set	100000000, %g5
+1:	rd	%tick, %g1
+	sub	%g1, %g4, %g1
+	cmp	%g1, %g5
+	bl,pt	%xcc, 1b
+	nop
+	nm_kbd	0x0e
+	nm_kbd	0x00
+	nm_puts	nm_fail
+	set	nm_off - _start, %o0	/* the chamber (manufacturing) mode? */
+	set	nm_chamber - _start, %g1
+	sethi	%hi(0x10000), %g5
+	andcc	%l7, %g5, %g0
+	movne	%icc, %g1, %o0
+	call	nm_puts
+	add	%o0, %l4, %o0
+
+	/* The time stamp, from the clock (its read bit set meanwhile). */
+	setx	NM_NVRAM + 0x1ff8, %g3, %g2
+	lduba	[%g2] ASI_BYPASS, %g1
+	or	%g1, 0x40, %g1
+	stba	%g1, [%g2] ASI_BYPASS
+	nm_clock 0x1ff9, 0x7f, %l0	/* seconds */
+	nm_clock 0x1ffa, 0x7f, %l1	/* minutes */
+	nm_clock 0x1ffb, 0x3f, %l2	/* hours */
+	nm_clock 0x1ffd, 0x3f, %l3	/* date */
+	nm_clock 0x1ffe, 0x1f, %l5	/* month */
+	nm_clock 0x1fff, 0xff, %l6	/* year */
+	setx	NM_NVRAM + 0x1ff8, %g3, %g2
+	lduba	[%g2] ASI_BYPASS, %g1
+	andn	%g1, 0x40, %g1
+	stba	%g1, [%g2] ASI_BYPASS
+	nm_puts	nm_time1
+	call	nm_put2
+	mov	%l2, %o0
+	nm_char	0x3a
+	call	nm_put2
+	mov	%l1, %o0
+	nm_char	0x3a
+	call	nm_put2
+	mov	%l0, %o0
+	nm_puts	nm_time2
+	call	nm_put2
+	mov	%l5, %o0
+	nm_char	0x2f
+	call	nm_put2
+	mov	%l3, %o0
+	nm_char	0x20
+	srl	%l6, 4, %o0		/* the year: BCD + 1968, as Solaris keeps it */
+	mulx	%o0, 10, %o0
+	and	%l6, 15, %g1
+	add	%o0, %g1, %o0
+	call	nm_put4
+	add	%o0, 1968, %o0
+	nm_puts	nm_newlines
+
+	/* The NVRAM's fields as a failed run leaves them: the options word,
+	   the board descriptor (no DIMMs), no pass, the suspect. */
+	set	0x1ce0, %o0
+	mov	%l7, %o1
+	call	nm_nvst
+	mov	8, %o2
+	set	0x1d58, %o0
+	setx	0x000200000200001b, %g1, %o1
+	call	nm_nvst
+	mov	8, %o2
+	set	0x1db2, %o0
+	clr	%o1
+	call	nm_nvst
+	mov	1, %o2
+	set	0x1cd8, %o0
+	mov	0x1b, %o1
+	call	nm_nvst
+	mov	1, %o2
+	set	0x1de0, %o0		/* the output column: 0 */
+	clr	%o1
+	call	nm_nvst
+	mov	1, %o2
+
+	mov	1, %o0
+	set	nm_dimm - _start, %o1
+	add	%o1, %l4, %o1
+	setx	0x000200000200001b, %g1, %o2
+	ba	post_return
+	nop
+
+/* A string (%o0, its address) on ttya, a newline as CR LF after it. */
+nm_puts:
+1:	lduba	[%o0] ASI_BYPASS, %o1
+	brz,pn	%o1, 3f
+	nop
+	nm_emit	%o1
+	cmp	%o1, 10
+	bne,pt	%icc, 2f
+	nop
+	mov	13, %o1
+	nm_emit	%o1
+2:	ba	1b
+	add	%o0, 1, %o0
+3:	retl
+	nop
+
+/* Two BCD digits (%o0). */
+nm_put2:
+	srl	%o0, 4, %o1
+	and	%o1, 15, %o1
+	add	%o1, 0x30, %o1
+	nm_emit	%o1
+	and	%o0, 15, %o1
+	add	%o1, 0x30, %o1
+	nm_emit	%o1
+	retl
+	nop
+
+/* Four decimal digits (%o0). */
+nm_put4:
+	mov	1000, %o2
+1:	udivx	%o0, %o2, %o1
+	mulx	%o1, %o2, %o3
+	sub	%o0, %o3, %o0
+	add	%o1, 0x30, %o1
+	nm_emit	%o1
+	udivx	%o2, 10, %o2
+	brnz,pt	%o2, 1b
+	nop
+	retl
+	nop
+
+/* An NVRAM field: %o0 its offset, %o1 the value, %o2 its bytes (the
+   last byte the value's lowest). */
+nm_nvst:
+	setx	NM_NVRAM, %g3, %g2
+	add	%g2, %o0, %g2
+1:	subcc	%o2, 1, %o2
+	bl,pn	%icc, 2f
+	nop
+	stba	%o1, [%g2 + %o2] ASI_BYPASS
+	ba	1b
+	srlx	%o1, 8, %o1
+2:	retl
+	nop
+
 /* The memory the POST would run in is bad: said so, and back. */
 post_ram_bad:
 	set	ram_bad_msg - _start, %o1
@@ -309,7 +522,8 @@ post_trap_fatal:
 	ldx	[%g1], %g2
 	add	%o1, %g2, %o1
 	mov	1, %o0
-	clr	%o2
+	set	post_board, %g1		/* (post_unexpected_trap's) */
+	ldx	[%g1], %o2
 	ba	post_return
 	nop
 
@@ -418,6 +632,30 @@ pm_col11:
 
 ram_bad_msg:				/* (beside the code: read from the PROM) */
 	.asciz	"Memory (POST area)"
+nm_banner:
+	.ascii	"@(#) Ultra 5/10 POST 0.1, OpenBoot 4.23.0, built "
+	.ascii	POST_DATE
+	.asciz	"\n\n"
+nm_probe:
+	.ascii	"Memory Probe\n\tProbe Memory\n"
+	.ascii	"\t\tINFO: All the memory banks in 10 bit column mode\n"
+	.asciz	"\t\tbank 0:\t  0MB\n\t\tbank 2:\t  0MB\n"
+nm_fail:
+	.ascii	"\n***********************\nSTATUS =FAILED\nTEST   =Probe Memory\n"
+	.ascii	"SUSPECT=No DIMM\nMESSAGE=No Memory Detected or only a single DIMM in a bank\n"
+	.asciz	"\n\n\nStatus of this POST run:\tFAIL\nmanfacturing mode="
+nm_off:
+	.asciz	"OFF\n"
+nm_chamber:
+	.asciz	"CHAMBER\n"
+nm_time1:
+	.asciz	"Time Stamp [hour:min:sec] "
+nm_time2:
+	.asciz	"  [month/date year] "
+nm_newlines:
+	.asciz	"\n\n"
+nm_dimm:
+	.asciz	"No DIMM"
 	.align	4
 
 /*

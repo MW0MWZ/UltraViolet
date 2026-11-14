@@ -35,8 +35,8 @@ constexpr u32 kFrameDone = 1u << 16;
 constexpr u32 kOwn = 1u << 31, kTxEop = 1u << 29, kTxCsum = 1u << 28, kRxOverflow = 1u << 30;
 // The internal PHY's address, and its registers.
 constexpr unsigned kPhyAddress = 1;
-constexpr unsigned kBmcr = 0, kBmsr = 1, kId1 = 2, kId2 = 3, kAnar = 4, kAnlpar = 5, kAner = 6, kPar = 25;
-constexpr u16 kBmcrReset = 0x8000, kBmcr100 = 0x2000, kBmcrAn = 0x1000, kBmcrRestart = 0x0200, kBmcrFull = 0x0100;
+constexpr unsigned kBmcr = 0, kBmsr = 1, kId1 = 2, kId2 = 3, kAnar = 4, kAnlpar = 5, kAner = 6, kLbremr = 24, kPar = 25;
+constexpr u16 kBmcrReset = 0x8000, kBmcrLoopback = 0x4000, kBmcr100 = 0x2000, kBmcrAn = 0x1000, kBmcrRestart = 0x0200, kBmcrFull = 0x0100;
 constexpr u16 kBmsrBase = 0x7809, kBmsrAnDone = 0x0020, kBmsrLink = 0x0004;
 
 // The widths of the BigMAC's registers (masks), by word; 0: none there.
@@ -372,9 +372,13 @@ void Hme::kick_tx() {
         // MYOWN clear, and with MYOWN set the copy is rejected while the
         // frame still goes out, as a net boot needs.) MII loopback stays
         // inside the MAC.
+        // The PHY's own loopbacks (BMCR loopback; LBREMR's 10BASE-T
+        // loopback, bit 11, or a loopback mode in LB[1:0], bits 9:8) return
+        // the frame from the transceiver without sending it.
         const u32 xif = bmac_[kXif / 4];
-        if ((xif & kXifOe) && !(xif & kXifMiiLoopback) && backend_) backend_->send(frame.data(), frame.size()), ++frames_;
-        if (xif & (kXifLoopback | kXifMiiLoopback)) receive(std::move(frame));
+        const bool phy_loop = (xif & kXifOe) && ((phy_[kBmcr] & kBmcrLoopback) || (phy_[kLbremr] & 0x0B00));
+        if ((xif & kXifOe) && !(xif & kXifMiiLoopback) && !phy_loop && backend_) backend_->send(frame.data(), frame.size()), ++frames_;
+        if ((xif & (kXifLoopback | kXifMiiLoopback)) || phy_loop) receive(std::move(frame));
     }
     tx_timer_.schedule_in(wire);
 }
@@ -439,7 +443,7 @@ void Hme::receive(std::vector<u8> frame) {
         return;
     }
     const std::size_t length = frame.size();  // (without the FCS)
-    if (bmac_[kRxCfg / 4] & kRxKeepFcs) {  // the FCS kept: appended, as it came off the wire
+    if (bmac_[kRxCfg / 4] & kRxKeepFcs) {  // the FCS kept: appended, as it came off the wire, and counted
         const u32 fcs = ~crc32(frame.data(), frame.size());
         for (int i = 0; i < 4; ++i) frame.push_back(static_cast<u8>(fcs >> (8 * i)));
     }
@@ -465,7 +469,7 @@ void Hme::receive(std::vector<u8> frame) {
     // offset (in halfwords) to the end of the frame, FCS excluded.
     const std::size_t start = 2 * ((erx_cfg_ >> 16) & 0x7F);
     const u32 sum = start < length ? ones_sum(frame.data() + start, length - start) : 0;
-    put_le32(d, static_cast<u32>(length & 0x3FFF) << 16 | (frame.size() > room ? kRxOverflow : 0) | (~sum & 0xFFFF));
+    put_le32(d, static_cast<u32>(frame.size() & 0x3FFF) << 16 | (frame.size() > room ? kRxOverflow : 0) | (~sum & 0xFFFF));
     master_write(at, d, 4);
     erx_ring_ = (erx_ring_ & ~0x7F8u) | ((idx + 1) % size) << 3;
     raise(kStatRxToHost | kStatRcvd);

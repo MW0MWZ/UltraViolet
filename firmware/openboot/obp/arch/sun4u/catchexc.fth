@@ -44,7 +44,9 @@
 \ keeps it in a scratchpad register), the globals are chosen through
 \ PSTATE (AG) in place of sun4v's global levels, and the hypervisor's TSB,
 \ watchdog and mondo queue calls are left out. A trap that goes back to the
-\ ok prompt first calls abandon-guards (see fieldberr.fth).
+\ ok prompt first calls abandon-guards (see fieldberr.fth). An XIR, entered
+\ by the reset code at the XIR trap entry, is reported as one (save-RED-state);
+\ a trap's name is shown alone, as an Ultra 10 shows it (.last-trap).
 id: @(#)catchexc.fth 1.3 06/04/19
 purpose: 
 copyright: Copyright 2006 Sun Microsystems, Inc.  All Rights Reserved.
@@ -339,8 +341,15 @@ label save-RED-state
 
    %g4  1  %g4  sub
    %g4  %g1 offset-of %state-valid  stx
+[ifdef] Ultra5_10
+   \ (Entered by the Ultra 5/10's reset code at an XIR only: the XIR's
+   \ trap type kept as last-trap#, which save-fstate does not set.)
+   %g0  3			%g4	add
+   %g4  %g1 offset-of last-trap#	stx
+[else]
    %g0  2			%g4	add
    %g4  %g1 offset-of error-reset-trap	stx
+[then]
 
    'user my-self                  %g4  nget
    %g4  %g1  offset-of %saved-my-self  stx
@@ -496,9 +505,29 @@ previous previous definitions
    then                                            (  )
 ;
 
+[ifdef] Ultra5_10
+\ (last-trap)'s message typed, its one %s, %d or %x filled in.
+: .trap-fmt ( ?? fmt$ -- )
+   ascii % left-parse-string type		( ?? rest$ )
+   dup 0=  if  2drop exit  then			( ?? rest$ )
+   over c@ -rot  1 /string 2>r			( ?? c )
+   case
+      ascii s  of  type  endof
+      ascii x  of  push-hex (u.) type pop-base  endof
+      ( n c )  swap push-decimal (.) type pop-base
+   endcase
+   2r> type
+;
+[then]
+
 : .last-trap ( -- )
    (last-trap) ?dup if
+[ifdef] Ultra5_10
+      \ (An Ultra 10 shows the trap's name alone, on a line of its own.)
+      ??cr .trap-fmt cr
+[else]
       cmn-error[ " Last Trap: " cmn-append ]cmn-end
+[then]
    else
       drop
    then

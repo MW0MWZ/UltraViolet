@@ -4,6 +4,7 @@
 
 #include <algorithm>
 
+#include "core/endian.h"
 #include "core/text.h"
 
 namespace uv {
@@ -270,6 +271,26 @@ unsigned Mach64::register_window(u32 offset) const {
     return 0;
 }
 
+// The register blocks at the top of the upper (big-endian) half: the same
+// registers, their bytes swapped as MEM_CNTL swaps that half's frame buffer
+// (an Ultra 10's PROM diagnostics walk the scratch registers at 0xFFFC80 of
+// the 16 MiB aperture, register block 0 at 0xFFFC00, with 32-bit accesses).
+u64 Mach64::upper_regs_read(u32 offset, unsigned size) {
+    const u32 swap = (regs_[kMemCntl] >> 26) & 3, x = swap == 1 ? 1 : swap == 2 ? 3 : 0;
+    if (x == 0) return regs_read(offset, size);
+    if (size == 4 && x == 3) return byteswap(static_cast<u32>(regs_read(offset, 4)));
+    u64 v = 0;
+    for (unsigned i = 0; i < size; ++i) v |= regs_read((offset + i) ^ x, 1) << (8 * i);
+    return v;
+}
+
+void Mach64::upper_regs_write(u32 offset, unsigned size, u64 value) {
+    const u32 swap = (regs_[kMemCntl] >> 26) & 3, x = swap == 1 ? 1 : swap == 2 ? 3 : 0;
+    if (x == 0) return regs_write(offset, size, value);
+    if (size == 4 && x == 3) return regs_write(offset, 4, byteswap(static_cast<u32>(value)));
+    for (unsigned i = 0; i < size; ++i) regs_write((offset + i) ^ x, 1, (value >> (8 * i)) & 0xFF);
+}
+
 // The frame buffer through an aperture: each byte lane swapped within 16
 // or 32 bits as MEM_CNTL sets for that half. Memory past what is fitted
 // reads as zero and keeps nothing.
@@ -298,7 +319,7 @@ bool Mach64::bar_read(unsigned bar, u32 offset, unsigned size, u64& value) {
         case 0: {
             const bool upper = offset >= kHalf;
             const u32 in = offset % kHalf;
-            if (const unsigned w = upper ? 0 : register_window(in)) value = regs_read(w - 1, size);
+            if (const unsigned w = register_window(in)) value = upper ? upper_regs_read(w - 1, size) : regs_read(w - 1, size);
             else value = aperture_read(in, size, upper);
             return true;
         }
@@ -313,8 +334,10 @@ bool Mach64::bar_write(unsigned bar, u32 offset, unsigned size, u64 value) {
         case 0: {
             const bool upper = offset >= kHalf;
             const u32 in = offset % kHalf;
-            if (const unsigned w = upper ? 0 : register_window(in)) regs_write(w - 1, size, value);
-            else aperture_write(in, size, value, upper);
+            if (const unsigned w = register_window(in)) {
+                if (upper) upper_regs_write(w - 1, size, value);
+                else regs_write(w - 1, size, value);
+            } else aperture_write(in, size, value, upper);
             return true;
         }
         case 1: regs_write(0x400 + (offset & 0xFF), size, value); return true;

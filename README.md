@@ -42,7 +42,7 @@ installed from their own media.
   (Sabre) with its IOMMU and interrupt mapping, the Advanced PCI Bridge
   (Simba), the PCIO EBus with the flash PROM, the M48T59 NVRAM and clock,
   the SuperIO's keyboard and mouse UARTs, floppy controller and 3.5" floppy
-  drive, the
+  drive and parallel port (its ECP FIFO and DMA), the
   SAB82532 serial ports, the CMD646 IDE controller with ATA disks and an
   ATAPI CD-ROM drive (data and audio discs, which it plays to the codec as
   a real one does through its audio cable), the on-board Happy Meal

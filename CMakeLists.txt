@@ -60,6 +60,7 @@ add_library(uv_emu STATIC
   src/devices/m48t59.cpp
   src/devices/ebus_misc.cpp
   src/devices/ebus_dma.cpp
+  src/devices/ecpp.cpp
   src/devices/cs4231.cpp
   src/devices/fdc82077.cpp
   src/devices/hme.cpp

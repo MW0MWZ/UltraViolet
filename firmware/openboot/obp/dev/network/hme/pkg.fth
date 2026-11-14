@@ -24,8 +24,9 @@ headerless
 : unmap-resources ( -- )  reg-base if  unmap-buffers unmap-regs  then  ;
 
 : bringup-link ( -- up? )
-   net-on dup 0= if
-      " Link down: check the network cable" diagnostic-mode? if type cr else 2drop then
+   diagnostic-mode? if  ." Using Onboard Transceiver - "  then
+   net-on  diagnostic-mode? if
+      dup if  ." Link Up. "  else  ." Link Down."  then  cr
    then
 ;
 

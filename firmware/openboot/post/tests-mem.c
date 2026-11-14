@@ -69,7 +69,6 @@ static void probe_memory(void)
 {
 	int b, n = 0, n11 = 0;
 
-	post_suspect("Memory");
 	for (b = 0; b < 2; b++) {
 		struct bank *k = &banks[b];
 		u32 r = probe_result[b];
@@ -135,7 +134,6 @@ void post_area_addr(void)
 {
 	u64 out[2];
 
-	post_suspect("Memory");
 	mem_fill_addr(2 * MB, POST_AREA - 2 * MB, 0x14);
 	if (mem_check_addr(2 * MB, POST_AREA - 2 * MB, 0x14, out))
 		post_compare_at(out[0], out[1], out[1], "Memory address mismatch");
@@ -148,7 +146,6 @@ void post_load(void)
 {
 	u32 size = _image_end - _start, i, w, mark = size / 10, dots = 0;
 
-	post_suspect("Memory");
 	post_putc('\t');
 	for (i = 0; i < size; i += 4) {
 		w = *(u32 *)(_start + i);
@@ -179,7 +176,6 @@ void post_fpu_regs(void)
 	};
 	u32 p, i;
 
-	post_suspect("FPU");
 	for (p = 0; p < 4; p++) {
 		fbuf[0] = pat[p];
 		fregs(fbuf);
@@ -202,7 +198,6 @@ static void fop(u32 n, u64 expected, const char *msg)
 
 void post_fpu_move(void)
 {
-	post_suspect("FPU");
 	fops_run(0x3ff8000000000000ULL, 0x4002000000000000ULL);	/* 1.5, 2.25 */
 	fop(4, 0xbff8000000000000ULL, "FNEGd");
 	fop(5, 0x3ff8000000000000ULL, "FABSd");
@@ -217,7 +212,6 @@ void post_fsr(void)
 	static const u64 pat[4] = { 0x154a800aaaULL, 0x2a85000555ULL, FSR_MASK, 0 };
 	u32 p;
 
-	post_suspect("FPU");
 	for (p = 0; p < 4; p++) {
 		fbuf[0] = pat[p];
 		fsr_test(fbuf);
@@ -227,7 +221,6 @@ void post_fsr(void)
 
 void post_fpu_func(void)
 {
-	post_suspect("FPU");
 	fops_run(0x3ff8000000000000ULL, 0x4002000000000000ULL);	/* 1.5, 2.25 */
 	fop(0, 0x400e000000000000ULL, "FADDd");
 	fop(1, 0x400b000000000000ULL, "FMULd");
@@ -243,7 +236,6 @@ static void fdiv0_run(void) { fdiv0(fbuf); }
 
 void post_fpu_trap(void)
 {
-	post_suspect("FPU");
 	fbuf[0] = 0x1000000;
 	fbuf[1] = 0x3ff0000000000000ULL;
 	fbuf[2] = 0;
@@ -262,7 +254,6 @@ void post_upa(void)
 	u64 x;
 	u32 i;
 
-	post_suspect("UPA Data Bus");
 	for (i = 0; i < 64; i++) {
 		x = 1ULL << i;
 		st64(UPA_SCRATCH, x);
@@ -391,7 +382,6 @@ static void side_init(int b, int s)
 
 void post_init_memory(void)
 {
-	post_suspect("Memory");
 	pattern = 0;
 	mem_asi = 0x15;
 	dots = 1;
@@ -401,7 +391,6 @@ void post_init_memory(void)
 
 static void addr_test(u32 asi)
 {
-	post_suspect("Memory");
 	mem_asi = asi;
 	dots = 0;
 	pass_w = w_addr;
@@ -422,7 +411,6 @@ void post_mem_addr_ecc(void)
 
 void post_blk_addr(void)
 {
-	post_suspect("Memory");
 	dots = 0;
 	pass_w = w_blk_addr;
 	pass_r = r_blk_addr;
@@ -449,7 +437,6 @@ static void side_blk(int b, int s)
 
 static void blk_test(const u64 *patterns)
 {
-	post_suspect("Memory");
 	blk_patterns = patterns;
 	pass_w = w_blk;
 	pass_r = r_blk;
@@ -487,7 +474,6 @@ void post_ec_access(void)
 	const u64 pa = POST_AREA - 128, x = 0x123456789abcdef0ULL;
 	u64 tag;
 
-	post_suspect("Ecache");
 	asi_stx(pa, 0x14, x);
 	post_compare(asi_ldx(pa, 0x14), x, "Ecache data mismatch");
 	asi_ldx((2ULL << 39) | (pa & (ecache_size - 1)), 0x7e);

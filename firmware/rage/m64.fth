@@ -294,7 +294,7 @@ create edid /edid allot
 0 value edid-answered?		\ the monitor answered at I2C address 50
 : fetch-edid  ( -- )
    i2c-init
-   edid /edid erase  false to edid-answered?
+   edid /edid ff fill  false to edid-answered?
    3 0 do  edid-read if  true to edid-answered?  edid-ok? if  leave  then  then  loop
 ;
 \ The node's edid: the block, when one checks; and aty,flags as the card's
@@ -529,11 +529,12 @@ my-address my-space encode-phys  0 encode-int encode+  0 encode-int encode+
 ;
 
 \ The frame buffer, kept mapped from the first open as the node's
-\ "address".
+\ "address"; the monitor's EDID read again, and "edid" made (or its value
+\ replaced) if it checks, as the Ultra 10's does.
 : m64-install  ( -- )
    aperture -1 = if  map-chip  then
    aperture encode-int " address" property
-   fetch-edid  edid-property  flags-property
+   fetch-edid  edid-property
    select-mode  mode-properties
    set-mode  set-palette  display-on
    aperture to frame-buffer-adr
