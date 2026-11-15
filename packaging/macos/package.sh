@@ -18,8 +18,8 @@ top=UltraViolet-$v-macos-$(uname -m)
 s=stage/$top
 rm -rf stage && mkdir -p $s/licenses out
 cmake --install $b --prefix "$PWD/$s"  # (an absolute path, as fixup_bundle needs)
-app=$s/UltraViolet.app
-codesign --verify --deep --strict $app
+app="$s/Ultra Violet.app"
+codesign --verify --deep --strict "$app"
 cp README.md $s/
 cp LICENSE $s/LICENSE.txt
 cp third_party/imgui/LICENSE.txt $s/licenses/imgui.txt
@@ -30,7 +30,7 @@ cp firmware/rage/LICENSE $s/licenses/rage-fcode.txt
 cp firmware/creator3d/LICENSE $s/licenses/creator3d-fcode.txt
 # The Homebrew formulas the libraries come from, through their own imports.
 brew_libs() { otool -L "$1" | awk 'NR > 1 {print $1}' | grep "^$(brew --prefix)/" || true; }
-seen= todo=$(brew_libs $b/UltraViolet.app/Contents/MacOS/UltraViolet)
+seen= todo=$(brew_libs "$b/Ultra Violet.app/Contents/MacOS/UltraViolet")
 while [ -n "$todo" ]; do
   set -- $todo; l=$1; shift; todo="$*"
   case " $seen " in *" $l "*) continue;; esac
@@ -50,7 +50,7 @@ for f in $(for l in $seen; do realpath $l; done | sed -n "s|^$(brew --prefix)/Ce
 done
 ls $s/licenses
 # The newest macOS any of the app's code was built for.
-need=$(find $app/Contents -type f \( -perm -u+x -o -name '*.dylib' \) | while read -r f; do
+need=$(find "$app/Contents" -type f \( -perm -u+x -o -name '*.dylib' \) | while read -r f; do
   otool -l "$f" | awk '/LC_BUILD_VERSION/ {b = 1} b && /minos/ {print $2; exit}'
 done | sort -t. -k1,1n -k2,2n | tail -1)
 echo "needs macOS $need"

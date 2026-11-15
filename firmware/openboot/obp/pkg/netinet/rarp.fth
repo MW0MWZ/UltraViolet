@@ -77,6 +77,33 @@ headerless
 
 /timer  instance buffer:  rarp-timer
 
+[ifdef] Ultra5_10
+\ As an Ultra 10's: each request (its target IP address all ones) given
+\ 1 s for a reply and reported if none came; then a pause, replies still
+\ taken, of 2, 4, 8, 16 and 32 s, after 32 s back to 1 s.
+0 instance value rarp-pause
+
+: rarp-wait ( -- )
+   begin
+      if-poll
+      my-ip-addr inaddr-any? 0=  rarp-timer timer-expired?  or
+   until
+;
+
+: do-rarp ( -- )
+   d# 2000 to rarp-pause
+   begin  my-ip-addr inaddr-any?  while
+      rarp-timer d# 1000 set-timer
+      inaddr-broadcast if-hwaddr RARP_REQ RARP_TYPE send-arp/rarp-packet
+      rarp-wait
+      my-ip-addr inaddr-any?  if
+         ." Timeout waiting for ARP/RARP packet" cr
+         rarp-timer rarp-pause set-timer  rarp-wait
+         rarp-pause 2*  dup d# 32000 >  if  drop d# 1000  then  to rarp-pause
+      then
+   repeat
+;
+[else]
 : rarp-backoff ( -- )
    rarp-timer dup clear-timer 2* d# 32000 min set-timer
 ;
@@ -93,5 +120,6 @@ headerless
       rarp-backoff
    repeat
 ;
+[then]
 
 headers

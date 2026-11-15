@@ -145,9 +145,9 @@ includes the licences of the firmware and libraries in it.
   any distribution as new. Make it executable (`chmod +x`) and run it.
 - **Windows** (x64): a zip. Unpack it and run `ultraviolet.exe`.
 - **macOS** (15 or later, Apple silicon or Intel): a disk image. Open it and drag
-  `UltraViolet.app` to Applications. It is not notarized, so before opening it
+  `Ultra Violet.app` to Applications. It is not notarized, so before opening it
   the first time, clear the download mark:
-  `xattr -dr com.apple.quarantine /Applications/UltraViolet.app`.
+  `xattr -dr com.apple.quarantine "/Applications/Ultra Violet.app"`.
 
 ## Building
 
@@ -207,7 +207,7 @@ ctest --test-dir build      # unit tests
 
 Check the configure output: it says if SDL3 or libslirp was not found.
 
-On macOS the build makes `build/UltraViolet.app`, a normal application
+On macOS the build makes `build/Ultra Violet.app`, a normal application
 with the menus in the system menu bar (`build/ultraviolet` links to the
 program inside it, for running from the terminal). Once it is built, to
 make a copy that runs on its own, with the libraries it uses copied in and

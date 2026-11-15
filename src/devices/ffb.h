@@ -15,10 +15,17 @@
 //   0x3000000  the dumb frame buffer, 32 bits a pixel (X, B, G, R)
 //   0x4000000  the smart frame buffer, a byte a pixel of R, G, B or X
 //   0x5000000  the smart frame buffer, 32 bits a pixel
+//   0x6000000  the smart frame buffer, 64 bits a pixel (colour and buffer C)
+//   0x9000000  4:2:2 video into buffer A (0x9800000 line doubled)
+//   0xA000000  the dumb frame buffer, 32 bits a pixel, buffer B
+//   0xB000000  4:2:2 video into buffer B (0xB800000 line doubled)
+//   0xC000000  the Z planes, 16 bits a pixel (0xC800000: 8 bits)
+//   0xD000000  4:2:2 video through the pixel processor (0xD800000 doubled)
 // The frame buffer is 2048 pixels a line in every view. Pixels are 32 bits:
 // the X plane (window ID and overlay) in the top byte, then blue, green
-// and red. There are two colour buffers, A and B; the FBC's frame buffer
-// control picks which drawing writes and reads. The dumb views reach the
+// and red. There are two colour buffers, A and B, and buffer C: the Y
+// (stencil) planes in bits 31:28 and the depth in 27:0; the FBC's frame
+// buffer control picks which drawing writes and reads. The dumb views reach the
 // memory as it is; the smart ones (and drawing) go through the raster
 // operation, the plane masks and the plane groups enabled.
 //
@@ -81,6 +88,27 @@ public:
     // stereo or interlaced modes), with the timing the card gives it.
     static const std::vector<MonitorTiming>& resolutions();
 
+    // The raster engine: a pixel on its way through the pixel processor
+    // (what its sources give).
+    struct Fragment {
+        u32 colour = 0;               // blue, green, red (bits 23:0)
+        u32 x = 0;                    // the X source's 8 bits: the alpha the blend and the X clip use
+        u32 z = 0;                    // depth, 28 bits
+        u32 y = 0;                    // the Y (stencil) planes' 4 bits
+        u32 lanes = 0xFFFFFFFF;       // the bytes of the colour buffers' word written
+        u32 c_lanes = 0xFFFFFFFF;     // the bytes of buffer C's word written
+        bool x_from_colour = false;   // the X value follows the constant colour (background too)
+    };
+    // A vertex of the setup unit: x and y in 16.16, the rest 2.30 (z 1.0 = 2^30).
+    struct Vertex {
+        s32 x = 0, y = 0;
+        u32 z = 0, a = 0, r = 0, g = 0, b = 0;
+    };
+    // A vertex's values as a primitive interpolates them (2.30 units).
+    struct Attributes {
+        double z = 0, a = 0, r = 0, g = 0, b = 0;
+    };
+
 private:
     // The DAC (dac.cpp's part of ffb.cpp): indirect registers.
     u32 dac_read(u32 address);
@@ -98,11 +126,25 @@ private:
 
     // Drawing (ffb_engine.cpp): the pixel processor, applied to a pixel
     // the raster processor or a smart view writes; and the operations.
+
     void draw_pixel(unsigned x, unsigned y, u32 colour, bool background = false);
-    void smart_write(unsigned x, unsigned y, u32 value, u32 lanes);
-    void smart_view_write(unsigned x, unsigned y, u32 value, u32 lanes);  // through the smart 32-bit view
+    void draw_fragment(int x, int y, Fragment f, bool background = false);
+    void pixel_ops(unsigned x, unsigned y, const Fragment& f);
+    u32 depth_cue(u32 colour, u32 z) const;
+    Fragment vertex_fragment(const Attributes& at) const;
+    void smart_view_write(unsigned x, unsigned y, u32 value, u32 lanes, u32 c_value, u32 c_lanes, bool byte_view = false);
+    void smart64_write(unsigned x, unsigned y, u64 value, u64 lanes);
+    void video_write(unsigned view, u64 in, u32 word);  // a 4:2:2 view's word (two pixels)
     void start_drawop(u32 reg);  // the operation's last register (bw or bx) written
     void line(int x0, int y0, int x1, int y1, bool last);
+    // The vertex interface: a vertex register written; the primitives.
+    void vertex_register(u32 off, u32 v);
+    void vertex_dot(const Vertex& v);
+    void vertex_aadot(const Vertex& v);
+    void vertex_line(const Vertex& a, const Vertex& b, bool antialiased);
+    void triangle(const Vertex& v0, const Vertex& v1, const Vertex& v2);
+    u32 setup_state_read(unsigned word) const;
+    void setup_state_write(unsigned word, u32 v);
     void fast_fill(u32 reg);
     void polygon_vertex(u32 reg);  // a polygon's vertex written (its x register)
     void polygon();
@@ -151,7 +193,11 @@ private:
     // FBC registers: the raster processor's (0-0xFFF) and its own
     // (0x10000-0x11FFF), as words.
     std::vector<u32> regs_, kregs_;
-    u32 ucsr_ = 0;
+    // UCSR's pick fields: enable (19:18, 10 off, 11 on) and status (17:16,
+    // 10 no hit, 11 hit); a write of 00 to either leaves it.
+    static constexpr u32 kUcsrPickField = 0x000C0000, kUcsrPickOn = 0x000C0000, kUcsrPickOff = 0x00080000,
+                         kUcsrPickStatus = 0x00030000, kUcsrPickHit = 0x00030000, kUcsrPickNoHit = 0x00020000;
+    u32 ucsr_ = kUcsrPickOff | kUcsrPickNoHit;
     u32 interrupts_ = 0;  // the FBC's interrupt register
     bool transfer_pending_ = false;  // a window transfer waiting for the vertical blank
     Timer retrace_timer_;
@@ -159,6 +205,11 @@ private:
     u32 engine_warned_ = 0;
     u32 fast_fill_colour_ = 0;  // the colour block's colour
     std::vector<std::pair<int, int>> polygon_;  // the polygon's vertices so far (x, y)
+    // The setup unit: the values latched for the vertex being given, and
+    // the last three vertices (oldest first).
+    Vertex latch_{};
+    std::array<Vertex, 3> history_{};
+    unsigned history_size_ = 0;
 
     // DAC: configuration pointer and registers; the cursor's.
     u32 dac_ptr_ = 0, cur_ptr_ = 0;

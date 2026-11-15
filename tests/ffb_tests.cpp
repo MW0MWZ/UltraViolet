@@ -2,9 +2,13 @@
 // Copyright (C) 2026 Andy Taylor
 // The Creator3D: its PROM's byte lanes, the strapping, the DAC's indirect
 // registers, the FBC's identity and fields, drawing (rectangles, vertical
-// scroll, font rows), the frame buffer views, and the picture through the
-// window lookups.
+// scroll, font rows; triangles, lines and dots from vertices), picking, the
+// pixel tests (compares, X clip, depth bounds), depth cueing, buffer C, the
+// frame buffer views, the picture through the
+// window lookups in each window mode, the window transfer and the
+// vertical retrace interrupt.
 #include <cmath>
+#include <initializer_list>
 #include <utility>
 #include <vector>
 
@@ -40,8 +44,9 @@ struct Rig {
     u32 pixel(unsigned x, unsigned y) { return static_cast<u32>(rd(kDfb32 + (u64{y} * Ffb::kLine + x) * 4)); }
     // 1152 x 900 at 66 Hz, as the FCode sets it: the pixel clock, the timing
     // registers from VBNP up, the timing generator and video on, every window
-    // ID true colour from buffer A.
+    // ID true colour from buffer A, all six window ID bits addressing them.
     void mode_1152x900() {
+        dac(0x3153, 0x3F);
         dac(0x0000, 0x4000 | 1 << 11 | 5 << 7 | 0x46);
         wr(kDac, 0x6001);
         for (u32 v : {0x22u, 0x3A6u, 3u, 0x3A8u, 0x2BBu, 0xA7u, 0x2E7u, 0x3Fu, 0x2FBu, 0x2E3u, 0xA3u, 0u, 0u, 0u}) wr(kDac + 4, v);
@@ -496,3 +501,634 @@ TEST(ffb_auxiliary_clip_adds_to_or_takes_from_the_view_clip) {
     CHECK_EQ(r.pixel(10, 5), 0x00112233u);
 }
 
+
+namespace {
+
+// The picture's pixel at (x, 0) for each X value given to buffer A's
+// pixel there, its colour red 0x30, green 0x20, blue 0x10.
+std::vector<u32> shown(Rig& r, std::initializer_list<u32> xs) {
+    unsigned x = 0;
+    for (u32 v : xs) r.wr(kDfb32 + 4 * x++, v << 24 | 0x102030);
+    Display::Frame frame;
+    CHECK(r.f.render(frame));
+    return {frame.pixels.begin(), frame.pixels.begin() + x};
+}
+
+}  // namespace
+
+TEST(ffb_separate_4_splits_the_x_planes_into_overlay_and_window_id) {
+    Rig r;
+    r.mode_1152x900();
+    // Separate_4 with the overlay; two primary and two overlay window IDs;
+    // overlay 15 transparent.
+    r.dac(0x1001, 0x18);
+    r.dac(0x3153, 0x303);
+    r.dac(0x3151, 0x0F);
+    r.dac(0x3152, 0x0F);
+    r.dac(0x3240, 0x4000);         // primary 0: true colour from A
+    r.dac(0x3241, 0x1000 | 0x100); // primary 1: palette 0 from red
+    r.dac(0x3120, 0x400 | 0x100 | 0x10 | 2);  // overlay 0: transparent, palette 1 section 2
+    r.dac(0x3121, 0x800);                     // overlay 1: opaque, no lookup
+    r.dac(0x2000 + 0x30, 0x0000AA);
+    r.dac(0x2000 + 256 + 2 * 16 + 3, 0x00FF00);
+    const auto p = shown(r, {0x0F, 0x03, 0x1F, 0x45, 0x4F});
+    CHECK_EQ(p[0], 0x302010u);  // window 0, overlay transparent: true colour
+    CHECK_EQ(p[1], 0x00FF00u);  // overlay 3 from palette 1's section 2
+    CHECK_EQ(p[2], 0xAA0000u);  // window 1 (X[5:4]): palette 0 from red
+    CHECK_EQ(p[3], 0x050505u);  // overlay window 1 (X[7:6]) opaque: grey 5
+    CHECK_EQ(p[4], 0x0F0F0Fu);  // opaque whatever the key
+    // Without the overlay enable, the window ID alone.
+    r.dac(0x1001, 0x10);
+    const auto q = shown(r, {0x03, 0x13});
+    CHECK_EQ(q[0], 0x302010u);
+    CHECK_EQ(q[1], 0xAA0000u);
+    // The primary mask: none of the window ID's bits leaves entry 0.
+    r.dac(0x3153, 0x300);
+    CHECK_EQ(shown(r, {0x13})[0], 0x302010u);
+}
+
+TEST(ffb_combined_mode_shows_the_overlay_through_its_entry) {
+    Rig r;
+    r.mode_1152x900();
+    // Combined with the overlay, 32 window IDs at X 0xE0-0xFF, as a
+    // single-buffered card is set up.
+    r.dac(0x1001, 0x08);
+    r.dac(0x3153, 0x1F);
+    r.dac(0x3151, 0xE0);
+    r.dac(0x3152, 0xFF);
+    r.dac(0x3120, 0x500);  // overlay 0: transparent, palette 0
+    CHECK_EQ(r.dac(0x3120), 0x500u);
+    r.dac(0x3245, 0x1000 | 0x100 | 0x10);  // window ID 5: palette 1 from red
+    r.dac(0x2000 + 0x10, 0x112233);
+    r.dac(0x2000 + 256 + 0x30, 0x0000CC);
+    const auto p = shown(r, {0xFF, 0x10, 0xE5});
+    CHECK_EQ(p[0], 0x302010u);  // window ID 31: true colour
+    CHECK_EQ(p[1], 0x332211u);  // an overlay pixel through palette 0
+    CHECK_EQ(p[2], 0xCC0000u);  // window ID 5
+    // The overlay entry's type none, or the overlay disabled: window IDs only.
+    r.dac(0x3120, 0x100);
+    CHECK_EQ(shown(r, {0x10})[0], 0x302010u);
+    r.dac(0x3120, 0x900);  // opaque: even the key
+    r.dac(0x2000 + 0xFF, 0x445566);
+    CHECK_EQ(shown(r, {0xFF})[0], 0x665544u);
+    r.dac(0x1001, 0x00);
+    CHECK_EQ(shown(r, {0x10, 0xE5})[1], 0xCC0000u);
+}
+
+TEST(ffb_window_address_mask_zero_uses_entry_0) {
+    Rig r;
+    r.mode_1152x900();
+    r.dac(0x1001, 0x00);
+    r.dac(0x3153, 0x00);
+    r.dac(0x3261, 0x100);  // window ID 0x21: palette 0 from X
+    CHECK_EQ(shown(r, {0x21})[0], 0x302010u);
+    r.dac(0x3153, 0x3F);
+    CHECK_EQ(shown(r, {0x21})[0], 0u);
+}
+
+TEST(ffb_window_transfer_moves_both_tables_at_the_blank) {
+    Rig r;
+    r.mode_1152x900();
+    r.dac(0x1001, 0x08);
+    r.dac(0x3153, 0x1F);
+    r.dac(0x3151, 0xFF);
+    r.dac(0x3152, 0xFF);
+    // Shadow entries: not shown, nor read back from the active tables.
+    r.dac(0x3100, 0x900);  // overlay 0 opaque, palette 0
+    r.dac(0x3201, 0x100);  // window ID 1: palette 0 from X
+    CHECK_EQ(r.dac(0x3100), 0x900u);
+    CHECK_EQ(r.dac(0x3120), 0u);
+    CHECK_EQ(r.dac(0x3241), 0x4000u);
+    r.dac(0x2001, 0x0000EE);
+    CHECK_EQ(shown(r, {0x01})[0], 0x302010u);
+    // The transfer: busy till the blank; the command bit reads 0, the
+    // others as written.
+    r.dac(0x3150, 0x12);
+    CHECK_EQ(r.dac(0x3150), 0x11u);
+    r.next_event();
+    CHECK_EQ(r.dac(0x3150), 0x10u);
+    CHECK_EQ(r.dac(0x3120), 0x900u);
+    CHECK_EQ(r.dac(0x3241), 0x100u);
+    CHECK_EQ(shown(r, {0x01})[0], 0xEE0000u);  // the overlay, opaque
+    // With the timing generator off a transfer is made at once.
+    r.dac(0x6000, 0);
+    r.dac(0x3101, 0x400);
+    r.dac(0x3150, 2);
+    CHECK_EQ(r.dac(0x3150), 0u);
+    CHECK_EQ(r.dac(0x3121), 0x400u);
+    CHECK_EQ(r.sched.next_event(), Scheduler::kNever);
+}
+
+TEST(ffb_interlaced_window_transfer_at_the_next_frame_or_field) {
+    // NTSC, interlaced: fields 525 half-lines; the blank at VBAP (517).
+    Rig r;
+    r.dac(0x0000, 0x5DD0);
+    r.dac(0x1000, 2);
+    r.wr(kDac, 0x6001);
+    for (u32 v : {37u, 517u, 5u, 524u, 165u, 59u, 184u, 28u, 194u, 180u, 55u, 13u, 11u, 518u}) r.wr(kDac + 4, v);
+    r.dac(0x6000, 0x63);
+    // In the frame's first field: TE waits for the second's blank.
+    r.dac(0x3150, 6);
+    r.next_event();
+    CHECK_EQ(r.dac(0x3150) & 1, 1u);
+    r.next_event();
+    CHECK_EQ(r.dac(0x3150), 4u);
+    // Without TE, the next field's.
+    r.now += 1000;
+    r.dac(0x3150, 2);
+    r.next_event();
+    CHECK_EQ(r.dac(0x3150), 0u);
+}
+
+TEST(ffb_retrace_interrupt_follows_the_timing_generator) {
+    Rig r;
+    unsigned pulses = 0;
+    r.f.set_interrupt_sink([&] { ++pulses; });
+    r.mode_1152x900();
+    // Pending is set only by the card; the enables as written.
+    r.fbc(0x10900, 0xE);
+    CHECK_EQ(r.rd(kFbc + 0x10900), 0xAu);
+    // The timing generator off: no blank, no interrupt.
+    r.dac(0x6000, 1);
+    CHECK_EQ(r.sched.next_event(), Scheduler::kNever);
+    // On again: the next blank raises it, once.
+    r.dac(0x6000, 3);
+    r.next_event();
+    CHECK_EQ(pulses, 1u);
+    CHECK_EQ(r.rd(kFbc + 0x10900), 0xEu);
+    // Acknowledged with 5: pending cleared, the retrace's enable too.
+    r.fbc(0x10900, 5);
+    CHECK_EQ(r.rd(kFbc + 0x10900), 0u);
+    CHECK_EQ(r.sched.next_event(), Scheduler::kNever);
+}
+
+// --- The raster engine: picking, the vertex interface, the pixel tests ---
+
+namespace {
+
+constexpr u32 kZOne = 0x40000000;  // 1.0 for a vertex's colour, alpha and z
+
+// A pixel coordinate as the vertex registers take it (16.16).
+u32 fixed(double v) { return static_cast<u32>(static_cast<s32>(std::lround(v * 65536))); }
+
+// A vertex by its x register (0x24 strip, 0x34 restart, 0x44 fan), y in the
+// register before it.
+void vertex(Rig& r, u32 xreg, double x, double y) {
+    r.fbc(xreg - 4, fixed(y));
+    r.fbc(xreg, fixed(x));
+}
+
+// Buffer A written, every colour group and X on, raster operation new;
+// colour, X and Y constant, Z from the vertices, no clip, pattern, blend
+// or depth cue.
+void plain_3d(Rig& r) {
+    r.fbc(0x254, 0x200875AA);
+    r.fbc(0x258, 0x00838383);
+    r.fbc(0x290, 0xFFFFFF);
+    r.fbc(0x294, 0xFF);
+    r.fbc(0x200, 0x869ABF);
+}
+
+// Buffer C's word at (x, y), through the smart 32-bit view with C read.
+u32 c_word(Rig& r, unsigned x, unsigned y) {
+    r.fbc(0x254, 0xC000);
+    const u32 v = static_cast<u32>(r.rd(kSfb32 + (u64{y} * Ffb::kLine + x) * 4));
+    r.fbc(0x254, 0x4000);
+    return v;
+}
+
+void dot(Rig& r, int x, int y) { r.fbc(0x300, 0x00), r.fbc(0x70, static_cast<u32>(y)), r.fbc(0x74, static_cast<u32>(x)); }
+
+}  // namespace
+
+TEST(ffb_pick_hits_when_a_pixel_passes_with_picking_enabled) {
+    Rig r;
+    plain_3d(r);
+    r.fbc(0x208, 0x00112233);
+    auto pick = [&] { return static_cast<u32>(r.rd(kFbc + 0x900) >> 16) & 0xF; };
+    CHECK_EQ(pick(), 0xAu);  // disabled, no hit
+    dot(r, 1, 1);
+    CHECK_EQ(pick(), 0xAu);  // disabled: drawing leaves the status
+    r.fbc(0x900, 0xC0000);
+    CHECK_EQ(pick(), 0xEu);
+    // A pixel the depth test turns away is no hit.
+    r.fbc(0x25C, 0x00840000);  // buffer C magnitude: never
+    dot(r, 2, 1);
+    CHECK_EQ(pick(), 0xEu);
+    CHECK_EQ(r.pixel(2, 1), 0u);
+    // One that passes is, whether or not it is written (colour groups off).
+    r.fbc(0x25C, 0x00800000);
+    r.fbc(0x254, 0x00000055);
+    dot(r, 3, 1);
+    CHECK_EQ(pick(), 0xFu);
+    CHECK_EQ(r.pixel(3, 1), 0u);
+    CHECK_EQ(r.rd(kFbc + 0x900) & 0x03000000, 0u);  // never busy
+    // Sticky until written: 10 no hit; 00 leaves both fields.
+    r.fbc(0x900, 0);
+    CHECK_EQ(pick(), 0xFu);
+    r.fbc(0x900, 0x20000);
+    CHECK_EQ(pick(), 0xEu);
+    // 11 sets hit (a saved status restored); disabling keeps the status.
+    r.fbc(0x900, 0x30000);
+    r.fbc(0x900, 0x80000);
+    CHECK_EQ(pick(), 0xBu);
+    r.fbc(0x900, 0xA0000);
+    dot(r, 4, 1);
+    CHECK_EQ(pick(), 0xAu);
+}
+
+TEST(ffb_triangle_covers_the_samples_inside_by_the_top_left_rule) {
+    for (const bool reversed : {false, true}) {
+        Rig r;
+        plain_3d(r);
+        r.fbc(0x208, 0x00445566);
+        r.fbc(0x300, 0x06);
+        vertex(r, 0x34, 10, 10);
+        vertex(r, 0x24, reversed ? 10 : 20, reversed ? 20 : 10);
+        CHECK_EQ(r.pixel(10, 10), 0u);  // nothing before the third
+        vertex(r, 0x24, reversed ? 20 : 10, reversed ? 10 : 20);
+        CHECK_EQ(r.pixel(10, 10), 0x00445566u);
+        CHECK_EQ(r.pixel(19, 10), 0x00445566u);
+        CHECK_EQ(r.pixel(20, 10), 0u);  // right
+        CHECK_EQ(r.pixel(14, 15), 0x00445566u);
+        CHECK_EQ(r.pixel(15, 15), 0u);  // on the right edge
+        CHECK_EQ(r.pixel(10, 19), 0x00445566u);
+        CHECK_EQ(r.pixel(10, 20), 0u);  // bottom
+        CHECK_EQ(r.pixel(9, 12), 0u);
+    }
+    // Two triangles sharing an edge (a strip making a square), drawn with
+    // xor: each pixel drawn once.
+    Rig r;
+    plain_3d(r);
+    r.fbc(0x258, 0x00868686);
+    r.fbc(0x208, 0x000000FF);
+    r.fbc(0x300, 0x06);
+    vertex(r, 0x34, 30, 0), vertex(r, 0x24, 40, 0), vertex(r, 0x24, 30, 10), vertex(r, 0x24, 40, 10);
+    unsigned drawn = 0;
+    for (unsigned y = 0; y < 12; ++y)
+        for (unsigned x = 28; x < 42; ++x) drawn += r.pixel(x, y) == 0xFFu;
+    CHECK_EQ(drawn, 100u);
+    CHECK_EQ(r.pixel(35, 5), 0xFFu);
+    // A triangle of no area draws nothing.
+    vertex(r, 0x34, 50, 0), vertex(r, 0x24, 60, 0), vertex(r, 0x24, 70, 0);
+    CHECK_EQ(r.pixel(55, 0), 0u);
+}
+
+TEST(ffb_triangle_strips_and_fans) {
+    // The square (0,0) (10,0) (10,10) (0,10): as a fan the second triangle
+    // is (v0, v2, v3), as a strip (v1, v2, v3).
+    for (const bool fan : {true, false}) {
+        Rig r;
+        plain_3d(r);
+        r.fbc(0x208, 0x00000011);
+        r.fbc(0x300, 0x06);
+        const u32 next = fan ? 0x44 : 0x24;
+        vertex(r, 0x34, 0, 0), vertex(r, next, 10, 0), vertex(r, next, 10, 10);
+        CHECK_EQ(r.pixel(8, 2), 0x11u);
+        // The colour (flat: the foreground) as it is when the vertex completes.
+        r.fbc(0x208, 0x00000022);
+        vertex(r, next, 0, 10);
+        CHECK_EQ(r.pixel(1, 8), fan ? 0x22u : 0u);
+        CHECK_EQ(r.pixel(8, 2), fan ? 0x11u : 0x22u);
+        CHECK_EQ(r.pixel(8, 9), fan ? 0x22u : 0x22u);
+        // A restart draws nothing and starts again.
+        r.fbc(0x208, 0x00000033);
+        vertex(r, 0x34, 100, 100), vertex(r, next, 110, 100);
+        CHECK_EQ(r.pixel(101, 100), 0u);
+        vertex(r, next, 100, 110);
+        CHECK_EQ(r.pixel(101, 101), 0x33u);
+    }
+}
+
+TEST(ffb_triangle_interpolates_colour_and_depth) {
+    Rig r;
+    plain_3d(r);
+    r.fbc(0x200, 0x0000AA);  // colour and Z from the vertices
+    r.fbc(0x254, 0xA0000800);  // A and C written, Z on
+    r.fbc(0x29C, 0x0FFFFFFF);
+    r.fbc(0x300, 0x06);
+    r.fbc(0x10, kZOne), r.fbc(0x14, 0), r.fbc(0x18, 0), r.fbc(0x1C, kZOne / 2);
+    vertex(r, 0x34, 10, 10);
+    r.fbc(0x10, 0), r.fbc(0x1C, 0);
+    vertex(r, 0x24, 20, 10);
+    vertex(r, 0x24, 10, 20);
+    CHECK_EQ(r.pixel(10, 10), 0x000000FFu);  // red 1.0: 255
+    CHECK_EQ(r.pixel(15, 10), 0x00000080u);  // half way
+    CHECK_EQ(c_word(r, 10, 10), 0x08000000u);  // z 0.5: bits 29:2
+    CHECK_EQ(c_word(r, 15, 10), 0x04000000u);
+}
+
+TEST(ffb_ddline_draws_from_the_first_pixel_to_before_the_last) {
+    Rig r;
+    plain_3d(r);
+    r.fbc(0x208, 0x000000FF);
+    r.fbc(0x300, 0x04);
+    vertex(r, 0x34, 10, 10);
+    CHECK_EQ(r.pixel(10, 10), 0u);  // a restart draws nothing
+    vertex(r, 0x24, 20, 10);
+    CHECK_EQ(r.pixel(10, 10), 0xFFu);
+    CHECK_EQ(r.pixel(19, 10), 0xFFu);
+    CHECK_EQ(r.pixel(20, 10), 0u);
+    // A strip on from there, steep: y-major, the joint drawn once (xor).
+    r.fbc(0x258, 0x00868686);
+    vertex(r, 0x24, 22, 20);
+    CHECK_EQ(r.pixel(20, 10), 0xFFu);
+    CHECK_EQ(r.pixel(21, 15), 0xFFu);  // x 21.0 at y 15
+    CHECK_EQ(r.pixel(22, 19), 0xFFu);
+    CHECK_EQ(r.pixel(22, 20), 0u);
+}
+
+TEST(ffb_ddline_pattern_runs_on_from_line_to_line) {
+    Rig r;
+    plain_3d(r);
+    r.fbc(0x208, 0x000000FF);
+    r.fbc(0x300, 0x04);
+    r.fbc(0x30C, 0x00040003);  // pattern 0011, length 4
+    vertex(r, 0x34, 0, 50), vertex(r, 0x24, 3, 50);
+    CHECK_EQ(r.pixel(0, 50), 0xFFu);
+    CHECK_EQ(r.pixel(1, 50), 0xFFu);
+    CHECK_EQ(r.pixel(2, 50), 0u);
+    CHECK_EQ((r.rd(kFbc + 0x30C) >> 24) & 0xF, 3u);
+    vertex(r, 0x24, 6, 50);
+    CHECK_EQ(r.pixel(3, 50), 0u);
+    CHECK_EQ(r.pixel(4, 50), 0xFFu);
+    CHECK_EQ(r.pixel(5, 50), 0xFFu);
+    // Only writing lpat starts it again.
+    r.fbc(0x30C, 0x00040003);
+    vertex(r, 0x34, 0, 60), vertex(r, 0x24, 2, 60);
+    CHECK_EQ(r.pixel(1, 60), 0xFFu);
+}
+
+TEST(ffb_antialiased_lines_and_dots_weight_the_alpha) {
+    Rig r;
+    plain_3d(r);
+    r.fbc(0x200, 0x8B);  // X from the vertex alpha
+    r.fbc(0x208, 0x00FFFFFF);
+    r.fbc(0x0C, kZOne);  // alpha 1.0
+    r.fbc(0x300, 0x05);
+    vertex(r, 0x34, 0, 10.25), vertex(r, 0x24, 4, 10.25);
+    CHECK_EQ(r.pixel(1, 10) >> 24, 191u);  // 0.75 of 255
+    CHECK_EQ(r.pixel(1, 11) >> 24, 64u);   // 0.25
+    CHECK_EQ(r.pixel(1, 12), 0u);
+    CHECK_EQ(r.pixel(4, 10), 0u);
+    r.fbc(0x300, 0x01);
+    vertex(r, 0x24, 5.5, 20);
+    CHECK_EQ(r.pixel(5, 20) >> 24, 128u);
+    CHECK_EQ(r.pixel(6, 20) >> 24, 128u);
+    CHECK_EQ(r.pixel(5, 21), 0u);
+    // DOT from a vertex: the pixel holding it.
+    r.fbc(0x300, 0x00);
+    vertex(r, 0x24, 3.75, 30.5);
+    CHECK_EQ(r.pixel(3, 30), 0xFFFFFFFFu);
+}
+
+TEST(ffb_compares_test_buffer_c_and_the_colour_buffers) {
+    Rig r;
+    plain_3d(r);
+    r.fbc(0x254, 0xA0000800);  // A and C, Z on
+    r.fbc(0x29C, 0x0FFFFFFF);
+    r.fbc(0x200, 0xC0);        // Z constant
+    r.fbc(0x26C, 0x0FFFFFFF);
+    auto at = [&](u32 z, u32 c) { r.fbc(0x214, z), r.fbc(0x208, c), dot(r, 5, 5); };
+    r.fbc(0x25C, 0x00800000);  // always
+    at(0x8000000, 0x11);
+    r.fbc(0x25C, 0x00870000);  // the depth test: less
+    at(0xC000000, 0x22);
+    CHECK_EQ(r.pixel(5, 5), 0x11u);
+    CHECK_EQ(c_word(r, 5, 5), 0x08000000u);
+    at(0x4000000, 0x33);
+    CHECK_EQ(r.pixel(5, 5), 0x33u);
+    CHECK_EQ(c_word(r, 5, 5), 0x04000000u);
+    // The match test on the stencil planes: equal to the constant Y.
+    r.fbc(0x25C, 0x82800000);
+    r.fbc(0x264, 0xF0000000);
+    r.fbc(0x210, 3);
+    r.fbc(0x200, 0x30);
+    at(0x1000, 0x44);
+    CHECK_EQ(r.pixel(5, 5), 0x33u);  // stencil 0, not 3
+    r.fbc(0x210, 0);
+    at(0x1000, 0x55);
+    CHECK_EQ(r.pixel(5, 5), 0x55u);
+    // The AB match test on the X planes against the current window ID.
+    r.fbc(0x25C, 0x80808200);
+    r.fbc(0x260, 0xFF000000);
+    r.fbc(0x254, 0x20000000);
+    r.wr(kDfb32 + (u64{5} * Ffb::kLine + 7) * 4, 0x05000000);
+    r.fbc(0x200, 0x4);  // X from the window ID
+    r.fbc(0x204, 6);
+    r.fbc(0x208, 0x77);
+    dot(r, 7, 5);
+    CHECK_EQ(r.pixel(7, 5), 0x05000000u);
+    r.fbc(0x204, 5);
+    dot(r, 7, 5);
+    CHECK_EQ(r.pixel(7, 5), 0x05000077u);
+    // Bit 6 passes it for buffer A whatever.
+    r.fbc(0x25C, 0xC300);  // A always, not equal
+    r.fbc(0x208, 0x88);
+    dot(r, 7, 5);
+    CHECK_EQ(r.pixel(7, 5), 0x05000088u);
+    // The AB magnitude test on red: greater.
+    r.fbc(0x25C, 0x8081);
+    r.fbc(0x268, 0xFF);
+    r.fbc(0x208, 0x80);
+    dot(r, 7, 5);
+    CHECK_EQ(r.pixel(7, 5), 0x05000088u);
+    r.fbc(0x208, 0x90);
+    dot(r, 7, 5);
+    CHECK_EQ(r.pixel(7, 5), 0x05000090u);
+}
+
+TEST(ffb_x_clip_tests_the_x_source_value) {
+    Rig r;
+    plain_3d(r);
+    r.fbc(0x218, 0x70080);  // less than 0x80
+    r.fbc(0x208, 0x40000011);
+    dot(r, 1, 1);
+    r.fbc(0x208, 0xC0000022);
+    dot(r, 2, 1);
+    CHECK_EQ(r.pixel(1, 1), 0x40000011u);
+    CHECK_EQ(r.pixel(2, 1), 0u);
+    r.fbc(0x218, 0x40000);  // never
+    dot(r, 1, 1);
+    r.fbc(0x218, 0x10080);  // greater
+    dot(r, 2, 1);
+    CHECK_EQ(r.pixel(1, 1), 0x40000011u);
+    CHECK_EQ(r.pixel(2, 1), 0xC0000022u);
+}
+
+TEST(ffb_view_clip_3d_bounds_the_depth) {
+    Rig r;
+    plain_3d(r);
+    r.fbc(0x220, 0), r.fbc(0x224, 100 << 16 | 100);
+    r.fbc(0x228, 0x100), r.fbc(0x22C, 0x200);
+    r.fbc(0x200, 0x30C0);  // view clip 3D, Z constant
+    r.fbc(0x208, 0x11);
+    for (u32 z : {0xFFu, 0x100u, 0x200u, 0x201u}) {
+        r.fbc(0x214, z);
+        dot(r, static_cast<int>(z & 0xF), 1);
+    }
+    CHECK_EQ(r.pixel(0xF, 1), 0u);
+    CHECK_EQ(r.pixel(0, 1), 0x11u);   // 0x100 and 0x200: inside, inclusive
+    CHECK_EQ(r.pixel(1, 1), 0u);      // 0x201
+    // In 2D the depth is not bounded.
+    r.fbc(0x200, 0x2000);
+    r.fbc(0x214, 0x201);
+    dot(r, 1, 1);
+    CHECK_EQ(r.pixel(1, 1), 0x11u);
+}
+
+TEST(ffb_depth_cue_fades_toward_the_blend_colours) {
+    Rig r;
+    plain_3d(r);
+    r.fbc(0x200, 0x300C0);  // depth cue on, Z constant
+    // Front 0 at scale 1.0, back 0x0FFFFFFF at 0: slope 1.0 (M 256, E 0);
+    // toward 100 in each channel (BLENDC1 -100, BLENDC2 +100).
+    r.fbc(0x238, 0), r.fbc(0x23C, 0x0FFFFFFF);
+    r.fbc(0x230, 256), r.fbc(0x234, 0);
+    r.fbc(0x21C, 256u << 22);
+    const u32 neg = 0x200 - 100;
+    r.fbc(0x248, neg | neg << 9 | neg << 18);
+    r.fbc(0x24C, 100 | 100 << 9 | 100 << 18);
+    r.fbc(0x208, 0x00C800C8);
+    auto at = [&](u32 z, int x) { r.fbc(0x214, z), dot(r, x, 0); };
+    at(0, 0), at(0x8000000, 1), at(0x0FFFFFFF, 2);
+    CHECK_EQ(r.pixel(0, 0), 0x00C800C8u);  // at the front: as it is
+    CHECK_EQ(r.pixel(1, 0), 0x00963296u);  // half: (c + 100) / 2
+    CHECK_EQ(r.pixel(2, 0), 0x00646464u);  // at the back: the colour
+    // A further breakpoint (FFB2+): from 0x8000000 at scale 64, flat.
+    r.fbc(0x370, 0x8000000), r.fbc(0x360, 64), r.fbc(0x350, 0);
+    at(0xC000000, 3);
+    CHECK_EQ(r.pixel(3, 0) & 0xFF, 125u);  // (200 - 100) * 64 / 256 + 100
+    // Off, the blend colours do nothing.
+    r.fbc(0x200, 0x20000);
+    at(0xC000000, 4);
+    CHECK_EQ(r.pixel(4, 0), 0x00C800C8u);
+}
+
+TEST(ffb_buffer_c_written_through_its_own_enables) {
+    Rig r;
+    plain_3d(r);
+    r.fbc(0x200, 0xF0);         // Y and Z constant
+    r.fbc(0x214, 0x01234567);
+    r.fbc(0x210, 5);
+    r.fbc(0x29C, 0x0FFFFFFF);
+    r.fbc(0x298, 0xF);
+    r.fbc(0x208, 0x00ABCDEF);
+    r.fbc(0x254, 0x80000600);   // C alone; Z off, Y on (the colour groups still on)
+    dot(r, 1, 1);
+    CHECK_EQ(c_word(r, 1, 1), 0x50000000u);
+    CHECK_EQ(r.pixel(1, 1), 0u);
+    r.fbc(0x254, 0x00000900);   // Z on, Y off
+    dot(r, 2, 1);
+    CHECK_EQ(c_word(r, 2, 1), 0x01234567u);
+    // On through ZPMASK.
+    r.fbc(0x254, 0x00000C00);
+    r.fbc(0x29C, 0x0000FFFF);
+    r.fbc(0x214, 0x0FFFFFFF);
+    dot(r, 2, 1);
+    CHECK_EQ(c_word(r, 2, 1), 0x0123FFFFu);
+    // The colour and X groups off do not stop it; the raster operation's
+    // Y/Z field applies (xor).
+    r.fbc(0x254, 0x00000855);
+    r.fbc(0x258, 0x00860000);
+    r.fbc(0x214, 0x0000000F);
+    dot(r, 2, 1);
+    CHECK_EQ(c_word(r, 2, 1), 0x0123FFF0u);
+    // Written through the smart 32-bit view: the value's Z (Z source VAR).
+    r.fbc(0x258, 0x00830000);
+    r.fbc(0x200, 0x80);
+    r.wr(kSfb32 + (u64{1} * Ffb::kLine + 3) * 4, 0xF7654321);
+    CHECK_EQ(c_word(r, 3, 1), 0x07654321u);
+}
+
+TEST(ffb_rop_fields_change_only_with_their_edit_bit) {
+    Rig r;
+    // Reset: new in every group.
+    CHECK_EQ(r.rd(kFbc + 0x258), 0x00838383u);
+    r.fbc(0x254, 0x200875AA);
+    r.fbc(0x290, 0xFFFFFF);
+    r.fbc(0x294, 0xFF);
+    r.fbc(0x200, 0x869BAF);
+    r.fbc(0x208, 0x12345678);
+    dot(r, 0, 0);
+    CHECK_EQ(r.pixel(0, 0), 0x12345678u);
+    // A field written with its edit bit clear is left; with it set, taken
+    // (0x80: clear).
+    r.fbc(0x258, 0x00000086);
+    CHECK_EQ(r.rd(kFbc + 0x258), 0x00838386u);
+    r.fbc(0x258, 0x00008000);
+    CHECK_EQ(r.rd(kFbc + 0x258), 0x00838086u);
+    r.fbc(0x208, 0xFF0000FF);
+    dot(r, 0, 0);
+    CHECK_EQ(r.pixel(0, 0), 0x00345687u);
+}
+
+TEST(ffb_setup_state_saved_and_restored) {
+    Rig r;
+    plain_3d(r);
+    r.fbc(0x208, 0x00000044);
+    r.fbc(0x300, 0x06);
+    vertex(r, 0x34, 0, 0), vertex(r, 0x24, 10, 0);
+    std::vector<u32> saved;
+    for (u32 a = 0x100; a < 0x180; a += 4) saved.push_back(static_cast<u32>(r.rd(kFbc + a)));
+    vertex(r, 0x34, 500, 500);
+    for (u32 i = 0; i < saved.size(); ++i) r.fbc(0x100 + 4 * i, saved[i]);
+    vertex(r, 0x24, 0, 10);
+    CHECK_EQ(r.pixel(2, 2), 0x44u);
+}
+
+TEST(ffb_sfb64_writes_colour_and_buffer_c_as_one_pixel) {
+    Rig r;
+    plain_3d(r);
+    r.fbc(0x200, 0x8A);  // colour and Z from the value
+    r.fbc(0x254, 0xA0000800);
+    r.fbc(0x29C, 0x0FFFFFFF);
+    const u64 kSfb64 = 0x6000000;
+    r.wr(kSfb64 + (u64{2} * Ffb::kLine + 4) * 8, 0x00AABBCC00000123ull, 8);
+    CHECK_EQ(r.pixel(4, 2), 0x00AABBCCu);
+    CHECK_EQ(c_word(r, 4, 2), 0x123u);
+    CHECK_EQ(r.rd(kSfb64 + (u64{2} * Ffb::kLine + 4) * 8, 8), 0x00AABBCC00000123ull);
+    // Compared on the Z it carries: the depth test (less) turns this away.
+    r.fbc(0x25C, 0x00870000);
+    r.fbc(0x26C, 0x0FFFFFFF);
+    r.wr(kSfb64 + (u64{2} * Ffb::kLine + 4) * 8, 0x0011111100000200ull, 8);
+    CHECK_EQ(r.pixel(4, 2), 0x00AABBCCu);
+}
+
+TEST(ffb_video_views_convert_4_2_2) {
+    Rig r;
+    plain_3d(r);
+    // Y0 235 (white), Cb 128, Y1 16 (black), Cr 128 at pixels 0 and 1 of line 1.
+    r.wr(kDfb32 + (u64{1} * Ffb::kLine) * 4, 0x7F000000);
+    r.wr(0x9000000 + 1 * 4096, 0xEB801080);
+    CHECK_EQ(r.pixel(0, 1), 0x7FFFFFFFu);  // the X planes kept
+    CHECK_EQ(r.pixel(1, 1), 0u);
+    CHECK_EQ(r.rd(0x9000000 + 1 * 4096), 0u);
+    // Line doubled: line 1 to lines 2 and 3 of buffer B.
+    r.wr(0xB800000 + 1 * 4096 + 4, 0xEB80EB80);
+    CHECK_EQ(r.rd(kDfb24B + (u64{2} * Ffb::kLine + 2) * 4) & 0xFFFFFF, 0xFFFFFFu);
+    CHECK_EQ(r.rd(kDfb24B + (u64{3} * Ffb::kLine + 3) * 4) & 0xFFFFFF, 0xFFFFFFu);
+    // Through the pixel processor (colour from the value): xor, twice.
+    r.fbc(0x200, 0x2);
+    r.fbc(0x258, 0x00838386);
+    r.wr(0xD000000 + 6 * 4096, 0xEB80EB80);
+    CHECK_EQ(r.pixel(1, 6), 0xFFFFFFu);
+    r.wr(0xD000000 + 6 * 4096, 0xEB80EB80);
+    CHECK_EQ(r.pixel(1, 6), 0u);
+}
+
+TEST(ffb_z_views_reach_the_top_of_the_depth) {
+    Rig r;
+    plain_3d(r);
+    r.fbc(0x200, 0xF0);
+    r.fbc(0x210, 0xA), r.fbc(0x214, 0x0FFFFFFF);
+    r.fbc(0x254, 0x80000A00);
+    r.fbc(0x298, 0xF), r.fbc(0x29C, 0x0FFFFFFF);
+    dot(r, 3, 0);
+    r.wr(0xC000000 + 3 * 2, 0xABCD, 2);
+    CHECK_EQ(c_word(r, 3, 0), 0xAABCD000u);  // Y kept, the bits below cleared
+    CHECK_EQ(r.rd(0xC000000 + 3 * 2, 2), 0xABCDu);
+    r.wr(0xC800000 + 3, 0x12, 1);
+    CHECK_EQ(c_word(r, 3, 0), 0xA1200000u);
+    CHECK_EQ(r.rd(0xC800000 + 3, 1), 0x12u);
+}

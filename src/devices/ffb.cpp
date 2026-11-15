@@ -33,8 +33,11 @@ constexpr u32 kFbcDevId = 0x3241906D;  // FBC_reg_ID, as a real card reads
 // count when its FIFO is empty is not known; the X driver's smallest
 // known FIFO is 124 entries, and it keeps 4 back.)
 constexpr u32 kUcsrFifoEmpty = 0x80;  // as the card reads when idle
-constexpr u32 kUcsrPickEnable = 0x000C0000, kUcsrPickNoHit = 0x00020000;
 constexpr u32 kUcsrErrors = 0xC0000000;
+// The raster operation register after reset: "new" in each plane group's
+// field (colour, X, Y and Z), so a group whose field software never writes
+// takes the pixel as given.
+constexpr u32 kRopReset = 0x00838383;
 // The FBC's interrupt register (+0x10900), as Solaris's driver uses it:
 // bit 3 enables the vertical retrace interrupt and bit 2 says it came;
 // the driver acknowledges with 5, clearing both, and enables it again
@@ -55,11 +58,22 @@ constexpr u32 kDacManRev = 1;             // UCTRL bits 8-11 (RamDAC_rev 1, as a
 constexpr u32 kTgenVideo = 1, kTgenTiming = 2, kTgenInterlaced = 0x40;
 // Window transfer control (the X driver's names): DS busy, TCMD transfer,
 // TE at the next frame (else field).
-constexpr u32 kWtctrlBusy = 1, kWtctrlTransfer = 2;
+constexpr u32 kWtctrlBusy = 1, kWtctrlTransfer = 2, kWtctrlFrame = 4;
+// User control: the window mode (bits 5:4: 0 Combined, 1 Separate_4, 2
+// Separate_8, 3 reserved, shown as Combined) and the overlay enable.
+constexpr u32 kUctrlMode = 0x30, kUctrlSeparate4 = 0x10, kUctrlSeparate8 = 0x20,
+              kUctrlOverlay = 8;
+// Separate_4: buffer A's X byte holds a 4-bit overlay and a 4-bit window
+// ID. True: the overlay is the low nibble and the window ID the high one;
+// false: the other way round.
+constexpr bool kSeparate4OverlayLowNibble = true;
 constexpr double kDacRefHz = 13.5e6;  // the PLLs' reference: the FCode's PLL settings give its mode clocks from it
 
 // Window lookup entries (PAC2).
 constexpr u32 kWlutTable = 0x30, kWlutLookup = 0x100, kWlutSource = 0x3000, kWlutTrue = 0x4000, kWlutBufferB = 0x8000;
+// Overlay window lookup entries: the palette section (Separate_4) and the
+// overlay type (0 none, 1 transparent, 2 opaque, 3 reserved: shown as none).
+constexpr u32 kOwlutSection = 0xF, kOwlutType = 0xC00, kOwlutTransparent = 0x400, kOwlutOpaque = 0x800;
 
 }  // namespace
 
@@ -75,7 +89,11 @@ Ffb::Ffb(Scheduler& scheduler, double cpu_hz, std::vector<u8> fcode)
 void Ffb::reset() {
     std::fill(regs_.begin(), regs_.end(), 0);
     std::fill(kregs_.begin(), kregs_.end(), 0);
-    ucsr_ = 0;
+    regs_[0x258 / 4] = kRopReset;
+    ucsr_ = kUcsrPickOff | kUcsrPickNoHit;
+    latch_ = {};
+    history_ = {};
+    history_size_ = 0;
     interrupts_ = 0;
     transfer_pending_ = false;
     retrace_timer_.cancel();
@@ -212,18 +230,23 @@ void Ffb::dac_write(u32 a, u32 v) {
     } else if (a >= kDacSovwlut && a < kDacSovwlut + 4) {
         owlut_shadow_[a - kDacSovwlut] = v;
         return;
+    } else if (a >= kDacAovwlut && a < kDacAovwlut + 4) {
+        owlut_[a - kDacAovwlut] = v;  // (the active entries: at once)
     } else if (a >= kDacTregs && a < kDacTregs + tregs_.size()) {
         tregs_[a - kDacTregs] = v & 0xFFF;
+        schedule_retrace();
     } else {
         switch (a) {
-            case kDacPpll: ppll_ = v; break;
+            case kDacPpll: ppll_ = v; schedule_retrace(); break;
             case kDacGpll: gpll_ = v; break;
-            case kDacPfctrl: pfctrl_ = v; break;
+            case kDacPfctrl: pfctrl_ = v; schedule_retrace(); break;
             case kDacUctrl: uctrl_ = v; break;
             case kDacWtctrl:
                 // The shadow window lookups to the active ones, at the next
-                // vertical blank (interlaced, the next field's, whether TE
-                // asks for a frame or a field); busy till then.
+                // vertical blank (interlaced, with TE the next frame's: the
+                // blank after the second field; without, the next field's);
+                // busy till then. The command bit reads 0; the others as
+                // written.
                 wtctrl_ = v & ~(kWtctrlTransfer | kWtctrlBusy);
                 if (v & kWtctrlTransfer) {
                     transfer_pending_ = true;
@@ -235,7 +258,7 @@ void Ffb::dac_write(u32 a, u32 v) {
             case kDacWamask: wamask_ = v; break;
             case kDacSanal: sanal_ = v; return;
             case kDacDacctrl: dacctrl_ = v; break;
-            case kDacTgen: tgen_ = v; break;
+            case kDacTgen: tgen_ = v; schedule_retrace(); break;
             case kDacMpdata:
                 mpdata_ = v & 3;
                 monitor_.drive(v & 1, v & 2);
@@ -303,11 +326,13 @@ u32 Ffb::fbc_read(u32 off) {
     if (off >= 0x1000) return 0;
     switch (off) {
         case 0x800: return kFbcDevId;
-        // Drawing is done when it is started: the raster processor is never
-        // busy, and the FIFO always empty. Picking is not modelled, so a pick
-        // never hits.
-        case 0x900: return (ucsr_ & ~0xFFFu) | kUcsrPickNoHit | kUcsrFifoEmpty;
-        default: return regs_[off / 4];
+        // Drawing is done when it is started: the raster processor and the
+        // frame buffer are never busy, and the FIFO always empty; so the
+        // pick status is final as soon as it is read.
+        case 0x900: return (ucsr_ & ~0xFFFu) | kUcsrFifoEmpty;
+        default:
+            if (off >= 0x100 && off < 0x180) return setup_state_read((off - 0x100) / 4);
+            return regs_[off / 4];
     }
 }
 
@@ -316,8 +341,8 @@ namespace {
 // Registers made of fields that a write changes only where it gives a
 // value: two-bit fields (three for the buffers written) left alone by 0
 // (the pixel processor control, the frame buffer control), and eight-bit
-// fields whose top bit says they are written (the raster operation, the
-// compare).
+// fields whose top bit (the edit bit) says they are written: the raster
+// operation (colour bits 7:0, X 15:8, Y and Z 23:16) and the compare.
 constexpr u32 kPpcFields[] = {0xC00000, 0x0C0000, 0x030000, 0x00C000, 0x003000, 0x000C00,
                               0x000300, 0x0000C0, 0x000030, 0x00000C, 0x000003};
 constexpr u32 kFbcFields[] = {0xE0000000, 0x00300000, 0x000C0000, 0x0000C000, 0x00003000, 0x00000C00,
@@ -365,13 +390,22 @@ void Ffb::fbc_write(u32 off, u32 v) {
         case 0x25C: r = merge_edit_bytes(r, v, 4); return;  // cmp
         case 0x320: font_row(v); return;
         case 0x800: return;  // (devid: read only)
-        case 0x900:  // errors cleared by writing them; the pick enable an edit field (0 no change)
+        case 0x900: {
+            // The errors cleared by writing them. The pick enable (19:18: 10
+            // off, 11 on) and the pick status (17:16: 10 no hit, 11 hit, as
+            // software restores a saved status) are edit fields: 00 leaves
+            // them (01 too).
             ucsr_ &= ~(v & kUcsrErrors);
-            if (v & kUcsrPickEnable) ucsr_ = (ucsr_ & ~kUcsrPickEnable) | (v & kUcsrPickEnable);
+            const u32 en = v & kUcsrPickField, st = v & kUcsrPickStatus;
+            if (en == kUcsrPickOn || en == kUcsrPickOff) ucsr_ = (ucsr_ & ~kUcsrPickField) | en;
+            if (st == kUcsrPickHit || st == kUcsrPickNoHit) ucsr_ = (ucsr_ & ~kUcsrPickStatus) | st;
             return;
+        }
         default: break;
     }
     r = v;
+    if (off >= 0x100 && off < 0x180) return setup_state_write((off - 0x100) / 4, v);
+    if (off >= 0x0C && off <= 0x44) return vertex_register(off, v);
     // A polygon is given vertex by vertex from the draw operation's write:
     // each through by/bx, one through bh/bw, the last through ebyi/ebxi,
     // which draws it.
@@ -392,11 +426,17 @@ namespace {
 // The dumb views are buffer A's whatever the frame buffer control selects
 // (a rectangle the engine draws into A alone reads back through DFB32 with
 // the read buffer B); DFB24B is buffer B's.
-enum class View { None, Dumb8, Dumb24, Dumb32, Smart8, Smart32, Dumb24B };
+enum class View { None, Dumb8, Dumb24, Dumb32, Smart8, Smart32, Dumb24B, Smart64, Video, Z16, Z8 };
 constexpr bool dumb_view(View v) { return v == View::Dumb8 || v == View::Dumb24 || v == View::Dumb32 || v == View::Dumb24B; }
+constexpr bool smart_view(View v) { return v == View::Smart8 || v == View::Smart32 || v == View::Smart64; }
+
+// The 4:2:2 video views (8 MiB each: 2 bytes a pixel, 2048 a line), as the
+// channel of View::Video: into buffer A, A line doubled, B, B line doubled,
+// through the pixel processor, and that line doubled.
+enum : unsigned { kVideoA, kVideoAD, kVideoB, kVideoBD, kVideoSmart, kVideoSmartD };
 
 // The view at an offset from 0x1000000, the channel of an 8-bit view (0 R,
-// 1 G, 2 B, 3 X) and the offset into the view.
+// 1 G, 2 B, 3 X) or of a video view, and the offset into the view.
 View view_at(u64 off, unsigned& channel, u64& in) {
     channel = 0;
     if (off < 0x1000000) {
@@ -412,9 +452,43 @@ View view_at(u64 off, unsigned& channel, u64& in) {
         return View::Smart8;
     }
     if (off < 0x5000000) return in = off - 0x4000000, View::Smart32;
+    if (off < 0x7000000) return in = off - 0x5000000, View::Smart64;
+    auto video = [&](u64 base, unsigned ch) { return channel = ch, in = off - base, View::Video; };
+    if (off >= 0x8000000 && off < 0x8800000) return video(0x8000000, kVideoA);
+    if (off >= 0x8800000 && off < 0x9000000) return video(0x8800000, kVideoAD);
     if (off >= 0x9000000 && off < 0xA000000) return in = off - 0x9000000, View::Dumb24B;
+    if (off >= 0xA000000 && off < 0xA800000) return video(0xA000000, kVideoB);
+    if (off >= 0xA800000 && off < 0xB000000) return video(0xA800000, kVideoBD);
+    if (off >= 0xB000000 && off < 0xB800000) return in = off - 0xB000000, View::Z16;
+    if (off >= 0xB800000 && off < 0xBC00000) return in = off - 0xB800000, View::Z8;
+    if (off >= 0xC000000 && off < 0xC800000) return video(0xC000000, kVideoSmart);
+    if (off >= 0xC800000 && off < 0xD000000) return video(0xC800000, kVideoSmartD);
     return View::None;
 }
+
+// --- Views whose layout is a guess (no software known to use them) ---
+//
+// SFB64: a pixel a 64-bit word, 2048 a line: the colour word (X, B, G, R)
+// in the high half and buffer C's word (Y, Z) in the low, written as one
+// pixel through the pixel processor (the colour to the colour buffers
+// written, Y and Z to buffer C, compared with Z from the low half); read,
+// the colour from the buffer read (A when that is C) and buffer C.
+constexpr unsigned kSfb64Bytes = 8;
+// The 4:2:2 views: a 32-bit word holds two pixels as Y0, Cb, Y1, Cr (from
+// the top byte), turned into RGB as ITU-R BT.601 (Y 16-235, Cb and Cr
+// 16-240) and written to the colour planes (the X planes kept); the line
+// doubled views write each line given to two frame buffer lines. Only
+// whole words are taken; reads give 0.
+u32 ycbcr_to_rgb(int y, int cb, int cr) {
+    const double l = 1.164 * (y - 16), u = cb - 128, v = cr - 128;
+    auto c = [](double x) { return static_cast<u32>(std::clamp(std::floor(x + 0.5), 0.0, 255.0)); };
+    return c(l + 2.017 * u) << 16 | c(l - 0.392 * u - 0.813 * v) << 8 | c(l + 1.596 * v);
+}
+// The Z views: 16 (0xC000000) or 8 (0xC800000) bits a pixel, the top bits
+// of buffer C's depth (27:12 or 27:20); a write sets them and clears the
+// depth's bits below, leaving the Y planes; written as they are (not
+// through the pixel processor).
+constexpr unsigned kZ16Shift = 12, kZ8Shift = 20;
 
 }  // namespace
 
@@ -427,16 +501,28 @@ bool Ffb::fb_read(u64 off, unsigned size, u64& value) {
         engine_unmodelled(3, "a frame buffer view", static_cast<u32>(off + 0x1000000));
         return true;
     }
+    if (v == View::Video) return true;
     // A pixel from the buffer the view reads: the dumb views' own, the
     // smart views' by the frame buffer control.
     const unsigned rb = !dumb_view(v) ? read_buffer() : v == View::Dumb24B ? 1 : 0;
-    auto pixel = [&](u64 x, u64 y) { return x < kLine && y < kLines ? buf_[rb][y * kLine + x] : 0u; };
+    auto pixel_of = [&](unsigned b, u64 x, u64 y) { return x < kLine && y < kLines ? buf_[b][y * kLine + x] : 0u; };
+    auto pixel = [&](u64 x, u64 y) { return pixel_of(rb, x, y); };
     for (unsigned i = 0; i < size; ++i) {
         const u64 a = in + i;
         u32 b;
         if (v == View::Dumb8 || v == View::Smart8) {
             const u32 p = pixel(a % kLine, a / kLine);
             b = (p >> (channel == 3 ? 24 : 8 * channel)) & 0xFF;
+        } else if (v == View::Smart64) {
+            const u64 n = a / kSfb64Bytes, k = a % kSfb64Bytes;
+            const u32 p = pixel_of(k < 4 ? (rb == 2 ? 0 : rb) : 2, n % kLine, n / kLine);
+            b = (p >> (8 * (3 - k % 4))) & 0xFF;
+        } else if (v == View::Z16) {
+            const u64 n = a / 2;
+            const u32 z = (pixel_of(2, n % kLine, n / kLine) >> kZ16Shift) & 0xFFFF;
+            b = a % 2 ? z & 0xFF : z >> 8;
+        } else if (v == View::Z8) {
+            b = (pixel_of(2, a % kLine, a / kLine) >> kZ8Shift) & 0xFF;
         } else {
             const u64 n = a / 4;
             const u32 p = pixel(n % kLine, n / kLine);
@@ -445,6 +531,36 @@ bool Ffb::fb_read(u64 off, unsigned size, u64& value) {
         value = value << 8 | b;
     }
     return true;
+}
+
+// A pixel through SFB64: the high half the colour word, the low buffer C's.
+void Ffb::smart64_write(unsigned x, unsigned y, u64 value, u64 lanes) {
+    smart_view_write(x, y, static_cast<u32>(value >> 32), static_cast<u32>(lanes >> 32), static_cast<u32>(value),
+                     static_cast<u32>(lanes));
+    changed(y, y + 1);
+}
+
+// A word of a 4:2:2 view: two pixels.
+void Ffb::video_write(unsigned view, u64 in, u32 word) {
+    const unsigned line = static_cast<unsigned>(in / (u64{kLine} * 2)), x0 = static_cast<unsigned>(in % (u64{kLine} * 2) / 2);
+    const bool doubled = view == kVideoAD || view == kVideoBD || view == kVideoSmartD;
+    const int cb = (word >> 16) & 0xFF, cr = word & 0xFF;
+    const u32 rgb[2] = {ycbcr_to_rgb(static_cast<int>(word >> 24), cb, cr), ycbcr_to_rgb(static_cast<int>((word >> 8) & 0xFF), cb, cr)};
+    for (unsigned d = 0; d < (doubled ? 2u : 1u); ++d) {
+        const unsigned y = doubled ? 2 * line + d : line;
+        if (y >= kLines) continue;
+        for (unsigned p = 0; p < 2; ++p) {
+            const unsigned x = x0 + p;
+            if (x >= kLine) continue;
+            if (view == kVideoSmart || view == kVideoSmartD) {
+                smart_view_write(x, y, rgb[p], 0xFFFFFF, 0, 0);
+            } else {
+                u32& px = buf_[view == kVideoA || view == kVideoAD ? 0 : 1][static_cast<std::size_t>(y) * kLine + x];
+                px = (px & 0xFF000000) | rgb[p];
+            }
+        }
+        changed(y, y + 1);
+    }
 }
 
 bool Ffb::fb_write(u64 off, unsigned size, u64 value) {
@@ -457,25 +573,61 @@ bool Ffb::fb_write(u64 off, unsigned size, u64 value) {
     }
     const unsigned db = v == View::Dumb24B ? 1 : 0;  // the dumb views' buffer
     // (Smart views with the pixel processor control, dumb ones with the channel.)
-    ++debug_ops_[{regs_[0x254 / 4], v == View::Smart8 || v == View::Smart32
-                                        ? 0xE0000000u | static_cast<u32>(v) << 24 | (regs_[0x200 / 4] & 0xFFFFFF)
-                                        : 0xD0000000u | static_cast<u32>(v) << 8 | channel}];
+    ++debug_ops_[{regs_[0x254 / 4], smart_view(v) ? 0xE0000000u | static_cast<u32>(v) << 24 | (regs_[0x200 / 4] & 0xFFFFFF)
+                                                  : 0xD0000000u | static_cast<u32>(v) << 8 | channel}];
+    auto byte = [&](unsigned i) { return static_cast<u32>(value >> (8 * (size - 1 - i))) & 0xFF; };
     auto dumb = [&](unsigned x, unsigned y, u32 bits, u32 mask) {
         const std::size_t i = static_cast<std::size_t>(y) * kLine + x;
         buf_[db][i] = (buf_[db][i] & ~mask) | (bits & mask);
         changed(y, y + 1);
     };
+    if (v == View::Video) {
+        if (in % 4 || size % 4) {
+            engine_unmodelled(6, "a 4:2:2 view written but by whole words", static_cast<u32>(off + 0x1000000));
+            return true;
+        }
+        for (unsigned i = 0; i < size; i += 4) video_write(channel, in + i, byte(i) << 24 | byte(i + 1) << 16 | byte(i + 2) << 8 | byte(i + 3));
+        return true;
+    }
+    if (v == View::Z16 || v == View::Z8) {
+        const unsigned per = v == View::Z16 ? 2 : 1, shift = v == View::Z16 ? kZ16Shift : kZ8Shift;
+        for (unsigned i = 0; i < size; ++i) {
+            const u64 a = in + i, n = a / per;
+            if (n / kLine >= kLines) continue;
+            const unsigned k = static_cast<unsigned>(a % per);
+            const unsigned bit = shift + 8 * (per - 1 - k);  // where this byte goes
+            u32& c = buf_[2][n / kLine * kLine + n % kLine];
+            c = (c & ~((0xFFu << bit) | ((1u << shift) - 1))) | byte(i) << bit;
+        }
+        return true;
+    }
+    if (v == View::Smart64) {
+        // Whole pixels, or the bytes of one.
+        for (unsigned i = 0; i < size;) {
+            const u64 a = in + i, n = a / kSfb64Bytes;
+            const unsigned first = static_cast<unsigned>(a % kSfb64Bytes), count = std::min(kSfb64Bytes - first, size - i);
+            u64 bits = 0, mask = 0;
+            for (unsigned k = 0; k < count; ++k) {
+                const unsigned shift = 8 * (7 - (first + k));
+                bits |= u64{byte(i + k)} << shift;
+                mask |= u64{0xFF} << shift;
+            }
+            i += count;
+            if (n / kLine < kLines) smart64_write(static_cast<unsigned>(n % kLine), static_cast<unsigned>(n / kLine), bits, mask);
+        }
+        return true;
+    }
     if (v == View::Dumb8 || v == View::Smart8) {
         const unsigned shift = channel == 3 ? 24 : 8 * channel;
         for (unsigned i = 0; i < size; ++i) {
             const u64 a = in + i;
-            const u32 b = static_cast<u32>(value >> (8 * (size - 1 - i))) & 0xFF;
+            const u32 b = byte(i);
             const unsigned x = static_cast<unsigned>(a % kLine), y = static_cast<unsigned>(a / kLine);
             if (y >= kLines) continue;
             if (v == View::Dumb8) {
                 dumb(x, y, b << shift, 0xFFu << shift);
             } else {
-                smart_write(x, y, b << shift, 0xFFu << shift);
+                smart_view_write(x, y, b << shift, 0xFFu << shift, b << shift, 0xFFu << shift, true);
                 changed(y, y + 1);
             }
         }
@@ -490,14 +642,14 @@ bool Ffb::fb_write(u64 off, unsigned size, u64 value) {
         u32 bits = 0, mask = 0;
         for (unsigned k = 0; k < count; ++k) {
             const unsigned shift = 8 * (3 - (first + k));
-            bits |= (static_cast<u32>(value >> (8 * (size - 1 - (i + k)))) & 0xFF) << shift;
+            bits |= byte(i + k) << shift;
             mask |= 0xFFu << shift;
         }
         i += count;
         if (y >= kLines) continue;
         if (v == View::Dumb24 || v == View::Dumb24B) mask &= 0xFFFFFF;  // (the X plane kept)
         if (v == View::Smart32) {
-            smart_view_write(x, y, bits, mask);
+            smart_view_write(x, y, bits, mask, bits, mask);
             changed(y, y + 1);
         } else {
             dumb(x, y, bits, mask);
@@ -561,13 +713,18 @@ void Ffb::window_transfer() {
 }
 
 void Ffb::retrace() {
-    if (transfer_pending_) window_transfer();
+    // Interlaced, a transfer at the next frame waits out the frame's first
+    // field (the even field count from time 0).
+    const Timing t = timing();
+    const bool first_field = t.on && (tgen_ & kTgenInterlaced) &&
+                             (static_cast<u64>(static_cast<double>(sched_.now()) / (t.line_cycles * t.total)) & 1) == 0;
+    if (transfer_pending_ && !((wtctrl_ & kWtctrlFrame) && first_field)) window_transfer();
     if ((interrupts_ & kIntVertEnable) && !(interrupts_ & kIntVertPending)) {
         interrupts_ |= kIntVertPending;
         ++debug_retraces_;
         if (on_interrupt_) on_interrupt_();
     }
-    if (timing().on) schedule_retrace();
+    if (t.on) schedule_retrace();
 }
 
 unsigned Ffb::current_line() const {
@@ -604,15 +761,25 @@ bool Ffb::render(Frame& f) const {
         f.pixels.assign(st.base.size(), 0);
     }
 
-    // Each pixel through its window ID's lookup entry. In the Combined
-    // window mode the window ID is buffer A's X planes. In Separate_8 it is
-    // buffer B's X planes, and A's are an 8-bit overlay: shown through an
-    // overlay lookup (chosen by the window ID's top bits), unless that says
-    // none, or transparent and the overlay pixel is the key.
+    // Each pixel through its window ID's lookup entries. The window mode
+    // says where the window ID (W) and the overlay pixel come from:
+    //   Combined (and the reserved mode): buffer A's X planes are both.
+    //   Separate_8: W is buffer B's X planes, the overlay A's (8 bits).
+    //   Separate_4: A's X planes hold a 4-bit window ID and a 4-bit overlay;
+    //     the window ID's low two bits pick the primary entry, its high two
+    //     the overlay entry.
+    // The primary entry is W & PMSK (0 leaves only entry 0); the overlay
+    // entry W[7:6] & OMSK. With the overlay enabled that entry decides
+    // first: none shows the primary entry; transparent shows it where A's X
+    // planes under the transparent mask match the key, else the overlay;
+    // opaque always the overlay. The overlay is a palette index (in
+    // Separate_4, in the entry's palette section of 16) or, with no
+    // lookup, grey.
     const bool video = tgen_ & kTgenVideo;
-    const u32 wid_mask = (wamask_ & 0x3F) ? (wamask_ & 0x3F) : 0x3F;
-    const bool separate8 = (uctrl_ & 0x30) == 0x20, overlay = separate8 && (uctrl_ & 8);
-    const u32 ov_mask = (wamask_ >> 8) & 3, key_mask = tmctrl_ & 0xFF, key = tcolorkey_ & key_mask;
+    const u32 mode = uctrl_ & kUctrlMode;
+    const bool separate8 = mode == kUctrlSeparate8, separate4 = mode == kUctrlSeparate4,
+               overlay = uctrl_ & kUctrlOverlay;
+    const u32 pmsk = wamask_ & 0x3F, omsk = (wamask_ >> 8) & 3, key_mask = tmctrl_ & 0xFF, key = tcolorkey_ & key_mask;
     auto make_row = [&](unsigned y) {
         u32* out = &st.base[static_cast<std::size_t>(y) * width];
         if (!video) {
@@ -622,17 +789,30 @@ bool Ffb::render(Frame& f) const {
         const u32* a = &buf_[0][static_cast<std::size_t>(y) * kLine];
         const u32* b = &buf_[1][static_cast<std::size_t>(y) * kLine];
         for (unsigned x = 0; x < width; ++x) {
-            const u32 wid = (separate8 ? b[x] : a[x]) >> 24;
+            const u32 ax = a[x] >> 24;
+            u32 primary, select, ov;
+            if (separate4) {
+                const u32 lo = ax & 0xF, hi = ax >> 4;
+                const u32 w4 = kSeparate4OverlayLowNibble ? hi : lo;
+                ov = kSeparate4OverlayLowNibble ? lo : hi;
+                primary = (w4 & 3) & pmsk;
+                select = (w4 >> 2) & omsk;
+            } else {
+                const u32 w = separate8 ? b[x] >> 24 : ax;
+                ov = ax;
+                primary = w & pmsk;
+                select = (w >> 6) & omsk;
+            }
             if (overlay) {
-                const u32 o = owlut_[(wid >> 6) & ov_mask], ov = a[x] >> 24;
-                const u32 type = o & 0xC00;  // 0 none, 0x400 transparent, 0x800 opaque
-                if (type == 0x800 || (type == 0x400 && (ov & key_mask) != key)) {
-                    const u32 c = (o & kWlutLookup) ? clut_[((o & kWlutTable) >> 4) * 256 + ov] : ov * 0x010101u;
+                const u32 o = owlut_[select], type = o & kOwlutType;
+                if (type == kOwlutOpaque || (type == kOwlutTransparent && (ax & key_mask) != key)) {
+                    const u32 i = separate4 ? (o & kOwlutSection) * 16 + ov : ov;
+                    const u32 c = (o & kWlutLookup) ? clut_[((o & kWlutTable) >> 4) * 256 + i] : ov * 0x010101u;
                     out[x] = (c & 0xFF) << 16 | (c & 0xFF00) | (c >> 16 & 0xFF);
                     continue;
                 }
             }
-            const u32 e = pwlut_[wid & wid_mask];
+            const u32 e = pwlut_[primary];
             const u32 p = (e & kWlutBufferB) ? b[x] : a[x];
             const u32* table = &clut_[((e & kWlutTable) >> 4) * 256];
             u32 r, g, bl;

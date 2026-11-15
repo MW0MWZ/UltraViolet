@@ -1,6 +1,6 @@
 \ Copyright (C) 2026 Andy Taylor. Distributed under the same terms as the
 \ OpenBoot release it is part of (see LICENSE).
-id: @(#)core.fth 1.0 26/11/07
+id: @(#)core.fth 1.1 26/11/15
 purpose: The Happy Meal: reset, rings, the link, sending and receiving
 copyright: Copyright 2026 Andy Taylor
 
@@ -146,18 +146,19 @@ h# 4000.0000 constant rx-overflow	\ (receive: the frame was longer than the buff
    set-chosen-speed&duplex
 ;
 
-\ Auto-negotiation: three rounds, each restarting it and waiting for it
-\ to complete and then for the link; in diagnostic mode each wait that
-\ runs out is reported, as an Ultra 10 reports them.
+\ Auto-negotiation: three rounds, each restarting it and waiting up to
+\ 5 s for it to complete and then up to 2 s for the link (the link wait
+\ made even when negotiation did not complete); in diagnostic mode each
+\ wait that runs out is reported. Waits and messages as an Ultra 10's,
+\ with no cable 21 s in all.
 : .diag ( $ -- )  diagnostic-mode? if  type cr  else  2drop  then  ;
 : auto-link ( -- up? )
    3 0 do
       phycr.an-enable phycr.an-restart or phy-cr!
-      physr.an-complete d# 2000 wait-link-ms if
-         physr.link-up d# 2000 wait-link-ms if  true unloop exit  then
-      else
+      physr.an-complete d# 5000 wait-link-ms 0= if
          " Timeout waiting for AutoNegotiation Status to be updated. " .diag
       then
+      physr.link-up d# 2000 wait-link-ms if  true unloop exit  then
       " Timeout reading Link status. Check cable and try again. " .diag
    loop
    " AutoNegotiation Timeout. " .diag
@@ -189,11 +190,12 @@ h# 4000.0000 constant rx-overflow	\ (receive: the frame was longer than the buff
 ;
 
 \ Sending: one frame at a time, from the transmit buffer; done when the
-\ device gives the descriptor back.
+\ device gives the descriptor back. A frame shorter than 60 bytes goes as
+\ 64, padded with what the buffer held, as an Ultra 10's does.
 : transmit ( adr len -- #sent )
    d# 1518 min  tuck tx-buf swap move			( len )
    tx-buf cpu>io  tx-next txd 4 + le-l!
-   dup d# 60 max  own or tx-sop or tx-eop or  tx-next txd le-l!
+   dup  dup d# 60 < if  drop d# 64  then  own or tx-sop or tx-eop or  tx-next txd le-l!
    1 etx-pending reg!
    get-msecs d# 2000 +  begin
       tx-next txd le-l@ own and 0= if

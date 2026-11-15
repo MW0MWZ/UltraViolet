@@ -218,6 +218,9 @@ false value obd-quit?
    ." Debugging enabled" cr
    mfg-mode to obd-mfg  diag-level to obd-diag-level  diag-switch? to obd-diag-switch
    true to obd-loaded?
+   \ As an Ultra 10's: once obdiag is loaded, the next boot resets the
+   \ machine first ("Resetting ...", then "Rebooting with command:").
+   true to already-go?
 ;
 
 \ --- The script -------------------------------------------------------------

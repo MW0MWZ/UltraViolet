@@ -1,6 +1,6 @@
 \ Copyright (C) 2026 Andy Taylor. Distributed under the same terms as the
 \ OpenBoot release it is part of (see LICENSE).
-id: @(#)pkg.fth 1.0 26/11/07
+id: @(#)pkg.fth 1.1 26/11/15
 purpose: The Happy Meal's methods
 copyright: Copyright 2026 Andy Taylor
 
@@ -10,6 +10,7 @@ copyright: Copyright 2026 Andy Taylor
 
 headerless
 0 instance value obp-tftp
+0 instance value link-up?
 
 : init-obp-tftp ( tftp-args$ -- okay? )
    " obp-tftp" find-package if
@@ -28,6 +29,38 @@ headerless
    net-on  diagnostic-mode? if
       dup if  ." Link Up. "  else  ." Link Down."  then  cr
    then
+   dup to link-up?
+;
+
+\ As an Ultra 10's: the device opens whether or not the link comes up;
+\ while it is down, each frame sent first sets the link up again, twice
+\ at most (each try announced on a line of its own in diagnostic mode,
+\ each failure reported),
+\ and is not sent if it is still down.
+: link-ready? ( -- up? )
+   link-up? ?dup if  exit  then
+   2 0 do
+      diagnostic-mode? if  ." Setting up Network Link and Speed. " cr  then
+      bringup-link if  true unloop exit  then
+      ." Network Link Setup Failed. " cr
+      ." Please Check Cable and Try Again. " cr
+   loop  false
+;
+
+\ Once the link is up, the open sends one frame to the station's own
+\ address (its type ff00, then this pattern), as an Ultra 10's does.
+create link-frame-data
+   h# ff c, h# 00 c, h# 01 c, h# 02 c, h# 04 c, h# 08 c, h# 10 c, h# 20 c,
+   h# 40 c, h# 80 c, h# fe c, h# fd c, h# fb c, h# f7 c, h# ef c, h# df c,
+   h# bf c, h# 7f c, h# 55 c, h# aa c, h# ff c, h# 00 c, h# 01 c, h# 02 c,
+   h# 04 c, h# 08 c, h# 10 c, h# 20 c, h# 40 c, h# 80 c, h# fe c, h# fd c,
+   h# fb c, h# f7 c, h# ef c, h# df c, h# bf c, h# 7f c, h# 55 c, h# aa c,
+   h# 01 c, h# 02 c, h# 04 c, h# 08 c, h# 10 c, h# 20 c, h# 40 c, h# 80 c,
+: send-link-frame ( -- )
+   d# 60 alloc-mem					( frame )
+   system-mac drop  over 6 move  system-mac drop  over 6 + 6 move
+   link-frame-data  over d# 12 +  d# 48 move		( frame )
+   dup d# 60 transmit drop  d# 60 free-mem
 ;
 
 external
@@ -43,14 +76,14 @@ external
    map-resources
    my-args parse-devargs
    init-obp-tftp 0= if  close false exit  then
-   bringup-link 0= if  close false exit  then
+   bringup-link if  send-link-frame  then
    publish-properties
    mac-address encode-bytes " mac-address" property
    true
 ;
 
 : read ( adr len -- #rcvd | -2 )  receive ?dup 0= if  -2  then  ;
-: write ( adr len -- #sent )  transmit  ;
+: write ( adr len -- #sent )  link-ready? if  transmit  else  2drop 0  then  ;
 : load ( adr -- size )  " load" obp-tftp $call-method  ;
 
 \ watch-net: frames counted as they come (promiscuous), until a key

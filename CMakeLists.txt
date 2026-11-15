@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Andy Taylor
 cmake_minimum_required(VERSION 3.21)
-project(UltraViolet VERSION 1.2.0 DESCRIPTION "Sun UltraSPARC (Ultra 5/10) emulator" LANGUAGES CXX)
+project(UltraViolet VERSION 1.3.0 DESCRIPTION "Sun UltraSPARC (Ultra 5/10) emulator" LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -218,19 +218,25 @@ if(UV_WITH_SDL3)
     target_link_libraries(ultraviolet PRIVATE uv_imgui SDL3::SDL3)
 
     if(APPLE)
-      # A macOS application: UltraViolet.app, with the system menu bar (and
-      # its icon, made from graphics/UltraViolet_icon_1024.png with sips and
-      # iconutil when that artwork is there). build/ultraviolet links to the
-      # program inside, for the terminal. `cmake --install build --prefix
-      # DIR` makes a self-contained copy in DIR, with the libraries it uses
-      # (SDL3, libslirp, ...) inside it.
+      # A macOS application, "Ultra Violet.app" (the program inside it
+      # UltraViolet, with no space), with the system menu bar (and its icon,
+      # made from graphics/UltraViolet_icon_1024.png with sips and iconutil
+      # when that artwork is there). CMake names a bundle after its program,
+      # so the bundle is laid out here: the program built into its
+      # Contents/MacOS, the Info.plist and icon copied in after each build.
+      # build/ultraviolet links to the program, for the terminal. `cmake
+      # --install build --prefix DIR` makes a self-contained copy in DIR, with
+      # the libraries it uses (SDL3, libslirp, ...) inside it.
       enable_language(OBJCXX)
       target_sources(ultraviolet PRIVATE src/app/menu_mac.mm)
       set_source_files_properties(src/app/menu_mac.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
       target_link_libraries(ultraviolet PRIVATE "-framework Cocoa")
 
+      set(UV_APP_NAME "Ultra Violet.app")
+      set(UV_APP_DIR "${CMAKE_CURRENT_BINARY_DIR}/${UV_APP_NAME}")
       set(UV_ICON_PNG ${CMAKE_CURRENT_SOURCE_DIR}/graphics/UltraViolet_icon_1024.png)
       set(UV_ICON_FILE "")
+      set(UV_ICON_COPY)
       if(EXISTS ${UV_ICON_PNG})
         set(UV_ICONSET ${CMAKE_CURRENT_BINARY_DIR}/UltraViolet.iconset)
         set(UV_ICNS ${CMAKE_CURRENT_BINARY_DIR}/UltraViolet.icns)
@@ -248,29 +254,30 @@ if(UV_WITH_SDL3)
           DEPENDS ${UV_ICON_PNG}
           COMMENT "Making the application icon"
           VERBATIM)
-        target_sources(ultraviolet PRIVATE ${UV_ICNS})
-        set_source_files_properties(${UV_ICNS} PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+        add_custom_target(ultraviolet_icon DEPENDS ${UV_ICNS})
+        add_dependencies(ultraviolet ultraviolet_icon)
         set(UV_ICON_FILE "UltraViolet")
+        set(UV_ICON_COPY
+          COMMAND ${CMAKE_COMMAND} -E make_directory "${UV_APP_DIR}/Contents/Resources"
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different ${UV_ICNS} "${UV_APP_DIR}/Contents/Resources/UltraViolet.icns")
       endif()
 
       configure_file(cmake/Info.plist.in ${CMAKE_CURRENT_BINARY_DIR}/Info.plist @ONLY)
       set_target_properties(ultraviolet PROPERTIES
-        MACOSX_BUNDLE TRUE
         OUTPUT_NAME "UltraViolet"
-        MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_BINARY_DIR}/Info.plist)
+        RUNTIME_OUTPUT_DIRECTORY "${UV_APP_DIR}/Contents/MacOS")
       add_custom_command(TARGET ultraviolet POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_BINARY_DIR}/Info.plist "${UV_APP_DIR}/Contents/Info.plist"
+        ${UV_ICON_COPY}
         COMMAND ${CMAKE_COMMAND} -E rm -f ${CMAKE_CURRENT_BINARY_DIR}/ultraviolet
-        COMMAND ${CMAKE_COMMAND} -E create_symlink "UltraViolet.app/Contents/MacOS/UltraViolet"
+        COMMAND ${CMAKE_COMMAND} -E create_symlink "${UV_APP_NAME}/Contents/MacOS/UltraViolet"
                 ${CMAKE_CURRENT_BINARY_DIR}/ultraviolet
         VERBATIM)
 
-      install(TARGETS ultraviolet BUNDLE DESTINATION .)
-      # The Info.plist is installed explicitly as well, and the libraries are
-      # gathered from the program's own path, so neither depends on the other.
-      install(FILES ${CMAKE_CURRENT_BINARY_DIR}/Info.plist DESTINATION "UltraViolet.app/Contents")
+      install(DIRECTORY "${UV_APP_DIR}" DESTINATION . USE_SOURCE_PERMISSIONS)
       install(CODE [[
         include(BundleUtilities)
-        set(app "${CMAKE_INSTALL_PREFIX}/UltraViolet.app")
+        set(app "${CMAKE_INSTALL_PREFIX}/Ultra Violet.app")
         fixup_bundle("${app}/Contents/MacOS/UltraViolet" "" "")
         # Signed for this machine (ad hoc): copying the libraries in changed them.
         execute_process(COMMAND codesign --force --deep --sign - "${app}" COMMAND_ERROR_IS_FATAL ANY)

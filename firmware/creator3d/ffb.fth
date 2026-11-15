@@ -391,9 +391,12 @@ here est-modes - 5 /n * / constant #est-modes
 \ Pixel processor: constant colour, window ID from the WID register, opaque
 \ background, no clipping, blending, patterns or depth cue.
 00069a07 constant ppc-plain
-083 constant rop-new
-085 constant rop-old
-08a constant rop-invert
+\ Raster operations: the colour planes' in bits 7:0, the X planes' in
+\ 15:8, each with its edit bit (80) so that both are set: the X planes
+\ take the new value (the window ID) as the colour does, or keep theirs.
+8383 constant rop-new
+8585 constant rop-old
+858a constant rop-invert
 \ Frame buffer control: buffer A written and read, RGB through the plane
 \ mask; the X planes (window ID) written or not; buffers A and B.
 2000707f constant fbc-x-off
@@ -407,7 +410,8 @@ here est-modes - 5 /n * / constant #est-modes
 \ The registers the console draws with.
 : fbc-console  ( -- )
    6 fifo-wait
-   0 204 fbc!                                   \ window ID 0
+   high-res? if  ff  else  0  then  204 fbc!   \ window ID: ff in the high resolutions
+                                                \ (transparent to their overlay), else 0
    ppc-plain 200 fbc!
    rop-new 258 fbc!
    8 300 fbc!                                   \ rectangles
@@ -440,7 +444,7 @@ here est-modes - 5 /n * / constant #est-modes
    fbc-console
    1 fifo-wait  fbc-ab-x-on 254 fbc!
    ffffff 0 colours
-   0 0 hres vres rectangle                      \ both buffers white, window ID 0
+   0 0 hres vres rectangle                      \ both buffers white, the window ID
    fbc-idle
    1 fifo-wait  fbc-x-off 254 fbc!
 ;
@@ -630,7 +634,7 @@ headers
 \ The FCode's identity, on one line, the cursor left after it.
 external
 : .version_ffb  ( -- )
-   " @(#)ffb.fth 0.6 26/11/13 " type  " Copyright (C) 2026 Andy Taylor" type
+   " @(#)ffb.fth 0.7 26/11/15 " type  " Copyright (C) 2026 Andy Taylor" type
 ;
 headers
 
@@ -650,7 +654,7 @@ my-space 1c0 - 2/ encode-int " upa-portid" property
 \ The card's identity, read from it.
 exp rl@ d# 24 rshift ff and encode-int " board_type" property
 " SUNW,501-4788" model
-" UltraViolet ffb.fth 0.6" encode-string " fcode_version" property
+" UltraViolet ffb.fth 0.7" encode-string " fcode_version" property
 dac-uctrl dac@ 8 rshift f and encode-int " ramdac_rev" property
 800 fbc@ encode-int " fbc_reg_id" property
 unmap-card

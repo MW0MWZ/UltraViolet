@@ -89,6 +89,36 @@ and the native macOS menu bar, in `src/app/`.
 | Disk | CMD646 IDE controller |
 | Graphics | Onboard ATI Rage (PGX), Ultra 10 UPA slot for Creator/Creator3D |
 
+### Creator3D raster engine
+
+`src/devices/ffb_engine.cpp` models the FBC's raster and pixel processors.
+Drawing completes when its last register is written, so the engine never
+reads busy and a pick result is final at once.
+
+* 2D operations from integer coordinates: DOT, BRLINE (with the line
+  pattern), RECTANGLE, POLYGON, FASTFILL, BCOPY/VSCROLL and font rows.
+* 3D operations from the setup unit: vertices given as alpha, colour and
+  depth (2.30 fixed point) and x, y (16.16), completed by an x register
+  that restarts, extends a strip or extends a fan. TRIANGLE, DDLINE,
+  AALINE, DOT and AADOT, with colour, alpha and depth interpolated or
+  taken from the constant registers; the line pattern runs on from one
+  line to the next. The setup unit's state is readable and writable
+  (0x100-0x17C) for context switches.
+* Every pixel, drawn or written through a smart view, goes through one
+  pipeline: view and auxiliary clips (and the view clip's depth bounds in
+  3D mode), the area pattern, the X clip (alpha test), the buffer compares
+  (match and magnitude for buffers A/B and C, the depth test among them),
+  picking, depth cueing with BLENDC1/BLENDC2, alpha blending, the raster
+  operation per plane group, the plane masks and the plane-group enables.
+  Buffer C holds depth in bits 27:0 and stencil in 31:28 and is written
+  through its own Z and Y enables and masks.
+* Views: the dumb and smart 8/32-bit views, DFB24B, SFB64, the 4:2:2
+  video views and the Z views.
+
+Where the card's behaviour is not documented (triangle edge rule, line
+pixel selection, antialiasing weights, the layouts of SFB64, the 4:2:2 and
+Z views) the choice made is in one named place in the source.
+
 ## CPU: UltraSPARC IIi
 
 ### Interpreter (implemented)
